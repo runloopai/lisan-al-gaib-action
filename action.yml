@@ -1,0 +1,49 @@
+name: Dependency Age Check
+description: >
+  Supply-chain security gate that fails if newly added/updated packages were
+  published less than a configurable number of days ago. Supports npm (pnpm),
+  Python (uv), Rust (Bazel crate.spec), and Java (Bazel maven_install).
+
+inputs:
+  ecosystems:
+    description: Comma-separated list of ecosystems to check (npm, python, rust, java)
+    required: true
+  min-age-days:
+    description: Minimum number of days since publication (default 14)
+    required: false
+    default: "14"
+  base-ref:
+    description: Git ref to diff against (default origin/main)
+    required: false
+    default: origin/main
+  npm-lockfile:
+    description: Path to pnpm lockfile (npm ecosystem)
+    required: false
+    default: pnpm-lock.yaml
+  python-lockfile-glob:
+    description: Glob pattern for Python uv.lock files
+    required: false
+    default: "**/uv.lock"
+  rust-module-file:
+    description: Path to Rust Bazel module file
+    required: false
+    default: java/rust/rust.MODULE.bazel
+  java-lock-file:
+    description: Path to Maven install lock file
+    required: false
+    default: java/maven_install.json
+
+runs:
+  using: composite
+  steps:
+    - name: Check dependency age
+      shell: bash
+      run: bash "${{ github.action_path }}/check-dep-age.sh"
+      env:
+        INPUT_ECOSYSTEMS: ${{ inputs.ecosystems }}
+        INPUT_MIN_AGE_DAYS: ${{ inputs.min-age-days }}
+        INPUT_BASE_REF: ${{ inputs.base-ref }}
+        INPUT_NPM_LOCKFILE: ${{ inputs.npm-lockfile }}
+        INPUT_PYTHON_LOCKFILE_GLOB: ${{ inputs.python-lockfile-glob }}
+        INPUT_RUST_MODULE_FILE: ${{ inputs.rust-module-file }}
+        INPUT_JAVA_LOCK_FILE: ${{ inputs.java-lock-file }}
