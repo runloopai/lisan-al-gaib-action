@@ -169,30 +169,50 @@ check_rust() {
     return
   fi
 
-  # Extract added crate.spec lines with package and version.
+  # Extract added crate specs. crate.spec() spans multiple lines, so we parse
+  # the diff line-by-line, tracking package/version/git fields per block.
+  local diff_added
+  diff_added=$(git diff "${BASE_REF}" -- "$RUST_MODULE_FILE" \
+    | grep '^+' | grep -v '^+++') || true
+
+  local packages="" current_pkg="" current_ver="" is_git=false
+  while IFS= read -r line; do
+    line="${line#+}"
+    # New crate.spec block
+    if [[ "$line" =~ crate\.spec\( ]]; then
+      # Flush previous block
+      if [[ -n "$current_pkg" && -n "$current_ver" && "$is_git" == false ]]; then
+        packages+="${current_pkg}@${current_ver}"$'\n'
+      fi
+      current_pkg="" current_ver="" is_git=false
+    fi
+    if [[ "$line" =~ package\ =\ \"([^\"]+)\" ]]; then
+      current_pkg="${BASH_REMATCH[1]}"
+    fi
+    if [[ "$line" =~ version\ =\ \"([^\"]+)\" ]]; then
+      current_ver="${BASH_REMATCH[1]}"
+    fi
+    if [[ "$line" =~ git\ =\ \" ]]; then
+      is_git=true
+    fi
+  done <<< "$diff_added"
+  # Flush last block
+  if [[ -n "$current_pkg" && -n "$current_ver" && "$is_git" == false ]]; then
+    packages+="${current_pkg}@${current_ver}"$'\n'
+  fi
+
   local changed
-  changed=$(git diff "${BASE_REF}" -- "$RUST_MODULE_FILE" \
-    | grep '^+' \
-    | grep -v '^+++' \
-    | grep -oE 'crate\.spec\([^)]*\)' \
-    | grep -oP 'package\s*=\s*"\K[^"]+|version\s*=\s*"\K[^"]+' \
-    | paste - - \
-    | sort -u) || true
+  changed=$(echo "$packages" | sort -u | grep -v '^$') || true
 
   if [[ -z "$changed" ]]; then
     echo "  No new/changed crates."
     return
   fi
 
-  while IFS=$'\t' read -r name version; do
+  while IFS= read -r entry; do
+    local version="${entry##*@}"
+    local name="${entry%@"$version"}"
     [[ -z "$name" || -z "$version" ]] && continue
-
-    # Skip git-sourced crates (they won't have a crates.io publish date)
-    if git diff "${BASE_REF}" -- "$RUST_MODULE_FILE" \
-        | grep -A5 "package = \"${name}\"" \
-        | grep -q 'git\s*='; then
-      continue
-    fi
 
     local publish_time
     publish_time=$(curl -sf -H "User-Agent: dependency-age-check-action" \
