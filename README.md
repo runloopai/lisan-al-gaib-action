@@ -16,7 +16,7 @@ A GitHub Action that acts as a supply-chain security gate by failing if newly ad
 ## Quick start
 
 ```yaml
-- uses: your-org/lisan-al-gaib-action@main
+- uses: runloopai/lisan-al-gaib-action@main
   with:
     ecosystems: npm
 ```
@@ -95,7 +95,7 @@ jobs:
 ### Multiple ecosystems with custom thresholds
 
 ```yaml
-- uses: your-org/lisan-al-gaib-action@main
+- uses: runloopai/lisan-al-gaib-action@main
   with:
     ecosystems: npm,python,rust,java
     min-age-days: "7"
@@ -117,7 +117,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
-      - uses: your-org/lisan-al-gaib-action@main
+      - uses: runloopai/lisan-al-gaib-action@main
         with:
           ecosystems: npm,python
 ```
@@ -125,7 +125,7 @@ jobs:
 ### Monorepo with multiple lockfiles
 
 ```yaml
-- uses: your-org/lisan-al-gaib-action@main
+- uses: runloopai/lisan-al-gaib-action@main
   with:
     ecosystems: npm
     node-lockfiles: |
@@ -136,7 +136,7 @@ jobs:
 ### Check GitHub Actions versions
 
 ```yaml
-- uses: your-org/lisan-al-gaib-action@main
+- uses: runloopai/lisan-al-gaib-action@main
   with:
     ecosystems: actions
 ```
@@ -146,7 +146,7 @@ Actions pinned to a branch (e.g. `@main`) are skipped. Actions pinned to a tag (
 ### Check Bazel module dependencies
 
 ```yaml
-- uses: your-org/lisan-al-gaib-action@main
+- uses: runloopai/lisan-al-gaib-action@main
   with:
     ecosystems: bazel
 ```
@@ -178,7 +178,7 @@ For every analyzed dependency, the action fetches the license from the package r
 ### Custom registry URL
 
 ```yaml
-- uses: your-org/lisan-al-gaib-action@main
+- uses: runloopai/lisan-al-gaib-action@main
   with:
     ecosystems: npm
     npm-registry-url: "https://npm.pkg.github.com"
