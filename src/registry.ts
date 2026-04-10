@@ -68,7 +68,7 @@ export async function cratesPublishDate(
 ): Promise<Date | null> {
   const data = (await fetchJson(
     `${registries.crates}/api/v1/crates/${name}`,
-    { "User-Agent": "dependency-age-check-action" },
+    { "User-Agent": "lisan-al-gaib-action" },
   )) as {
     versions?: Array<{ num: string; created_at?: string }>;
   } | null;
@@ -131,7 +131,7 @@ export async function bcrPublishDate(
 ): Promise<Date | null> {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
-    "User-Agent": "dependency-age-check-action",
+    "User-Agent": "lisan-al-gaib-action",
     "X-GitHub-Api-Version": "2022-11-28",
   };
   if (token) {
@@ -210,7 +210,7 @@ export async function gitCommitDate(
 
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
-    "User-Agent": "dependency-age-check-action",
+    "User-Agent": "lisan-al-gaib-action",
     "X-GitHub-Api-Version": "2022-11-28",
   };
   if (token) {

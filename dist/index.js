@@ -67178,7 +67178,7 @@ async function pypiPublishDate(name, version, registries) {
     return time ? new Date(time) : null;
 }
 async function cratesPublishDate(name, version, registries) {
-    const data = (await fetchJson(`${registries.crates}/api/v1/crates/${name}`, { "User-Agent": "dependency-age-check-action" }));
+    const data = (await fetchJson(`${registries.crates}/api/v1/crates/${name}`, { "User-Agent": "lisan-al-gaib-action" }));
     const entry = data?.versions?.find((v) => v.num === version);
     return entry?.created_at ? new Date(entry.created_at) : null;
 }
@@ -67217,7 +67217,7 @@ async function mavenPublishDate(group, artifact, version, repositories, registri
 async function bcrPublishDate(name, version, token, bcrUrl) {
     const headers = {
         Accept: "application/vnd.github+json",
-        "User-Agent": "dependency-age-check-action",
+        "User-Agent": "lisan-al-gaib-action",
         "X-GitHub-Api-Version": "2022-11-28",
     };
     if (token) {
@@ -67281,7 +67281,7 @@ async function gitCommitDate(remote, ref, token) {
     const repo = ghMatch[2];
     const headers = {
         Accept: "application/vnd.github+json",
-        "User-Agent": "dependency-age-check-action",
+        "User-Agent": "lisan-al-gaib-action",
         "X-GitHub-Api-Version": "2022-11-28",
     };
     if (token) {
@@ -69254,7 +69254,7 @@ async function actions_getPublishDate(name, ref, token) {
     const repo = parts[1];
     const headers = {
         Accept: "application/vnd.github+json",
-        "User-Agent": "dependency-age-check-action",
+        "User-Agent": "lisan-al-gaib-action",
         "X-GitHub-Api-Version": "2022-11-28",
     };
     if (token) {
@@ -69405,7 +69405,7 @@ async function writeSummary(results, minAgeDays, warnAgeDays, licenseResults = [
         fail: "❌",
         unknown: "❓",
     };
-    core.summary.addHeading("Dependency Age Check", 2);
+    core.summary.addHeading("Lisan al-Gaib", 2);
     core.summary.addRaw(`Minimum age: **${minAgeDays}d** | Warning threshold: **${warnAgeDays}d**\n\n`);
     core.summary.addTable([
         [
@@ -69613,7 +69613,7 @@ async function fetchPypiLicense(name, version, registries) {
 async function fetchCrateLicense(name, version, registries) {
     try {
         const resp = await fetch(`${registries.crates}/api/v1/crates/${name}/${version}`, {
-            headers: { "User-Agent": "dependency-age-check-action" },
+            headers: { "User-Agent": "lisan-al-gaib-action" },
         });
         if (!resp.ok)
             return null;
@@ -69663,7 +69663,7 @@ async function fetchGitHubRepoLicense(name, token) {
     const repo = parts[1];
     const headers = {
         Accept: "application/vnd.github+json",
-        "User-Agent": "dependency-age-check-action",
+        "User-Agent": "lisan-al-gaib-action",
         "X-GitHub-Api-Version": "2022-11-28",
     };
     if (token) {

@@ -184,7 +184,7 @@ export async function fetchCrateLicense(
 ): Promise<string | null> {
   try {
     const resp = await fetch(`${registries.crates}/api/v1/crates/${name}/${version}`, {
-      headers: { "User-Agent": "dependency-age-check-action" },
+      headers: { "User-Agent": "lisan-al-gaib-action" },
     });
     if (!resp.ok) return null;
     const data = (await resp.json()) as { version?: { license?: string } };
@@ -239,7 +239,7 @@ export async function fetchGitHubRepoLicense(
 
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
-    "User-Agent": "dependency-age-check-action",
+    "User-Agent": "lisan-al-gaib-action",
     "X-GitHub-Api-Version": "2022-11-28",
   };
   if (token) {

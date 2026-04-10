@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * CLI entry point for running the dependency age check locally.
+ * CLI entry point for running lisan-al-gaib locally.
  *
  * Usage:
- *   npx dependency-age-check [options]
+ *   npx lisan-al-gaib [options]
  *   pnpm local [-- options]
  *
  * Modes:
