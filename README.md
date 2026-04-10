@@ -1,4 +1,4 @@
-# Dependency Age Check
+# Lisan al-Gaib
 
 A GitHub Action that acts as a supply-chain security gate by failing if newly added or updated packages were published less than a configurable number of days ago.
 
@@ -16,7 +16,7 @@ A GitHub Action that acts as a supply-chain security gate by failing if newly ad
 ## Quick start
 
 ```yaml
-- uses: your-org/dependency-age-check-action@main
+- uses: your-org/lisan-al-gaib-action@main
   with:
     ecosystems: npm
 ```
@@ -87,7 +87,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: runloopai/dependency-age-check-action@main
+      - uses: runloopai/lisan-al-gaib-action@main
         with:
           ecosystems: npm
 ```
@@ -95,7 +95,7 @@ jobs:
 ### Multiple ecosystems with custom thresholds
 
 ```yaml
-- uses: your-org/dependency-age-check-action@main
+- uses: your-org/lisan-al-gaib-action@main
   with:
     ecosystems: npm,python,rust,java
     min-age-days: "7"
@@ -117,7 +117,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
-      - uses: your-org/dependency-age-check-action@main
+      - uses: your-org/lisan-al-gaib-action@main
         with:
           ecosystems: npm,python
 ```
@@ -125,7 +125,7 @@ jobs:
 ### Monorepo with multiple lockfiles
 
 ```yaml
-- uses: your-org/dependency-age-check-action@main
+- uses: your-org/lisan-al-gaib-action@main
   with:
     ecosystems: npm
     node-lockfiles: |
@@ -136,7 +136,7 @@ jobs:
 ### Check GitHub Actions versions
 
 ```yaml
-- uses: your-org/dependency-age-check-action@main
+- uses: your-org/lisan-al-gaib-action@main
   with:
     ecosystems: actions
 ```
@@ -146,7 +146,7 @@ Actions pinned to a branch (e.g. `@main`) are skipped. Actions pinned to a tag (
 ### Check Bazel module dependencies
 
 ```yaml
-- uses: your-org/dependency-age-check-action@main
+- uses: your-org/lisan-al-gaib-action@main
   with:
     ecosystems: bazel
 ```
@@ -160,7 +160,7 @@ Parses `MODULE.bazel.lock` for resolved module versions and queries the Bazel Ce
 ### License compliance
 
 ```yaml
-- uses: runloopai/dependency-age-check-action@main
+- uses: runloopai/lisan-al-gaib-action@main
   with:
     ecosystems: npm
     # Use default permissive license set
@@ -178,7 +178,7 @@ For every analyzed dependency, the action fetches the license from the package r
 ### Custom registry URL
 
 ```yaml
-- uses: your-org/dependency-age-check-action@main
+- uses: your-org/lisan-al-gaib-action@main
   with:
     ecosystems: npm
     npm-registry-url: "https://npm.pkg.github.com"
@@ -215,7 +215,7 @@ For the Actions ecosystem, it parses workflow YAML files for `uses:` directives,
 If you need to merge a PR with a dependency that fails the age gate (e.g., a critical 0-day vulnerability fix), set the `bypass-keyword` input:
 
 ```yaml
-- uses: runloopai/dependency-age-check-action@main
+- uses: runloopai/lisan-al-gaib-action@main
   with:
     ecosystems: npm
     bypass-keyword: "DEPENDENCY-AGE-BYPASS"
@@ -284,3 +284,11 @@ You can also run directly with Node after building:
 pnpm build
 node out/cli.js --ecosystems npm --diff
 ```
+
+## Etymology
+
+**Lisan al-Gaib** (لسان الغيب, "Voice from the Outer World") is a messianic figure in Frank Herbert's *Dune* universe — the prophesied leader who would deliver the Fremen from oppression. In the story, the Lisan al-Gaib defeats **Shai-Hulud**, the colossal sandworms that dominate the deserts of Arrakis.
+
+The name is fitting for this action because **Shai-Hulud** is also the name given to a series of devastating npm supply chain attacks that began in September 2025. The Shai-Hulud worm compromised over 500 npm packages — collectively downloaded 132 million times per month — by hijacking maintainer credentials and automatically republishing all of a victim's packages with malicious payloads. Like its namesake sandworm, the malware burrowed through the ecosystem, using TruffleHog to scan for secrets (GitHub tokens, AWS/GCP/Azure keys) and self-replicating across every package owned by a compromised maintainer. A second wave in November 2025 impacted tens of thousands of GitHub repositories.
+
+Just as the Lisan al-Gaib tamed the sandworms, this action guards your repository against the supply chain threats that Shai-Hulud exploited — by ensuring that newly published packages have had time to be vetted by the community before they enter your dependency tree.

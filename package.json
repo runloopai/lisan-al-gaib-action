@@ -1,5 +1,5 @@
 {
-  "name": "dependency-age-check-action",
+  "name": "lisan-al-gaib-action",
   "version": "1.0.0",
   "private": true,
   "packageManager": "pnpm@10.33.0",
@@ -8,7 +8,7 @@
     "node": ">=24"
   },
   "bin": {
-    "dependency-age-check": "out/cli.js"
+    "lisan-al-gaib": "out/cli.js"
   },
   "scripts": {
     "build": "tsc && ncc build out/main.js -o dist",

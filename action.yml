@@ -1,4 +1,4 @@
-name: Dependency Age Check
+name: Lisan al-Gaib
 description: >
   Supply-chain security gate that fails if newly added/updated packages were
   published less than a configurable number of days ago. Supports npm/pnpm/yarn/bun,

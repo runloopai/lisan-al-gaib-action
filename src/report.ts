@@ -124,7 +124,7 @@ export async function writeSummary(
     unknown: "❓",
   };
 
-  core.summary.addHeading("Dependency Age Check", 2);
+  core.summary.addHeading("Lisan al-Gaib", 2);
   core.summary.addRaw(
     `Minimum age: **${minAgeDays}d** | Warning threshold: **${warnAgeDays}d**\n\n`,
   );

@@ -130,7 +130,7 @@ describe("writeSummary", () => {
       14,
       21,
     );
-    expect(core.summary.addHeading).toHaveBeenCalledWith("Dependency Age Check", 2);
+    expect(core.summary.addHeading).toHaveBeenCalledWith("Lisan al-Gaib", 2);
     expect(core.summary.addTable).toHaveBeenCalled();
   });
 
