@@ -1,0 +1,5 @@
+# Mark dist folder as generated
+dist/**/*.js -diff -merge linguist-generated=true
+dist/**/*.wasm linguist-generated=true
+dist/**/*.json -merge linguist-vendored=true
+
