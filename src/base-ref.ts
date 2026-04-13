@@ -28,7 +28,7 @@ async function refExists(ref: string): Promise<boolean> {
 }
 
 function isZeroSha(sha: string): boolean {
-  return /^0+$/.test(sha);
+  return /^0{40}$/.test(sha);
 }
 
 export function resolveBaseRef(inputBaseRef: string): string {
@@ -104,5 +104,62 @@ export async function validateBaseRef(ref: string): Promise<string> {
 
   // Initial commit — nothing to diff against
   core.info("No valid base ref found — using empty tree (initial commit)");
-  return "4b825dc642cb6eb9a060e54bf899d15363461264";
+  return "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+}
+
+async function isShallowRepo(): Promise<boolean> {
+  let output = "";
+  const exitCode = await exec.exec(
+    "git",
+    ["rev-parse", "--is-shallow-repository"],
+    {
+      listeners: { stdout: (data) => (output += data.toString()) },
+      silent: true,
+      ignoreReturnCode: true,
+    },
+  );
+  return exitCode === 0 && output.trim() === "true";
+}
+
+async function canDiffCommits(ref: string): Promise<boolean> {
+  const exitCode = await exec.exec(
+    "git",
+    ["diff", "--no-patch", ref, "HEAD"],
+    { silent: true, ignoreReturnCode: true },
+  );
+  return exitCode === 0;
+}
+
+export async function ensureBaseRefAvailable(ref: string): Promise<string> {
+  const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+  if (ref === EMPTY_TREE) return ref;
+  if (ref.startsWith("HEAD")) return ref;
+  if (ref.startsWith("origin/")) return ref;
+
+  if (!(await isShallowRepo())) return ref;
+
+  if (await canDiffCommits(ref)) return ref;
+
+  core.info(`Shallow clone: base ref ${ref} not diffable, fetching...`);
+  await exec.exec("git", ["fetch", "origin", ref, "--depth=1"], {
+    silent: true,
+    ignoreReturnCode: true,
+  });
+
+  if (await canDiffCommits(ref)) return ref;
+
+  core.info("Direct fetch didn't help, trying --deepen=2...");
+  await exec.exec(
+    "git",
+    ["fetch", "--deepen=2", "origin"],
+    { silent: true, ignoreReturnCode: true },
+  );
+
+  if (await canDiffCommits(ref)) return ref;
+
+  core.warning(
+    `Cannot diff against ${ref} even after fetching — falling back to empty tree`,
+  );
+  return EMPTY_TREE;
 }

@@ -94,7 +94,7 @@ describe("fetchCrateLicense", () => {
   });
 
   it("returns null on error", async () => {
-    vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("fail"));
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("fail"));
     expect(await fetchCrateLicense("serde", "1.0.0", registries)).toBeNull();
   });
 });
@@ -166,7 +166,22 @@ describe("fetchBcrLicense", () => {
     ).toBe("Apache-2.0");
   });
 
-  it("returns null when no licenses", async () => {
+  it("falls back to GitHub homepage when no licenses", async () => {
+    const spy = vi.spyOn(globalThis, "fetch");
+    // First call: BCR metadata with homepage but no licenses
+    spy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ homepage: "https://github.com/owner/repo" })),
+    );
+    // Second call: GitHub license API
+    spy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ license: { spdx_id: "Apache-2.0" } })),
+    );
+    expect(
+      await fetchBcrLicense("mod", "1.0", "https://bcr.bazel.build", "token"),
+    ).toBe("Apache-2.0");
+  });
+
+  it("returns null when no licenses and no homepage", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
       new Response(JSON.stringify({})),
     );
@@ -222,7 +237,7 @@ describe("fetchLicense", () => {
 describe("emitLicenseAnnotations", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("emits error for incompatible licenses", () => {
+  it("emits error for incompatible licenses", async () => {
     const checkResults: CheckResult[] = [
       {
         dep: { ecosystem: "npm", name: "pkg", version: "1.0.0", file: "lock.yaml" },
@@ -231,7 +246,7 @@ describe("emitLicenseAnnotations", () => {
         status: "pass",
       },
     ];
-    const violations = emitLicenseAnnotations(
+    const violations = await emitLicenseAnnotations(
       [{ name: "pkg", version: "1.0.0", ecosystem: "npm", license: "GPL-3.0", spdx: "GPL-3.0-only", compatible: false }],
       checkResults,
     );
@@ -242,8 +257,8 @@ describe("emitLicenseAnnotations", () => {
     );
   });
 
-  it("emits warning for unknown license", () => {
-    const violations = emitLicenseAnnotations(
+  it("emits warning for unknown license", async () => {
+    const violations = await emitLicenseAnnotations(
       [{ name: "pkg", version: "1.0.0", ecosystem: "npm", license: null, spdx: null, compatible: null }],
       [{ dep: { ecosystem: "npm", name: "pkg", version: "1.0.0", file: "f" }, publishDate: null, ageDays: 30, status: "pass" }],
     );
@@ -254,8 +269,8 @@ describe("emitLicenseAnnotations", () => {
     );
   });
 
-  it("returns 0 for all compatible", () => {
-    const violations = emitLicenseAnnotations(
+  it("returns 0 for all compatible", async () => {
+    const violations = await emitLicenseAnnotations(
       [{ name: "pkg", version: "1.0.0", ecosystem: "npm", license: "MIT", spdx: "MIT", compatible: true }],
       [],
     );
@@ -327,7 +342,7 @@ describe("checkLicenses", () => {
     ];
     const lr = await checkLicenses(
       results,
-      ["MIT"],
+      new Map([["*", ["MIT"]]]),
       registries,
       new Map(),
       "",

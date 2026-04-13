@@ -62,6 +62,37 @@ describe("parseModuleLock", () => {
     expect(modules.size).toBe(0);
   });
 
+  it("parses v24 format using registryFileHashes source.json", () => {
+    const content = JSON.stringify({
+      lockFileVersion: 24,
+      registryFileHashes: {
+        "https://bcr.bazel.build/modules/rules_java/8.12.0/MODULE.bazel": "abc123",
+        "https://bcr.bazel.build/modules/rules_java/8.12.0/source.json": "def456",
+        "https://bcr.bazel.build/modules/protobuf/29.3/MODULE.bazel": "111",
+        "https://bcr.bazel.build/modules/protobuf/29.3/source.json": "222",
+        "https://bcr.bazel.build/modules/protobuf/28.0/MODULE.bazel": "333",
+        // No source.json for 28.0 — not selected
+      },
+    });
+    const modules = parseModuleLock(content);
+    expect(modules.size).toBe(2);
+    expect(modules.get("rules_java")).toBe("8.12.0");
+    expect(modules.get("protobuf")).toBe("29.3");
+  });
+
+  it("handles non-standard source.json URL format without crashing", () => {
+    const content = JSON.stringify({
+      lockFileVersion: 24,
+      registryFileHashes: {
+        "https://custom-registry.example.com/source.json": "abc123",
+        "https://bcr.bazel.build/modules/rules_java/8.12.0/source.json": "def456",
+      },
+    });
+    const modules = parseModuleLock(content);
+    expect(modules.size).toBe(1);
+    expect(modules.get("rules_java")).toBe("8.12.0");
+  });
+
   it("skips entries without name or version", () => {
     const content = JSON.stringify({
       moduleDepGraph: {

@@ -57,7 +57,7 @@ async function main() {
   let baseRef: string;
   if (args["all"]) {
     // Empty tree SHA — diffs everything
-    baseRef = "4b825dc642cb6eb9a060e54bf899d15363461264";
+    baseRef = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
   } else if (args["diff"]) {
     baseRef = "HEAD";
   } else if (args["base-ref"]) {
@@ -73,7 +73,6 @@ async function main() {
     "warn-age-days": args["warn-age-days"] ?? "21",
     "base-ref": baseRef,
     "module-bazel": args["module-bazel"] ?? "MODULE.bazel",
-    "module-bazel-lock": args["module-bazel-lock"] ?? "MODULE.bazel.lock",
     "node-lockfiles": args["node-lockfiles"] ?? "",
     "python-lockfiles": args["python-lockfiles"] ?? "",
     "workflow-files": args["workflow-files"] ?? "",
@@ -86,7 +85,11 @@ async function main() {
     "check-all-on-new-workflow": "false",
     "strict-third-party": args["strict-third-party"] ?? "false",
     "bypass-keyword": "",
+    "target-licenses": args["target-licenses"] ?? "",
     "allowed-licenses": args["allowed-licenses"] ?? "auto",
+    "age-overrides": args["age-overrides"] ?? "",
+    "license-overrides": args["license-overrides"] ?? "",
+    "license-heuristics": args["license-heuristics"] ?? "true",
   };
 
   for (const [key, value] of Object.entries(inputs)) {

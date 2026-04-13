@@ -1,5 +1,6 @@
 import * as core from "@actions/core";
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import {
   resolveModuleFiles,
   extractMavenInstalls,
@@ -34,6 +35,7 @@ export async function getChangedDeps(
   moduleBazelPath: string,
 ): Promise<{ deps: ChangedDep[]; repositories: Map<string, string[]> }> {
   const moduleFiles = await resolveModuleFiles(moduleBazelPath);
+  const workspaceRoot = path.resolve(path.dirname(moduleBazelPath));
   const allInstalls: MavenInstall[] = [];
 
   for (const file of moduleFiles) {
@@ -43,7 +45,7 @@ export async function getChangedDeps(
     } catch {
       continue;
     }
-    allInstalls.push(...(await extractMavenInstalls(content)));
+    allInstalls.push(...(await extractMavenInstalls(content, workspaceRoot)));
   }
 
   if (allInstalls.length === 0) {

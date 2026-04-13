@@ -6,7 +6,7 @@ description: >
 
 inputs:
   ecosystems:
-    description: Comma-separated list of ecosystems to check (npm, python, rust, java, bazel, actions)
+    description: Comma-separated list of ecosystems to check (npm, python, rust, java, bazel, actions, multitool)
     required: true
   min-age-days:
     description: Minimum number of days since publication to pass
@@ -44,10 +44,6 @@ inputs:
     description: Path to root MODULE.bazel file (used by rust, java, and bazel ecosystems)
     required: false
     default: MODULE.bazel
-  module-bazel-lock:
-    description: Path to MODULE.bazel.lock file (used by bazel ecosystem)
-    required: false
-    default: MODULE.bazel.lock
   workflow-files:
     description: >
       Newline-separated glob patterns for GitHub Actions workflow files.
@@ -107,15 +103,59 @@ inputs:
     required: false
     default: "https://repo1.maven.org/maven2"
 
-  allowed-licenses:
+  target-licenses:
     description: >
-      Comma-separated list of allowed SPDX license identifiers. Each
-      analyzed dependency's license is fetched from its registry and
-      checked against this list. Set to empty string to skip license
-      checking. Defaults to a set of common permissive licenses
-      (MIT, ISC, BSD-2-Clause, BSD-3-Clause, Apache-2.0, etc.).
+      YAML mapping of ecosystem names to comma-separated SPDX license
+      identifiers. Use "*" as a fallback for unlisted ecosystems. A
+      dependency is allowed if its license is compatible with any of
+      its ecosystem's target licenses. Set to "auto" to detect from
+      LICENSE/package.json. Set to empty string to skip license checking.
+      Example:
+        target-licenses: |
+          "*": Apache-2.0
+          rust: Apache-2.0, MIT
+          npm: MIT
+      A plain string (e.g. "GPL-3.0-or-later") is treated as a
+      wildcard applying to all ecosystems.
     required: false
     default: "auto"
+  allowed-licenses:
+    description: >
+      Deprecated: use target-licenses instead. If target-licenses is set,
+      this input is ignored.
+    required: false
+    default: ""
+  age-overrides:
+    description: >
+      YAML mapping of ecosystem to list of package names excluded from age
+      checking. Example:
+        age-overrides: |
+          npm:
+            - some-legacy-package
+          python:
+            - internal-tool
+    required: false
+    default: ""
+  license-overrides:
+    description: >
+      YAML mapping of ecosystem → package → SPDX license or "ignore".
+      Use this to override licenses that cannot be auto-detected or to
+      exclude packages from license checking. Example:
+        license-overrides: |
+          multitool:
+            buildifier: Apache-2.0
+          actions:
+            owner/repo: ignore
+    required: false
+    default: ""
+  license-heuristics:
+    description: >
+      When true, infer licenses from LICENSE/README file text
+      using heuristic matching. When false, only use registry metadata
+      and GitHub API; packages without explicit license metadata will be
+      reported as unknown.
+    required: false
+    default: "false"
 
 outputs:
   total-checked:

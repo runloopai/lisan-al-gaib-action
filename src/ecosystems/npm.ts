@@ -23,15 +23,42 @@ function detectType(file: string): LockType {
   if (base === "package-lock.json") return "npm";
   if (base === "yarn.lock") return "yarn";
   if (base === "bun.lock") return "bun";
-  if (base.endsWith(".yaml") || base.endsWith(".yml")) return "pnpm";
+  if (base.endsWith(".yaml") || base.endsWith(".yml")) {
+    core.debug(`npm: treating ${file} as pnpm lockfile based on extension`);
+    return "pnpm";
+  }
+  core.debug(`npm: treating ${file} as npm lockfile (default fallback)`);
   return "npm";
+}
+
+/**
+ * Resolve npm aliases. In pnpm lockfiles, aliased packages like
+ * `string-width-cjs: string-width@4.2.3` produce version = "string-width@4.2.3".
+ * Returns [resolvedName, resolvedVersion].
+ */
+function resolveAlias(name: string, version: string): [string, string] {
+  // Pattern: version contains "@" with a real package name prefix
+  // e.g. "string-width@4.2.3" or "@scope/pkg@1.0.0"
+  const atIdx = version.startsWith("@")
+    ? version.indexOf("@", 1)  // scoped: find second @
+    : version.indexOf("@");
+  if (atIdx > 0) {
+    const realName = version.slice(0, atIdx);
+    const realVersion = version.slice(atIdx + 1);
+    // Sanity check: realVersion should look like a version (starts with digit)
+    if (/^\d/.test(realVersion)) {
+      return [realName, realVersion];
+    }
+  }
+  return [name, version];
 }
 
 /** Flatten a parsed lockfile into a map of name -> version. */
 function collectPackages(deps: ParsedDependency[]): Map<string, string> {
   const result = new Map<string, string>();
   for (const dep of deps) {
-    result.set(dep.name, dep.version);
+    const [name, version] = resolveAlias(dep.name, dep.version);
+    result.set(name, version);
   }
   return result;
 }

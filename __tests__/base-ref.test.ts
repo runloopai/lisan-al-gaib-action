@@ -137,7 +137,7 @@ describe("validateBaseRef", () => {
   it("falls back to empty tree when everything fails", async () => {
     vi.mocked(exec.exec).mockResolvedValue(1);
     expect(await validateBaseRef("bad-ref")).toBe(
-      "4b825dc642cb6eb9a060e54bf899d15363461264",
+      "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
     );
   });
 });

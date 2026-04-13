@@ -19,6 +19,8 @@ jobs:
     steps:
       - uses: runloopai/checkout@main
       - uses: runloopai/pnpm-action@master
+        with:
+          version: ^10.16
       - uses: runloopai/setup-node@main
         with:
           node-version-file: package.json

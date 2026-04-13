@@ -21,7 +21,6 @@ describe("getInputs", () => {
         "node-lockfiles": "",
         "python-lockfiles": "",
         "module-bazel": "MODULE.bazel",
-        "module-bazel-lock": "MODULE.bazel.lock",
         "workflow-files": "",
         "github-token": "tok",
         "bcr-url": "https://bcr.bazel.build",
@@ -89,7 +88,6 @@ describe("getInputs", () => {
   it("uses defaults for empty optional inputs", () => {
     const inputs = getInputs();
     expect(inputs.moduleBazel).toBe("MODULE.bazel");
-    expect(inputs.moduleBazelLock).toBe("MODULE.bazel.lock");
     expect(inputs.allowedLicenses).toBe("auto");
   });
 });

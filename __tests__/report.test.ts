@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { determineStatus, sortedByStatus, reportTotals } from "../src/report.js";
+import { determineStatus, sortedByStatus, reportTotals, versionAtLeast, parseExcludeNewerDays } from "../src/report.js";
 import type { CheckResult, DepStatus } from "../src/ecosystems/types.js";
 
 function makeResult(status: DepStatus, name = "pkg"): CheckResult {
@@ -53,13 +53,13 @@ describe("sortedByStatus", () => {
     expect(sorted.map((r) => r.status)).toEqual(["fail", "warn", "unknown", "pass"]);
   });
 
-  it("preserves order within same status", () => {
+  it("sorts by name within same status", () => {
     const input = [
       makeResult("fail", "b"),
       makeResult("fail", "a"),
     ];
     const sorted = sortedByStatus(input);
-    expect(sorted.map((r) => r.dep.name)).toEqual(["b", "a"]);
+    expect(sorted.map((r) => r.dep.name)).toEqual(["a", "b"]);
   });
 
   it("does not mutate original array", () => {
@@ -89,5 +89,58 @@ describe("reportTotals", () => {
 
   it("returns zeros for empty input", () => {
     expect(reportTotals([])).toEqual({ checked: 0, failures: 0, warnings: 0 });
+  });
+});
+
+describe("versionAtLeast", () => {
+  it("equal versions", () => {
+    expect(versionAtLeast("1.2.3", "1.2.3")).toBe(true);
+  });
+
+  it("greater major", () => {
+    expect(versionAtLeast("2.0.0", "1.9.9")).toBe(true);
+  });
+
+  it("lesser minor", () => {
+    expect(versionAtLeast("1.0.0", "1.1.0")).toBe(false);
+  });
+
+  it("missing patch in actual", () => {
+    expect(versionAtLeast("1.2", "1.2.0")).toBe(true);
+    expect(versionAtLeast("1.2", "1.2.1")).toBe(false);
+  });
+
+  it("returns false for NaN segments", () => {
+    expect(versionAtLeast("1.x.0", "1.0.0")).toBe(false);
+  });
+});
+
+describe("parseExcludeNewerDays", () => {
+  it("parses '14 days'", () => {
+    expect(parseExcludeNewerDays("14 days")).toBe(14);
+  });
+
+  it("parses '1 day'", () => {
+    expect(parseExcludeNewerDays("1 day")).toBe(1);
+  });
+
+  it("parses 'P14D'", () => {
+    expect(parseExcludeNewerDays("P14D")).toBe(14);
+  });
+
+  it("parses RFC 3339 timestamp", () => {
+    const daysAgo = 10;
+    const ts = new Date(Date.now() - daysAgo * 86_400_000).toISOString();
+    const result = parseExcludeNewerDays(ts);
+    expect(result).toBeGreaterThanOrEqual(daysAgo - 1);
+    expect(result).toBeLessThanOrEqual(daysAgo + 1);
+  });
+
+  it("returns null for garbage", () => {
+    expect(parseExcludeNewerDays("not-a-date")).toBe(null);
+  });
+
+  it("returns null for empty string", () => {
+    expect(parseExcludeNewerDays("")).toBe(null);
   });
 });

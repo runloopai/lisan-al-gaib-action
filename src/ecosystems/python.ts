@@ -11,12 +11,13 @@ type LockFormat = "uv" | "pylock";
 function detectFormat(file: string): LockFormat {
   const base = path.basename(file);
   if (base === "pylock.toml" || base.startsWith("pylock.")) return "pylock";
-  return "uv";
+  return "uv"; // uv.lock and *.py.lock (script lockfiles)
 }
 
 interface UvPackage {
   name?: string;
   version?: string;
+  source?: { registry?: string; editable?: string; directory?: string; virtual?: string };
 }
 
 interface PylockPackage {
@@ -31,9 +32,11 @@ function parseUvLock(content: string): Map<string, string> {
     const data = parseToml(content) as { package?: UvPackage[] };
     if (Array.isArray(data.package)) {
       for (const pkg of data.package) {
-        if (pkg.name && pkg.version) {
-          result.set(pkg.name, pkg.version);
-        }
+        if (!pkg.name || !pkg.version) continue;
+        // Skip local/editable/virtual packages (workspace deps)
+        const src = pkg.source;
+        if (src && (src.editable || src.directory || src.virtual)) continue;
+        result.set(pkg.name, pkg.version);
       }
     }
   } catch (e) {
@@ -97,6 +100,15 @@ export function findChangedPackages(
 
 const DEFAULT_LOCKFILES = ["uv.lock", "pylock.toml"];
 
+/** Check if a file path looks like a Python lockfile we handle. */
+function isPythonLockfile(file: string): boolean {
+  const base = path.basename(file);
+  if (DEFAULT_LOCKFILES.includes(base)) return true;
+  // uv lock --script creates *.py.lock adjacent to the script
+  if (base.endsWith(".py.lock")) return true;
+  return false;
+}
+
 export async function getChangedDeps(
   baseRef: string,
   lockfileInput: string,
@@ -108,9 +120,9 @@ export async function getChangedDeps(
     const changedFiles = await gitDiffNameOnly(baseRef);
     lockfiles = changedFiles.filter((f) => allLockfiles.has(f));
   } else {
-    // Auto-detect: find which default lockfiles were changed
-    const changedFiles = new Set(await gitDiffNameOnly(baseRef));
-    lockfiles = DEFAULT_LOCKFILES.filter((f) => changedFiles.has(f));
+    // Auto-detect: find changed lockfiles (known names + *.py.lock pattern)
+    const changedFiles = await gitDiffNameOnly(baseRef);
+    lockfiles = changedFiles.filter((f) => isPythonLockfile(f));
   }
 
   if (lockfiles.length === 0) {

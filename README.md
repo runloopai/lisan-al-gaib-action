@@ -7,11 +7,12 @@ A GitHub Action that acts as a supply-chain security gate by failing if newly ad
 | Ecosystem | Lockfiles | Registry |
 |-----------|-----------|----------|
 | **npm** | `pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, `bun.lock` | npm registry |
-| **python** | `uv.lock`, `pylock.toml` (PEP 751) | PyPI |
+| **python** | `uv.lock`, `*.py.lock` (script lockfiles), `pylock.toml` (PEP 751) | PyPI |
 | **rust** | `MODULE.bazel` with `crate.spec()` | crates.io |
 | **java** | `MODULE.bazel` with `maven.install()` + JSON lock files | Maven Central / custom repos |
 | **bazel** | `MODULE.bazel.lock` | Bazel Central Registry (BCR) |
 | **actions** | `.github/workflows/*.yml`, `action.yml` | GitHub API |
+| **multitool** | `multitool.hub()` lockfiles via `MODULE.bazel` | Archive `Last-Modified` headers |
 
 ## Quick start
 
@@ -41,14 +42,13 @@ You can always override with the `base-ref` input.
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `ecosystems` | Yes | | Comma-separated list: `npm`, `python`, `rust`, `java`, `bazel`, `actions` |
+| `ecosystems` | Yes | | Comma-separated list: `npm`, `python`, `rust`, `java`, `bazel`, `actions`, `multitool` |
 | `min-age-days` | No | `14` | Minimum days since publication to pass |
 | `warn-age-days` | No | `21` | Age threshold for warnings (between min and warn = warning, above = pass) |
 | `base-ref` | No | auto-detect | Git ref to diff against |
 | `node-lockfiles` | No | auto-detect | Newline-separated glob patterns for Node.js lockfiles |
 | `python-lockfiles` | No | auto-detect | Newline-separated glob patterns for Python lockfiles |
-| `module-bazel` | No | `MODULE.bazel` | Path to root MODULE.bazel (for rust/java/bazel ecosystems) |
-| `module-bazel-lock` | No | `MODULE.bazel.lock` | Path to MODULE.bazel.lock (for bazel ecosystem) |
+| `module-bazel` | No | `MODULE.bazel` | Path to root MODULE.bazel (for rust/java/bazel/multitool ecosystems) |
 | `workflow-files` | No | auto-detect | Newline-separated glob patterns for workflow files (for actions ecosystem) |
 | `strict-third-party` | No | `false` | Fail (instead of warn) on archive overrides without `Last-Modified` and third-party branch-pinned actions |
 | `bypass-keyword` | No | `""` | If the PR body contains this string on a line by itself, failures are downgraded to warnings |
@@ -58,7 +58,12 @@ You can always override with the `base-ref` input.
 | `pypi-registry-url` | No | `https://pypi.org` | PyPI registry URL |
 | `crates-registry-url` | No | `https://crates.io` | crates.io registry URL |
 | `maven-registry-url` | No | `https://repo1.maven.org/maven2` | Maven Central registry URL |
-| `allowed-licenses` | No | `auto` | Comma-separated SPDX license IDs. `auto` uses a default permissive set (MIT, ISC, BSD, Apache-2.0, etc.). Empty string disables license checking. |
+| `target-licenses` | No | `auto` | SPDX license(s) your project is distributed under. Deps must be compatible with the target. Supports per-ecosystem YAML map, special aliases (`open-source`, `open-source-no-strong-copyleft`, `open-source-no-relinkable-copyleft`, `open-source-no-network-copyleft`), or `auto` to detect from `package.json`/`LICENSE`. Empty string disables license checking. |
+| `allowed-licenses` | No | `""` | **Deprecated** — use `target-licenses`. Ignored when `target-licenses` is set. |
+| `age-overrides` | No | `""` | YAML map of `ecosystem → list of package names` to skip age checking for specific packages |
+| `license-overrides` | No | `""` | YAML map of `ecosystem → package → SPDX license or "ignore"` to override or skip license checking |
+| `license-heuristics` | No | `false` | When true, infer licenses from LICENSE/README file text using heuristic matching. When false, only use registry metadata and GitHub API. |
+| `bcr-url` | No | `https://bcr.bazel.build` | Bazel Central Registry URL |
 
 ## Outputs
 
@@ -163,17 +168,59 @@ Parses `MODULE.bazel.lock` for resolved module versions and queries the Bazel Ce
 - uses: runloopai/lisan-al-gaib-action@main
   with:
     ecosystems: npm
-    # Use default permissive license set
-    allowed-licenses: auto
+    # Auto-detect your project's license from package.json or LICENSE file
+    target-licenses: auto
 
-    # Or specify exactly which licenses are allowed
-    # allowed-licenses: "MIT,Apache-2.0,ISC,BSD-2-Clause,BSD-3-Clause"
+    # Or specify your project's license explicitly
+    # target-licenses: "MIT"
+
+    # Per-ecosystem targets (YAML map)
+    # target-licenses: |
+    #   "*": Apache-2.0
+    #   rust: Apache-2.0, MIT
+    #   npm: MIT
+
+    # Special aliases:
+    # target-licenses: "open-source"                           # any OSI-approved license
+    # target-licenses: "open-source-no-relinkable-copyleft"    # OSI minus LGPL/GPL/AGPL (allows MPL, CDDL, EPL)
+    # target-licenses: "open-source-no-strong-copyleft"        # OSI minus GPL/AGPL (allows LGPL, MPL, CDDL, EPL)
+    # target-licenses: "open-source-no-network-copyleft"       # OSI minus AGPL
 
     # Disable license checking
-    # allowed-licenses: ""
+    # target-licenses: ""
 ```
 
-For every analyzed dependency, the action fetches the license from the package registry (npm, PyPI, crates.io, Maven POM, GitHub API, BCR metadata) and checks it against the allowed list using SPDX expression matching. Incompatible licenses produce error annotations and fail the check.
+For every analyzed dependency, the action fetches the license from the package registry (npm, PyPI, crates.io, Maven POM, GitHub API, BCR metadata) and checks **directional compatibility** — whether the dependency's license allows incorporation into a project under your target license. This uses a full SPDX compatibility matrix (permissive → copyleft flow, GPL version compatibility, weak copyleft rules, etc.). Incompatible licenses produce error annotations and fail the check.
+
+### License and age overrides
+
+```yaml
+- uses: runloopai/lisan-al-gaib-action@main
+  with:
+    ecosystems: npm,python
+    age-overrides: |
+      npm:
+        - some-legacy-package
+      python:
+        - internal-tool
+    license-overrides: |
+      npm:
+        custom-pkg: MIT
+      actions:
+        owner/repo: ignore
+```
+
+When license violations or unknown licenses are detected, the action suggests a `license-overrides` block as a colored git diff of your workflow file.
+
+### Check Bazel multitool binaries
+
+```yaml
+- uses: runloopai/lisan-al-gaib-action@main
+  with:
+    ecosystems: multitool
+```
+
+Parses `multitool.hub()` calls from `MODULE.bazel` (following `include()` statements), finds the referenced lockfiles, and diffs HEAD vs base to detect changed tool binaries. Each binary's publish date is checked via the `Last-Modified` header of its download URL.
 
 ### Custom registry URL
 
@@ -193,7 +240,7 @@ When violations are detected, the action suggests package manager-level settings
 | pnpm | `pnpm-workspace.yaml` | `minimumReleaseAge: 20160` (minutes) |
 | yarn | `.yarnrc.yml` | `npmMinimalAgeGate: "14d"` |
 | bun | `bunfig.toml` | `[install] minimumReleaseAge = 1209600` (seconds) |
-| uv | `pyproject.toml` | `[tool.uv] exclude-newer = "14 days"` |
+| uv | `pyproject.toml` or `uv.toml` | `[tool.uv] exclude-newer = "14 days"` |
 
 ## How it works
 
@@ -209,6 +256,8 @@ For Rust and Java ecosystems, the action parses `MODULE.bazel` using a tree-sitt
 For the Bazel ecosystem, it parses `MODULE.bazel.lock` (JSON) to find resolved module versions and extracts override directives (`git_override`, `archive_override`, etc.) from `MODULE.bazel` files.
 
 For the Actions ecosystem, it parses workflow YAML files for `uses:` directives, determines whether each ref is a tag or commit SHA (branches are skipped), and queries the GitHub API for the associated date.
+
+For the Multitool ecosystem, it finds `multitool.hub()` calls in `MODULE.bazel`, reads the referenced lockfiles (JSON), and checks each binary's download URL for a `Last-Modified` header.
 
 ## Bypass for emergency fixes
 

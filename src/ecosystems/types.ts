@@ -42,3 +42,16 @@ export interface BazelOverride {
   versions?: string[];
   registry?: string;
 }
+
+export interface MultitoolBinary {
+  kind: string;
+  url: string;
+  sha256: string;
+  os: string;
+  cpu: string;
+  file?: string;
+}
+
+export interface MultitoolEntry {
+  binaries: MultitoolBinary[];
+}

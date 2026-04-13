@@ -1,6 +1,6 @@
 # Project overview
 
-This is a GitHub Action (TypeScript, node24 runtime) that checks whether newly added or updated dependencies were published recently enough to be a supply-chain risk. It supports npm/pnpm/yarn/bun, Python (uv/pylock), Rust (Bazel crate.spec), Java (Bazel maven.install), Bazel module dependencies (MODULE.bazel.lock + BCR), and GitHub Actions (workflow/composite action `uses:` directives).
+This is a GitHub Action (TypeScript, node24 runtime) that checks whether newly added or updated dependencies were published recently enough to be a supply-chain risk. It supports npm/pnpm/yarn/bun, Python (uv/pylock), Rust (Bazel crate.spec), Java (Bazel maven.install), Bazel module dependencies (MODULE.bazel.lock + BCR), GitHub Actions (workflow/composite action `uses:` directives), and Bazel multitool binaries.
 
 # Commands
 
@@ -29,6 +29,7 @@ src/
   registry.ts          # Fetch publish dates from npm/pypi/crates.io/maven/BCR/GitHub
   report.ts            # GitHub annotations, job summary, remediation hints
   bazel.ts             # tree-sitter Starlark parser for MODULE.bazel
+  license.ts           # SPDX license compatibility checking, registry license fetching
   ecosystems/
     types.ts           # Shared interfaces (ChangedDep, CheckResult, etc.)
     npm.ts             # Parse pnpm/npm/yarn/bun lockfiles via lockparse
@@ -37,6 +38,7 @@ src/
     java.ts            # Extract maven.install() from MODULE.bazel, diff lock JSON
     bazel-module.ts    # Parse MODULE.bazel.lock for bazel_dep modules, handle overrides
     actions.ts         # Parse workflow YAML for uses: directives, query GitHub API
+    multitool.ts       # Parse multitool.hub() lockfiles, diff HEAD vs base
 ```
 
 ## Flow
@@ -44,7 +46,8 @@ src/
 1. `main.ts` reads inputs, resolves the base ref (PR base SHA, push before, HEAD~1, etc.), validates it exists
 2. For each ecosystem, the corresponding `ecosystems/*.ts` module diffs HEAD vs base lockfiles to find changed packages
 3. Each changed package's publish date is fetched from the appropriate registry (`registry.ts`)
-4. `report.ts` emits GitHub error/warning annotations, a job summary table, and package manager remediation hints
+4. License compliance is checked via `license.ts` — directional SPDX compatibility (dep license → project target license)
+5. `report.ts` emits GitHub error/warning annotations, a job summary table, and package manager remediation hints
 
 ## Key design decisions
 
@@ -72,13 +75,17 @@ Uses `web-tree-sitter` with `tree-sitter-starlark` WASM to parse MODULE.bazel fi
 - `extractCrateSpecs(content)`: Finds `crate.spec(package=..., version=...)` calls
 - `extractMavenInstalls(content)`: Finds `maven.install(lock_file=..., repositories=..., artifacts=...)` calls
 - `extractOverrides(content)`: Finds `git_override`, `archive_override`, `local_path_override`, `single_version_override`, `multiple_version_override` calls
+- `extractMultitoolHubs(content)`: Finds `multitool.hub(name=..., lockfile=...)` calls
 
 ## Testing
 
 Tests are in `__tests__/` using vitest:
-- `bazel.test.ts` — tree-sitter Starlark parsing (crate.spec, maven.install)
+- `bazel.test.ts` — tree-sitter Starlark parsing (crate.spec, maven.install, multitool.hub)
 - `parsers.test.ts` — Lockfile parsing for all formats (pnpm, npm, yarn, bun, uv, pylock)
 - `report.test.ts` — Status determination boundary conditions
+- `license.test.ts` — SPDX license compatibility and detection
+- `multitool.test.ts` — Multitool lockfile parsing and diffing
+- `actions.test.ts` — GitHub Actions workflow parsing
 
 Run tests: `pnpm test`
 
@@ -95,6 +102,11 @@ Run tests: `pnpm test`
 - `lockparse` — Parse pnpm/npm/yarn/bun lockfiles
 - `smol-toml` — Parse TOML (uv.lock, pylock.toml)
 - `web-tree-sitter`, `tree-sitter-starlark` — Parse Starlark/Bazel files
+- `spdx-correct`, `spdx-satisfies`, `spdx-expression-parse`, `spdx-osi` — SPDX license parsing and compatibility
+- `fast-xml-parser` — Parse Maven POM XML for license extraction
+- `tar-stream` — Extract LICENSE files from tarballs
+- `js-yaml` — Parse YAML inputs (target-licenses, overrides)
+- `semver` — Semver version comparison
 
 ## Dev
 - `typescript`, `@vercel/ncc` — Build toolchain

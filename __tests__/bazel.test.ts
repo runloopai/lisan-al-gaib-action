@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractCrateSpecs, extractMavenInstalls, extractOverrides } from "../src/bazel.js";
+import { extractCrateSpecs, extractMavenInstalls, extractOverrides, extractMultitoolHubs, resolveBazelLabel } from "../src/bazel.js";
 
 describe("extractCrateSpecs", () => {
   it("extracts package and version from crate.spec()", async () => {
@@ -81,7 +81,7 @@ maven.install(
     const installs = await extractMavenInstalls(content);
     expect(installs).toHaveLength(1);
     expect(installs[0].name).toBe("server");
-    expect(installs[0].lockFile).toBe("server:maven_install.json");
+    expect(installs[0].lockFile).toBe("server/maven_install.json");
   });
 
   it("handles multiple maven.install blocks", async () => {
@@ -236,5 +236,74 @@ single_version_override(
     const content = `module(name = "my_project")`;
     const overrides = await extractOverrides(content);
     expect(overrides.size).toBe(0);
+  });
+});
+
+describe("extractMultitoolHubs", () => {
+  it("extracts lockfile paths from multitool.hub() calls", async () => {
+    const content = `
+bazel_dep(name = "rules_multitool", version = "1.11.1", dev_dependency = True)
+multitool = use_extension("@rules_multitool//multitool:extension.bzl", "multitool")
+multitool.hub(lockfile = "//:prebuilt_buildtools.json")
+use_repo(multitool, "multitool")
+`;
+    const hubs = await extractMultitoolHubs(content);
+    expect(hubs).toEqual(["prebuilt_buildtools.json"]);
+  });
+
+  it("handles multiple hub calls", async () => {
+    const content = `
+multitool.hub(lockfile = "//:tools1.json")
+multitool.hub(lockfile = "//sub:tools2.json")
+`;
+    const hubs = await extractMultitoolHubs(content);
+    expect(hubs).toEqual(["tools1.json", "sub/tools2.json"]);
+  });
+
+  it("returns empty array when no multitool.hub calls", async () => {
+    const content = `bazel_dep(name = "rules_go", version = "0.50.1")`;
+    const hubs = await extractMultitoolHubs(content);
+    expect(hubs).toEqual([]);
+  });
+
+  it("skips hub calls without lockfile kwarg", async () => {
+    const content = `
+multitool.hub(lockfile = "//:valid.json")
+multitool.hub(name = "something_else")
+`;
+    const hubs = await extractMultitoolHubs(content);
+    expect(hubs).toEqual(["valid.json"]);
+  });
+});
+
+describe("resolveBazelLabel", () => {
+  it("resolves //pkg:file relative to workspace root", () => {
+    expect(resolveBazelLabel("//rust:rust.MODULE.bazel", "/ws", "/ws/sub")).toBe(
+      "/ws/rust/rust.MODULE.bazel",
+    );
+  });
+
+  it("resolves //:file relative to workspace root", () => {
+    expect(resolveBazelLabel("//:maven_install.json", "/ws", "/ws/sub")).toBe(
+      "/ws/maven_install.json",
+    );
+  });
+
+  it("resolves :file relative to current dir", () => {
+    expect(resolveBazelLabel(":foo.json", "/ws", "/ws/sub")).toBe(
+      "/ws/sub/foo.json",
+    );
+  });
+
+  it("resolves plain paths relative to current dir", () => {
+    expect(resolveBazelLabel("foo.json", "/ws", "/ws/sub")).toBe(
+      "/ws/sub/foo.json",
+    );
+  });
+
+  it("handles //pkg without colon", () => {
+    expect(resolveBazelLabel("//tools/lockfile.json", "/ws", "/ws")).toBe(
+      "/ws/tools/lockfile.json",
+    );
   });
 });
