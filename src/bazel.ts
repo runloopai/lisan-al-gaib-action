@@ -1,46 +1,43 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore — web-tree-sitter 0.24.x uses `export =` which needs esModuleInterop
+import Parser from "web-tree-sitter";
 import type { CrateSpec, MavenInstall, BazelOverride } from "./ecosystems/types.js";
 
 const cwd = process.cwd();
 
-type Parser = import("web-tree-sitter").Parser;
-type Node = import("web-tree-sitter").Node;
-type Language = import("web-tree-sitter").Language;
-type Tree = import("web-tree-sitter").Tree;
+type Node = Parser.SyntaxNode;
+type Tree = Parser.Tree;
 
 let parserPromise: Promise<Parser> | null = null;
 
 async function getParser(): Promise<Parser> {
   if (!parserPromise) {
     parserPromise = (async () => {
-      const { Parser: ParserClass, Language: LanguageClass } = await import("web-tree-sitter");
-      await ParserClass.init();
-      const parser = new ParserClass() as Parser;
-
-      // Locate the WASM file from tree-sitter-starlark package
       const thisDir = path.dirname(fileURLToPath(import.meta.url));
-      const wasmPath = path.resolve(
-        thisDir,
-        "..",
-        "node_modules",
-        "tree-sitter-starlark",
-        "tree-sitter-starlark.wasm",
-      );
 
-      let lang: Language;
-      try {
-        lang = await LanguageClass.load(wasmPath);
-      } catch {
-        const fallback = path.resolve(
-          process.cwd(),
-          "node_modules",
-          "tree-sitter-starlark",
-          "tree-sitter-starlark.wasm",
-        );
-        lang = await LanguageClass.load(fallback);
+      // web-tree-sitter 0.24.x uses __dirname (CJS) but ncc bundles as ESM where
+      // __dirname doesn't exist. Provide it globally for the emscripten init code.
+      if (typeof globalThis.__dirname === "undefined") {
+        (globalThis as Record<string, unknown>).__dirname = thisDir;
       }
+
+      await Parser.init();
+      const parser = new Parser();
+
+      // In the ncc bundle, the WASM is copied to dist/ alongside index.js.
+      // In dev/test, resolve from node_modules.
+      let starlarkWasm = path.resolve(thisDir, "tree-sitter-starlark.wasm");
+      try {
+        await fs.access(starlarkWasm);
+      } catch {
+        starlarkWasm = path.resolve(
+          thisDir, "..", "node_modules", "tree-sitter-starlark", "tree-sitter-starlark.wasm",
+        );
+      }
+      const lang = await (Parser as unknown as { Language: { load: (path: string) => Promise<Parser.Language> } }).Language.load(starlarkWasm);
 
       parser.setLanguage(lang);
       return parser;
@@ -115,9 +112,42 @@ function extractStringList(node: Node): string[] {
 /**
  * Resolve all MODULE.bazel files by following include() statements recursively.
  */
+/**
+ * Resolve a Bazel label to a filesystem path.
+ *   "//pkg:file"  → <workspaceRoot>/pkg/file
+ *   "//:file"     → <workspaceRoot>/file
+ *   ":file"       → <currentDir>/file
+ *   "file"        → <currentDir>/file
+ */
+export function resolveBazelLabel(
+  label: string,
+  workspaceRoot: string,
+  currentDir: string,
+): string {
+  if (label.startsWith("//")) {
+    // "//pkg:file" → "pkg/file", "//:file" → "file"
+    const stripped = label.slice(2);
+    const colonIdx = stripped.indexOf(":");
+    let relativePath: string;
+    if (colonIdx === -1) {
+      relativePath = stripped;
+    } else if (colonIdx === 0) {
+      relativePath = stripped.slice(1);
+    } else {
+      relativePath = stripped.slice(0, colonIdx) + "/" + stripped.slice(colonIdx + 1);
+    }
+    return path.resolve(workspaceRoot, relativePath);
+  }
+  if (label.startsWith(":")) {
+    return path.resolve(currentDir, label.slice(1));
+  }
+  return path.resolve(currentDir, label);
+}
+
 export async function resolveModuleFiles(rootPath: string): Promise<string[]> {
   const visited = new Set<string>();
   const result: string[] = [];
+  const workspaceRoot = path.resolve(path.dirname(rootPath));
 
   async function visit(filePath: string): Promise<void> {
     const abs = path.resolve(filePath);
@@ -144,13 +174,14 @@ export async function resolveModuleFiles(rootPath: string): Promise<string[]> {
       for (let i = 0; i < argList.childCount; i++) {
         const child = argList.child(i)!;
         if (child.type === "string") {
-          let includePath = extractString(child);
+          const includePath = extractString(child);
           if (!includePath) continue;
 
-          // Strip Bazel label prefix "//"
-          includePath = includePath.replace(/^\/\//, "");
-
-          const resolved = path.resolve(path.dirname(abs), includePath);
+          const resolved = resolveBazelLabel(
+            includePath,
+            workspaceRoot,
+            path.dirname(abs),
+          );
           await visit(resolved);
         }
       }
@@ -271,10 +302,12 @@ export async function extractOverrides(
 
 export async function extractMavenInstalls(
   content: string,
+  workspaceRoot?: string,
 ): Promise<MavenInstall[]> {
   const tree = await parseStarlark(content);
   const calls = findCallsByName(tree.rootNode, "maven.install");
   const installs: MavenInstall[] = [];
+  const wsRoot = workspaceRoot ?? cwd;
 
   for (const call of calls) {
     const nameNode = getKeywordArg(call, "name");
@@ -287,15 +320,45 @@ export async function extractMavenInstalls(
 
     if (!lockFile) continue;
 
-    const cleanLockFile = lockFile.replace(/^\/\//, "").replace(/^:/, "");
+    const resolvedLockFile = path.relative(
+      cwd,
+      resolveBazelLabel(lockFile, wsRoot, wsRoot),
+    );
 
     installs.push({
       name,
-      lockFile: cleanLockFile,
+      lockFile: resolvedLockFile,
       repositories: repoNode ? extractStringList(repoNode) : [],
       artifacts: artNode ? extractStringList(artNode) : [],
     });
   }
 
   return installs;
+}
+
+/**
+ * Extract multitool.hub() calls from Starlark content and return lockfile paths.
+ */
+export async function extractMultitoolHubs(
+  content: string,
+  workspaceRoot?: string,
+): Promise<string[]> {
+  const tree = await parseStarlark(content);
+  const calls = findCallsByName(tree.rootNode, "multitool.hub");
+  const lockfiles: string[] = [];
+  const wsRoot = workspaceRoot ?? cwd;
+
+  for (const call of calls) {
+    const lockNode = getKeywordArg(call, "lockfile");
+    const lockfile = lockNode ? extractString(lockNode) : null;
+    if (!lockfile) continue;
+
+    const resolved = path.relative(
+      cwd,
+      resolveBazelLabel(lockfile, wsRoot, wsRoot),
+    );
+    lockfiles.push(resolved);
+  }
+
+  return lockfiles;
 }

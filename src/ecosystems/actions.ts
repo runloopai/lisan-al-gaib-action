@@ -12,6 +12,7 @@ interface ActionRef {
 }
 
 const SHA_RE = /^[0-9a-f]{40}$/;
+const branchSkipLogged = new Set<string>();
 
 function isCommitSha(ref: string): boolean {
   return SHA_RE.test(ref);
@@ -23,11 +24,14 @@ function isCommitSha(ref: string): boolean {
  */
 export function parseActionRefs(content: string): Map<string, ActionRef> {
   const refs = new Map<string, ActionRef>();
+  // Filter out YAML comment lines (lines starting with #) before regex matching.
+  // This is safe because `uses:` directives never start with # in valid YAML.
+  const filtered = content.split('\n').filter(l => !l.trimStart().startsWith('#')).join('\n');
   // Match: uses: owner/repo@ref or uses: owner/repo/path@ref
   // Skip: uses: ./local, uses: docker://..., uses: ./.github/...
   const re = /\buses:\s*['"]?([^'"#\s]+)['"]?/g;
   let match;
-  while ((match = re.exec(content)) !== null) {
+  while ((match = re.exec(filtered)) !== null) {
     const raw = match[1];
     // Skip local and docker actions
     if (raw.startsWith("./") || raw.startsWith("docker://")) continue;
@@ -163,8 +167,12 @@ export async function getPublishDate(
   const tagDate = await getTagDate(owner, repo, ref, headers);
   if (tagDate !== null) return tagDate;
 
-  // Not a tag → assume branch → skip
-  core.info(`actions: ${name}@${ref} appears to be a branch, skipping`);
+  // Not a tag → assume branch → skip (dedup log)
+  const key = `${name}@${ref}`;
+  if (!branchSkipLogged.has(key)) {
+    branchSkipLogged.add(key);
+    core.info(`actions: ${key} appears to be a branch, skipping`);
+  }
   return null;
 }
 

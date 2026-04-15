@@ -96,6 +96,18 @@ jobs:
     expect(ref.path).toBe("a/b/c");
   });
 
+  it("ignores uses: inside comment lines", () => {
+    const content = `
+# uses: actions/old-thing@v1
+  # uses: actions/another-old@v2
+steps:
+  - uses: actions/checkout@v4
+`;
+    const refs = parseActionRefs(content);
+    expect(refs.size).toBe(1);
+    expect(refs.has("actions/checkout@v4")).toBe(true);
+  });
+
   it("ignores inline comments after uses", () => {
     const content = `
   - uses: actions/checkout@v4 # pin to v4

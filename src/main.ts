@@ -2,7 +2,7 @@ import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 import * as github from "@actions/github";
 import { getInputs } from "./inputs.js";
-import { resolveBaseRef, validateBaseRef } from "./base-ref.js";
+import { resolveBaseRef, validateBaseRef, ensureBaseRefAvailable } from "./base-ref.js";
 import { gitDiffFiltered } from "./diff.js";
 import * as npm from "./ecosystems/npm.js";
 import * as python from "./ecosystems/python.js";
@@ -10,6 +10,7 @@ import * as rust from "./ecosystems/rust.js";
 import * as java from "./ecosystems/java.js";
 import * as bazelModule from "./ecosystems/bazel-module.js";
 import * as actions from "./ecosystems/actions.js";
+import * as multitool from "./ecosystems/multitool.js";
 import { bcrPublishDate, gitCommitDate, archiveDate } from "./registry.js";
 import type { BazelOverride } from "./ecosystems/types.js";
 import {
@@ -19,9 +20,10 @@ import {
   reportTotals,
 } from "./report.js";
 import {
-  getAllowedLicenses,
+  getTargetLicenses,
   checkLicenses,
   emitLicenseAnnotations,
+  fetchLicense,
 } from "./license.js";
 import type { ChangedDep, CheckResult } from "./ecosystems/types.js";
 
@@ -71,7 +73,7 @@ async function resolveEffectiveBaseRef(
   );
 
   // Empty tree SHA — forces diffing everything
-  return "4b825dc642cb6eb9a060e54bf899d15363461264";
+  return "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 }
 
 /**
@@ -134,12 +136,91 @@ async function checkBypass(keyword: string, token: string): Promise<boolean> {
   return false;
 }
 
+async function lookupPublishDate(
+  dep: ChangedDep,
+  inputs: ReturnType<typeof getInputs>,
+  javaRepoMap: Map<string, string[]>,
+  bazelOverrides: Map<string, BazelOverride>,
+): Promise<Date | null> {
+  switch (dep.ecosystem) {
+    case "npm":
+      return npm.getPublishDate(dep.name, dep.version, inputs.registries);
+    case "python":
+      return python.getPublishDate(dep.name, dep.version, inputs.registries);
+    case "rust":
+      return rust.getPublishDate(dep.name, dep.version, inputs.registries);
+    case "java":
+      return java.getPublishDate(
+        dep.name,
+        dep.version,
+        javaRepoMap.get(dep.name) ?? [],
+        inputs.registries,
+      );
+    case "bazel": {
+      const override = bazelOverrides.get(dep.name);
+      if (override?.type === "git" && override.remote) {
+        const ref = override.commit ?? override.tag ?? override.branch;
+        if (ref) {
+          return gitCommitDate(override.remote, ref, inputs.githubToken);
+        }
+      } else if (override?.type === "archive" && override.urls?.length) {
+        const date = await archiveDate(override.urls[0]);
+        if (date === null) {
+          const msg = `${dep.name}: archive_override has no Last-Modified header (${override.urls[0]})`;
+          if (inputs.strictThirdParty) {
+            core.error(msg, { file: dep.file });
+          } else {
+            core.warning(msg, { file: dep.file });
+          }
+        }
+        return date;
+      } else {
+        return bcrPublishDate(dep.name, dep.version, inputs.githubToken, inputs.bcrUrl);
+      }
+      return null;
+    }
+    case "actions": {
+      const publishDate = await actions.getPublishDate(dep.name, dep.version, inputs.githubToken);
+      const isSha = /^[0-9a-f]{40}$/.test(dep.version);
+      if (publishDate === null && !isSha) {
+        const actionOwner = dep.name.split("/")[0];
+        let contextOwner = "";
+        try { contextOwner = github.context.repo.owner; } catch { /* not in GH */ }
+        if (actionOwner !== contextOwner) {
+          const msg = `${dep.name}@${dep.version} appears to be a branch ref from a third-party owner`;
+          if (inputs.strictThirdParty) {
+            core.error(msg, { file: dep.file });
+          } else {
+            core.warning(msg, { file: dep.file });
+          }
+        }
+      }
+      return publishDate;
+    }
+    case "multitool": {
+      const date = await multitool.getPublishDate(dep.version);
+      if (date === null) {
+        const msg = `${dep.name}: multitool binary has no Last-Modified header (${dep.version})`;
+        if (inputs.strictThirdParty) {
+          core.error(msg, { file: dep.file });
+        } else {
+          core.warning(msg, { file: dep.file });
+        }
+      }
+      return date;
+    }
+    default:
+      return null;
+  }
+}
+
 async function run(): Promise<void> {
   const inputs = getInputs();
   const rawBaseRef = resolveBaseRef(inputs.baseRef);
   const validatedRef = await validateBaseRef(rawBaseRef);
+  const diffableRef = await ensureBaseRefAvailable(validatedRef);
   const baseRef = await resolveEffectiveBaseRef(
-    validatedRef,
+    diffableRef,
     inputs.checkAllOnNewWorkflow,
   );
 
@@ -148,6 +229,9 @@ async function run(): Promise<void> {
   );
 
   const allResults: CheckResult[] = [];
+
+  // Cache for publish date lookups: "ecosystem:name@version" → Date | null
+  const publishDateCache = new Map<string, Date | null>();
 
   // Per-ecosystem metadata maps
   let javaRepoMap = new Map<string, string[]>();
@@ -178,7 +262,6 @@ async function run(): Promise<void> {
         const result = await bazelModule.getChangedDeps(
           baseRef,
           inputs.moduleBazel,
-          inputs.moduleBazelLock,
         );
         deps = result.deps;
         bazelOverrides = result.overrides;
@@ -186,6 +269,12 @@ async function run(): Promise<void> {
       }
       case "actions":
         deps = await actions.getChangedDeps(baseRef, inputs.workflowFiles);
+        break;
+      case "multitool":
+        deps = await multitool.getChangedDeps(
+          baseRef,
+          inputs.moduleBazel,
+        );
         break;
       default:
         core.setFailed(`Unknown ecosystem: ${eco}`);
@@ -200,82 +289,44 @@ async function run(): Promise<void> {
 
     core.info(`Found ${deps.length} changed packages in ${eco}`);
 
-    for (const dep of deps) {
-      let publishDate: Date | null = null;
-
-      switch (dep.ecosystem) {
-        case "npm":
-          publishDate = await npm.getPublishDate(dep.name, dep.version, inputs.registries);
-          break;
-        case "python":
-          publishDate = await python.getPublishDate(dep.name, dep.version, inputs.registries);
-          break;
-        case "rust":
-          publishDate = await rust.getPublishDate(dep.name, dep.version, inputs.registries);
-          break;
-        case "java":
-          publishDate = await java.getPublishDate(
-            dep.name,
-            dep.version,
-            javaRepoMap.get(dep.name) ?? [],
-            inputs.registries,
-          );
-          break;
-        case "bazel": {
-          const override = bazelOverrides.get(dep.name);
-          if (override?.type === "git" && override.remote) {
-            const ref = override.commit ?? override.tag ?? override.branch;
-            if (ref) {
-              publishDate = await gitCommitDate(
-                override.remote,
-                ref,
-                inputs.githubToken,
-              );
-            }
-          } else if (override?.type === "archive" && override.urls?.length) {
-            publishDate = await archiveDate(override.urls[0]);
-            if (publishDate === null) {
-              const msg = `${dep.name}: archive_override has no Last-Modified header (${override.urls[0]})`;
-              if (inputs.strictThirdParty) {
-                core.error(msg, { file: dep.file });
-              } else {
-                core.warning(msg, { file: dep.file });
-              }
-            }
-          } else {
-            // Registry dep (including single_version_override, multiple_version_override)
-            publishDate = await bcrPublishDate(
-              dep.name,
-              dep.version,
-              inputs.githubToken,
-              inputs.bcrUrl,
-            );
-          }
-          break;
-        }
-        case "actions": {
-          const isSha = /^[0-9a-f]{40}$/.test(dep.version);
-          publishDate = await actions.getPublishDate(
-            dep.name,
-            dep.version,
-            inputs.githubToken,
-          );
-          // Warn/fail on third-party actions pinned to a branch
-          if (publishDate === null && !isSha) {
-            const actionOwner = dep.name.split("/")[0];
-            const contextOwner = github.context.repo.owner;
-            if (actionOwner !== contextOwner) {
-              const msg = `${dep.name}@${dep.version} appears to be a branch ref from a third-party owner`;
-              if (inputs.strictThirdParty) {
-                core.error(msg, { file: dep.file });
-              } else {
-                core.warning(msg, { file: dep.file });
-              }
-            }
-          }
-          break;
-        }
+    // Filter out age-overridden packages
+    const filteredDeps = deps.filter((dep) => {
+      if (inputs.ageOverrides.get(dep.ecosystem)?.has(dep.name)) {
+        core.info(`Skipping age check for ${dep.name} (age-override)`);
+        return false;
       }
+      return true;
+    });
+
+    // Deduplicate by cache key, then fetch in parallel
+    const uniqueDeps = new Map<string, ChangedDep>();
+    for (const dep of filteredDeps) {
+      const cacheKey = `${dep.ecosystem}:${dep.name}@${dep.version}`;
+      if (!publishDateCache.has(cacheKey) && !uniqueDeps.has(cacheKey)) {
+        uniqueDeps.set(cacheKey, dep);
+      }
+    }
+    const entries = [...uniqueDeps.entries()];
+    // Fetch in batches of 10 to avoid rate limiting
+    for (let i = 0; i < entries.length; i += 10) {
+      const batch = entries.slice(i, i + 10);
+      const results = await Promise.allSettled(
+        batch.map(([, dep]) => lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides)),
+      );
+      batch.forEach(([key], idx) => {
+        const r = results[idx];
+        if (r.status === "fulfilled") {
+          publishDateCache.set(key, r.value);
+        } else {
+          core.warning(`Registry lookup failed for ${key}: ${r.reason}`);
+          publishDateCache.set(key, null);
+        }
+      });
+    }
+
+    for (const dep of filteredDeps) {
+      const cacheKey = `${dep.ecosystem}:${dep.name}@${dep.version}`;
+      const publishDate = publishDateCache.get(cacheKey) ?? null;
 
       const ageDays =
         publishDate !== null
@@ -295,21 +346,39 @@ async function run(): Promise<void> {
   }
 
   // License compliance check
-  const allowedLicenses = getAllowedLicenses(inputs.allowedLicenses);
+  const targetLicenses = await getTargetLicenses(inputs.allowedLicenses);
   let licenseViolations = 0;
   let licenseResults: Awaited<ReturnType<typeof checkLicenses>> = [];
 
-  if (inputs.allowedLicenses) {
+  if (targetLicenses && targetLicenses.size > 0) {
     core.startGroup("=== license compliance ===");
+    for (const [eco, licenses] of targetLicenses) {
+      core.info(`Target licenses [${eco}]: ${licenses.join(", ")}`);
+    }
     licenseResults = await checkLicenses(
       allResults,
-      allowedLicenses,
+      targetLicenses,
       inputs.registries,
       javaRepoMap,
       inputs.githubToken,
       inputs.bcrUrl,
+      inputs.licenseOverrides,
+      inputs.licenseHeuristics,
     );
-    licenseViolations = emitLicenseAnnotations(licenseResults, allResults);
+    // When heuristics is off, still try to infer licenses for suggestion purposes
+    let inferredLicenses: Map<string, string> | undefined;
+    if (!inputs.licenseHeuristics) {
+      inferredLicenses = new Map();
+      const unknowns = licenseResults.filter((lr) => lr.compatible === null && lr.license === null);
+      for (const lr of unknowns) {
+        const dep = { ecosystem: lr.ecosystem, name: lr.name, version: lr.version };
+        const inferred = await fetchLicense(dep, inputs.registries, javaRepoMap, inputs.githubToken, inputs.bcrUrl, true);
+        if (inferred) {
+          inferredLicenses.set(`${lr.ecosystem}:${lr.name}`, inferred);
+        }
+      }
+    }
+    licenseViolations = await emitLicenseAnnotations(licenseResults, allResults, inputs.licenseHeuristics, inferredLicenses);
     core.info(
       `License check: ${licenseResults.length} packages, ${licenseViolations} violation(s)`,
     );
@@ -317,7 +386,7 @@ async function run(): Promise<void> {
   }
 
   // Report
-  emitAnnotations(allResults, inputs.minAgeDays);
+  await emitAnnotations(allResults, inputs.ecosystems, inputs.minAgeDays);
   await writeSummary(allResults, inputs.minAgeDays, inputs.warnAgeDays, licenseResults);
 
   const { checked, failures, warnings } = reportTotals(allResults);

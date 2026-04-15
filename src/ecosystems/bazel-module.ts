@@ -13,13 +13,31 @@ export function parseModuleLock(content: string): Map<string, string> {
   const result = new Map<string, string>();
   try {
     const data = JSON.parse(content);
-    const graph = data.moduleDepGraph ?? {};
-    for (const [key, value] of Object.entries(graph)) {
-      // Skip root module (key is "" or "<root>")
-      if (key === "" || key === "<root>") continue;
-      const entry = value as ModuleDepEntry;
-      if (entry.name && entry.version) {
-        result.set(entry.name, entry.version);
+
+    // v3 format: moduleDepGraph with name/version entries
+    const graph = data.moduleDepGraph;
+    if (graph && typeof graph === "object") {
+      for (const [key, value] of Object.entries(graph)) {
+        if (key === "" || key === "<root>") continue;
+        const entry = value as ModuleDepEntry;
+        if (entry.name && entry.version) {
+          result.set(entry.name, entry.version);
+        }
+      }
+      return result;
+    }
+
+    // v24+ format: modules with source.json in registryFileHashes
+    // are the resolved/selected modules
+    const rfh = data.registryFileHashes;
+    if (rfh && typeof rfh === "object") {
+      for (const url of Object.keys(rfh)) {
+        const match = url.match(/\/modules\/([^/]+)\/([^/]+)\/source\.json$/);
+        if (match) {
+          result.set(match[1], match[2]);
+        } else if (url.endsWith("source.json")) {
+          core.debug(`bazel: unexpected source.json URL format, skipping: ${url}`);
+        }
       }
     }
   } catch (e) {
@@ -31,11 +49,12 @@ export function parseModuleLock(content: string): Map<string, string> {
 export async function getChangedDeps(
   baseRef: string,
   moduleBazelPath: string,
-  lockfilePath: string,
 ): Promise<{
   deps: ChangedDep[];
   overrides: Map<string, BazelOverride>;
 }> {
+  const lockfilePath = moduleBazelPath + ".lock";
+
   // Check if lockfile changed
   const diff = await gitDiff(baseRef, lockfilePath);
   if (!diff) {
