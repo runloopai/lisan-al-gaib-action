@@ -111,7 +111,7 @@ const COMMON_SPDX_IDS = [
   "LGPL-3.0-only", "LGPL-3.0-or-later", "BSD-2-Clause", "BSD-3-Clause",
   "ISC", "MPL-2.0", "CDDL-1.0", "CDDL-1.1", "EPL-1.0", "EPL-2.0",
   "Unlicense", "0BSD", "Artistic-2.0", "Zlib", "BSL-1.0",
-  "AGPL-3.0-only", "AGPL-3.0-or-later", "CC0-1.0", "PSF-2.0",
+  "AGPL-3.0-only", "AGPL-3.0-or-later", "CC0-1.0", "PSF-2.0", "ZPL-2.0", "ZPL-2.1",
 ];
 
 interface SpdxLicenseEntry {
@@ -268,6 +268,10 @@ export function normalizeLicense(raw: string): string {
   if (lower === "epl 1.0" || lower === "eclipse public license 1.0") return "EPL-1.0";
   if (lower === "epl 2.0" || lower === "eclipse public license 2.0") return "EPL-2.0";
 
+  // ZPL (Zope Public License) — permissive
+  if (lower === "zpl" || lower === "zpl 2.0" || lower === "zope public license") return "ZPL-2.0";
+  if (lower === "zpl 2.1") return "ZPL-2.1";
+
   // Bouncy Castle Licence — MIT-style permissive
   if (lower.includes("bouncy castle")) return "MIT";
 
@@ -355,7 +359,7 @@ const PERMISSIVE = new Set([
   "MIT", "MIT-0", "ISC", "BSD-2-Clause", "BSD-3-Clause", "0BSD",
   "Unlicense", "CC0-1.0", "CC-BY-3.0", "CC-BY-4.0",
   "Zlib", "WTFPL", "BlueOak-1.0.0", "Python-2.0", "PSF-2.0",
-  "CNRI-Python", "MIT-CMU", "CDLA-Permissive-2.0",
+  "CNRI-Python", "MIT-CMU", "CDLA-Permissive-2.0", "ZPL-2.0", "ZPL-2.1",
 ]);
 
 type LicenseCategory =
@@ -427,6 +431,16 @@ export function isCompatibleWith(
   // Apache-2.0 flows into everything except GPL-2.0-only
   if (depCat === "apache-2.0") {
     return targetCat !== "gpl-2.0-only";
+  }
+
+  // File-level copyleft (MPL, CDDL, EPL) is compatible with permissive targets.
+  // These licenses only require changes to the licensed files themselves to be
+  // shared — they don't impose restrictions on the consuming project's license.
+  if (
+    (depCat === "mpl-2.0" || depCat === "epl-1.0" || depCat === "epl-2.0" || depCat === "cddl-1.0") &&
+    (targetCat === "permissive" || targetCat === "apache-2.0")
+  ) {
+    return true;
   }
 
   if (depCat === "unknown" || targetCat === "unknown") {
@@ -524,11 +538,12 @@ export async function getTargetLicenses(input: string): Promise<TargetLicenseMap
       map.set("*", [detected]);
       return map;
     }
-    core.warning(
-      "Could not auto-detect project license; skipping license check. " +
-      "Set target-licenses explicitly to enable.",
+    core.info(
+      "Could not auto-detect project license; defaulting to open-source-no-relinkable-copyleft.",
     );
-    return null;
+    const map: TargetLicenseMap = new Map();
+    map.set("*", ["open-source-no-relinkable-copyleft"]);
+    return map;
   }
 
   // Try parsing as YAML map

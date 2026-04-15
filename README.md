@@ -58,7 +58,7 @@ You can always override with the `base-ref` input.
 | `pypi-registry-url` | No | `https://pypi.org` | PyPI registry URL |
 | `crates-registry-url` | No | `https://crates.io` | crates.io registry URL |
 | `maven-registry-url` | No | `https://repo1.maven.org/maven2` | Maven Central registry URL |
-| `target-licenses` | No | `auto` | SPDX license(s) your project is distributed under. Deps must be compatible with the target. Supports per-ecosystem YAML map, special aliases (`open-source`, `open-source-no-strong-copyleft`, `open-source-no-relinkable-copyleft`, `open-source-no-network-copyleft`), or `auto` to detect from `package.json`/`LICENSE`. Empty string disables license checking. |
+| `target-licenses` | No | `auto` | SPDX license(s) your project is distributed under. Deps must be compatible with the target. Supports per-ecosystem YAML map, special aliases (`open-source`, `open-source-no-strong-copyleft`, `open-source-no-relinkable-copyleft`, `open-source-no-network-copyleft`), or `auto` to detect from `package.json`/`LICENSE` (falls back to `open-source-no-relinkable-copyleft` if detection fails). Empty string disables license checking. |
 | `allowed-licenses` | No | `""` | **Deprecated** — use `target-licenses`. Ignored when `target-licenses` is set. |
 | `age-overrides` | No | `""` | YAML map of `ecosystem → list of package names` to skip age checking for specific packages |
 | `license-overrides` | No | `""` | YAML map of `ecosystem → package → SPDX license or "ignore"` to override or skip license checking |
@@ -168,7 +168,8 @@ Parses `MODULE.bazel.lock` for resolved module versions and queries the Bazel Ce
 - uses: runloopai/lisan-al-gaib-action@main
   with:
     ecosystems: npm
-    # Auto-detect your project's license from package.json or LICENSE file
+    # Auto-detect your project's license from package.json or LICENSE file.
+    # Falls back to open-source-no-relinkable-copyleft if detection fails.
     target-licenses: auto
 
     # Or specify your project's license explicitly

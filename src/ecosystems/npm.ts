@@ -53,12 +53,21 @@ function resolveAlias(name: string, version: string): [string, string] {
   return [name, version];
 }
 
-/** Flatten a parsed lockfile into a map of name -> version. */
-function collectPackages(deps: ParsedDependency[]): Map<string, string> {
-  const result = new Map<string, string>();
+/** Resolved package entry preserving the original key for diffing. */
+interface ResolvedPkg {
+  /** Original name from lockfile (used as Map key for base vs head comparison) */
+  key: string;
+  /** Resolved name for registry lookups (same as key unless aliased) */
+  name: string;
+  version: string;
+}
+
+/** Flatten a parsed lockfile into resolved package entries. */
+function collectPackages(deps: ParsedDependency[]): Map<string, ResolvedPkg> {
+  const result = new Map<string, ResolvedPkg>();
   for (const dep of deps) {
     const [name, version] = resolveAlias(dep.name, dep.version);
-    result.set(name, version);
+    result.set(dep.name, { key: dep.name, name, version });
   }
   return result;
 }
@@ -71,7 +80,7 @@ export async function findChangedPackages(
 ): Promise<ChangedDep[]> {
   const type = detectType(file);
 
-  let headPkgs: Map<string, string>;
+  let headPkgs: Map<string, ResolvedPkg>;
   try {
     const parsed = await parseLockfile(headContent, type);
     headPkgs = collectPackages(parsed.packages);
@@ -80,7 +89,7 @@ export async function findChangedPackages(
     return [];
   }
 
-  let basePkgs = new Map<string, string>();
+  let basePkgs = new Map<string, ResolvedPkg>();
   if (baseContent) {
     try {
       const parsed = await parseLockfile(baseContent, type);
@@ -91,9 +100,11 @@ export async function findChangedPackages(
   }
 
   const deps: ChangedDep[] = [];
-  for (const [name, version] of headPkgs) {
-    if (basePkgs.get(name) === version) continue;
-    deps.push({ ecosystem: "npm", name, version, file });
+  for (const [key, pkg] of headPkgs) {
+    const basePkg = basePkgs.get(key);
+    if (basePkg && basePkg.version === pkg.version) continue;
+    // Use resolved name for registry lookups
+    deps.push({ ecosystem: "npm", name: pkg.name, version: pkg.version, file });
   }
 
   return deps;

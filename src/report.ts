@@ -880,9 +880,8 @@ export async function writeSummary(
     ]);
   }
 
-  core.summary.addRaw(
-    "\n\n---\nMade with 💚 by [Runloop AI](https://runloop.ai)\n",
-  );
+  const branding = getBranding();
+  if (branding) core.summary.addRaw(branding);
 
   await core.summary.write();
 }
