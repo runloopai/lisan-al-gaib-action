@@ -48,9 +48,16 @@ describe("isCompatibleWith", () => {
     expect(isCompatibleWith("LGPL-3.0-only", "GPL-2.0-only")).toBe(false);
   });
 
-  it("MPL-2.0 flows into GPL", () => {
+  it("MPL-2.0 flows into GPL and permissive targets", () => {
     expect(isCompatibleWith("MPL-2.0", "GPL-3.0-only")).toBe(true);
-    expect(isCompatibleWith("MPL-2.0", "MIT")).toBe(false);
+    expect(isCompatibleWith("MPL-2.0", "MIT")).toBe(true);
+    expect(isCompatibleWith("MPL-2.0", "Apache-2.0")).toBe(true);
+  });
+
+  it("file-level copyleft (CDDL, EPL) compatible with permissive targets", () => {
+    expect(isCompatibleWith("CDDL-1.0", "MIT")).toBe(true);
+    expect(isCompatibleWith("EPL-2.0", "Apache-2.0")).toBe(true);
+    expect(isCompatibleWith("EPL-1.0", "MIT")).toBe(true);
   });
 
   it("unknown licenses fall back to spdx-satisfies or exact match", () => {

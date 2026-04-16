@@ -80380,12 +80380,12 @@ function resolveAlias(name, version) {
     }
     return [name, version];
 }
-/** Flatten a parsed lockfile into a map of name -> version. */
+/** Flatten a parsed lockfile into resolved package entries. */
 function collectPackages(deps) {
     const result = new Map();
     for (const dep of deps) {
         const [name, version] = resolveAlias(dep.name, dep.version);
-        result.set(name, version);
+        result.set(dep.name, { key: dep.name, name, version });
     }
     return result;
 }
@@ -80412,10 +80412,12 @@ async function findChangedPackages(headContent, baseContent, file) {
         }
     }
     const deps = [];
-    for (const [name, version] of headPkgs) {
-        if (basePkgs.get(name) === version)
+    for (const [key, pkg] of headPkgs) {
+        const basePkg = basePkgs.get(key);
+        if (basePkg && basePkg.version === pkg.version)
             continue;
-        deps.push({ ecosystem: "npm", name, version, file });
+        // Use resolved name for registry lookups
+        deps.push({ ecosystem: "npm", name: pkg.name, version: pkg.version, file });
     }
     return deps;
 }
@@ -83415,7 +83417,9 @@ async function writeSummary(results, minAgeDays, warnAgeDays, licenseResults = [
             ]),
         ]);
     }
-    core.summary.addRaw("\n\n---\nMade with 💚 by [Runloop AI](https://runloop.ai)\n");
+    const branding = getBranding();
+    if (branding)
+        core.summary.addRaw(branding);
     await core.summary.write();
 }
 function reportTotals(results) {
@@ -86716,7 +86720,7 @@ const COMMON_SPDX_IDS = [
     "LGPL-3.0-only", "LGPL-3.0-or-later", "BSD-2-Clause", "BSD-3-Clause",
     "ISC", "MPL-2.0", "CDDL-1.0", "CDDL-1.1", "EPL-1.0", "EPL-2.0",
     "Unlicense", "0BSD", "Artistic-2.0", "Zlib", "BSL-1.0",
-    "AGPL-3.0-only", "AGPL-3.0-or-later", "CC0-1.0", "PSF-2.0",
+    "AGPL-3.0-only", "AGPL-3.0-or-later", "CC0-1.0", "PSF-2.0", "ZPL-2.0", "ZPL-2.1",
 ];
 const licenseCorpus = [];
 for (const id of COMMON_SPDX_IDS) {
@@ -86857,6 +86861,11 @@ function normalizeLicense(raw) {
         return "EPL-1.0";
     if (lower === "epl 2.0" || lower === "eclipse public license 2.0")
         return "EPL-2.0";
+    // ZPL (Zope Public License) — permissive
+    if (lower === "zpl" || lower === "zpl 2.0" || lower === "zope public license")
+        return "ZPL-2.0";
+    if (lower === "zpl 2.1")
+        return "ZPL-2.1";
     // Bouncy Castle Licence — MIT-style permissive
     if (lower.includes("bouncy castle"))
         return "MIT";
@@ -86941,7 +86950,7 @@ const PERMISSIVE = new Set([
     "MIT", "MIT-0", "ISC", "BSD-2-Clause", "BSD-3-Clause", "0BSD",
     "Unlicense", "CC0-1.0", "CC-BY-3.0", "CC-BY-4.0",
     "Zlib", "WTFPL", "BlueOak-1.0.0", "Python-2.0", "PSF-2.0",
-    "CNRI-Python", "MIT-CMU", "CDLA-Permissive-2.0",
+    "CNRI-Python", "MIT-CMU", "CDLA-Permissive-2.0", "ZPL-2.0", "ZPL-2.1",
 ]);
 function categorize(spdx) {
     const upper = spdx.toUpperCase();
@@ -87008,6 +87017,13 @@ function isCompatibleWith(depLicense, targetLicense) {
     // Apache-2.0 flows into everything except GPL-2.0-only
     if (depCat === "apache-2.0") {
         return targetCat !== "gpl-2.0-only";
+    }
+    // File-level copyleft (MPL, CDDL, EPL) is compatible with permissive targets.
+    // These licenses only require changes to the licensed files themselves to be
+    // shared — they don't impose restrictions on the consuming project's license.
+    if ((depCat === "mpl-2.0" || depCat === "epl-1.0" || depCat === "epl-2.0" || depCat === "cddl-1.0") &&
+        (targetCat === "permissive" || targetCat === "apache-2.0")) {
+        return true;
     }
     if (depCat === "unknown" || targetCat === "unknown") {
         // Fall back to spdx-satisfies or exact match
@@ -87101,9 +87117,10 @@ async function getTargetLicenses(input) {
             map.set("*", [detected]);
             return map;
         }
-        core.warning("Could not auto-detect project license; skipping license check. " +
-            "Set target-licenses explicitly to enable.");
-        return null;
+        core.info("Could not auto-detect project license; defaulting to open-source-no-relinkable-copyleft.");
+        const map = new Map();
+        map.set("*", ["open-source-no-relinkable-copyleft"]);
+        return map;
     }
     // Try parsing as YAML map
     // Quote bare * keys (YAML treats * as alias character)
