@@ -12,9 +12,13 @@ export function parseMultitoolLock(content: string): Map<string, string> {
     const data = JSON.parse(content) as Record<string, { binaries?: MultitoolBinary[] }>;
     for (const [key, value] of Object.entries(data)) {
       if (key.startsWith("$")) continue;
-      const firstUrl = value?.binaries?.[0]?.url;
-      if (firstUrl) {
-        result.set(key, firstUrl);
+      const urls = (value?.binaries ?? [])
+        .map((b) => b?.url)
+        .filter(Boolean)
+        .sort()
+        .join("\n");
+      if (urls) {
+        result.set(key, urls);
       }
     }
   } catch (e) {

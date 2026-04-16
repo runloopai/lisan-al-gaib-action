@@ -200,6 +200,60 @@ version = "2.31.0"
     const deps = findPythonChanges(head, null, "uv.lock");
     expect(deps).toHaveLength(1);
   });
+
+  it("normalizes package names (case-insensitive, PEP 503)", () => {
+    const head = `version = 1
+
+[[package]]
+name = "Django"
+version = "5.0.0"
+`;
+    const base = `version = 1
+
+[[package]]
+name = "django"
+version = "4.2.0"
+`;
+    const deps = findPythonChanges(head, base, "uv.lock");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].version).toBe("5.0.0");
+  });
+
+  it("treats hyphens, underscores, and dots as equivalent in names", () => {
+    const head = `version = 1
+
+[[package]]
+name = "my-cool-package"
+version = "1.0.0"
+`;
+    const base = `version = 1
+
+[[package]]
+name = "my_cool_package"
+version = "1.0.0"
+`;
+    const deps = findPythonChanges(head, base, "uv.lock");
+    expect(deps).toHaveLength(0);
+  });
+
+  it("skips editable/virtual packages", () => {
+    const head = `version = 1
+
+[[package]]
+name = "my-app"
+version = "0.1.0"
+
+[package.source]
+virtual = "."
+
+[[package]]
+name = "requests"
+version = "2.31.0"
+`;
+    const deps = findPythonChanges(head, null, "uv.lock");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("requests");
+  });
 });
 
 // ─── Python: pylock.toml (PEP 751) ─────────────────────────────────────────
@@ -230,6 +284,25 @@ version = "25.1.0"
       version: "24.1.2",
       file: "pylock.toml",
     });
+  });
+
+  it("normalizes package names (PEP 503)", () => {
+    const head = `lock-version = "1.0"
+
+[[packages]]
+name = "attrs"
+version = "25.2.0"
+`;
+    const base = `lock-version = "1.0"
+
+[[packages]]
+name = "Attrs"
+version = "25.1.0"
+`;
+    const deps = findPythonChanges(head, base, "pylock.toml");
+    // Case difference in name should NOT cause double-counting
+    expect(deps).toHaveLength(1);
+    expect(deps[0].version).toBe("25.2.0");
   });
 
   it("handles packages without version (VCS)", () => {

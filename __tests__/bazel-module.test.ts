@@ -103,4 +103,19 @@ describe("parseModuleLock", () => {
     const modules = parseModuleLock(content);
     expect(modules.size).toBe(1);
   });
+
+  it("prefers v3 format over v24+ when both are present", () => {
+    const content = JSON.stringify({
+      moduleDepGraph: {
+        "rules_go@0.46.0": { name: "rules_go", version: "0.46.0" },
+      },
+      registryFileHashes: {
+        "https://bcr.bazel.build/modules/protobuf/21.7/source.json": "sha256-abc",
+      },
+    });
+    const result = parseModuleLock(content);
+    expect(result.size).toBe(1);
+    expect(result.has("rules_go")).toBe(true);
+    expect(result.has("protobuf")).toBe(false);
+  });
 });

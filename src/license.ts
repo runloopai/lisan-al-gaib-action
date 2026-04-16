@@ -272,6 +272,17 @@ export function normalizeLicense(raw: string): string {
   if (lower === "zpl" || lower === "zpl 2.0" || lower === "zope public license") return "ZPL-2.0";
   if (lower === "zpl 2.1") return "ZPL-2.1";
 
+  // EDL (Eclipse Distribution License) — BSD-3-Clause
+  if (lower === "edl 1.0" || lower === "eclipse distribution license 1.0"
+    || lower === "eclipse distribution license - v 1.0"
+    || lower === "eclipse distribution license v. 1.0") return "BSD-3-Clause";
+
+  // GPL w/ Classpath Exception variants (common in Jakarta/javax POMs)
+  if (((lower.includes("gpl") || lower.includes("general public license")) && lower.includes("classpath"))
+    || lower === "gpl2 w/ cpe" || lower === "gplv2+ce") {
+    return "GPL-2.0-only WITH Classpath-exception-2.0";
+  }
+
   // Bouncy Castle Licence — MIT-style permissive
   if (lower.includes("bouncy castle")) return "MIT";
 
@@ -399,6 +410,15 @@ export function isCompatibleWith(
   depLicense: string,
   targetLicense: string,
 ): boolean {
+  // Handle OR expressions first: dep is compatible if ANY alternative is compatible
+  if (depLicense.includes(" OR ")) {
+    const alternatives = depLicense.split(" OR ").map((s) => s.trim());
+    return alternatives.some((alt) => isCompatibleWith(alt, targetLicense));
+  }
+
+  // GPL with Classpath Exception is effectively permissive for library consumers
+  if (depLicense.includes("WITH Classpath-exception")) return true;
+
   // Special target aliases — use spdx-osi for robust identification
   if (targetLicense === "open-source") {
     return isOpenSource(depLicense);
@@ -411,15 +431,6 @@ export function isCompatibleWith(
   }
   if (targetLicense === "open-source-no-relinkable-copyleft") {
     return isOpenSource(depLicense) && !isRelinkableCopyleft(depLicense);
-  }
-
-  // GPL with Classpath Exception is effectively permissive for library consumers
-  if (depLicense.includes("WITH Classpath-exception")) return true;
-
-  // Handle OR expressions: dep is compatible if ANY alternative is compatible
-  if (depLicense.includes(" OR ")) {
-    const alternatives = depLicense.split(" OR ").map((s) => s.trim());
-    return alternatives.some((alt) => isCompatibleWith(alt, targetLicense));
   }
 
   const depCat = categorize(depLicense);
@@ -602,8 +613,11 @@ function evaluateExpr(
       evaluateExpr(node.right, targetLicenses);
   }
 
-  // Leaf: single license
-  const id = node.plus ? `${node.license}-or-later` : node.license;
+  // Leaf: single license (preserve WITH exception)
+  let id = node.plus ? `${node.license}-or-later` : node.license;
+  if ("exception" in node && node.exception) {
+    id = `${id} WITH ${node.exception}`;
+  }
   const normalized = normalizeLicense(id);
   const corrected = spdxCorrect(normalized) ?? normalized;
   return targetLicenses.some((target) => {
@@ -935,6 +949,12 @@ interface PomXml {
       artifactId?: string;
       version?: string;
     };
+    scm?: {
+      url?: string;
+      connection?: string;
+      developerConnection?: string;
+    };
+    url?: string;
   };
 }
 
@@ -969,8 +989,16 @@ async function fetchPom(
 function extractPomLicense(pom: PomXml): string | null {
   const licenses = pom.project?.licenses?.license;
   if (!licenses) return null;
-  const first = Array.isArray(licenses) ? licenses[0] : licenses;
-  return first?.name?.trim() ?? null;
+  if (Array.isArray(licenses)) {
+    const names = licenses.map((l) => l?.name?.trim()).filter(Boolean) as string[];
+    if (names.length === 0) return null;
+    // Normalize each license name individually before joining
+    const normalized = names.map((n) => normalizeLicense(n));
+    if (normalized.length === 1) return normalized[0];
+    // Multiple licenses in a POM means the consumer can choose (OR)
+    return normalized.join(" OR ");
+  }
+  return licenses?.name?.trim() ?? null;
 }
 
 /**
@@ -982,6 +1010,8 @@ export async function fetchMavenLicense(
   version: string,
   repositories: string[],
   registries: RegistryUrls,
+  githubToken: string = "",
+  licenseHeuristics: boolean = true,
 ): Promise<string | null> {
   const parts = name.split(":");
   if (parts.length < 2) return null;
@@ -990,20 +1020,40 @@ export async function fetchMavenLicense(
   let groupId = parts[0];
   let artifactId = parts[1];
   let ver = version;
+  let scmUrl: string | undefined;
+  let projectUrl: string | undefined;
 
   for (let depth = 0; depth < 5; depth++) {
     const pom = await fetchPom(groupId, artifactId, ver, repos);
-    if (!pom) return null;
+    if (!pom) break;
 
     const license = extractPomLicense(pom);
     if (license) return license;
 
+    // Capture SCM/URL for GitHub fallback
+    if (!scmUrl) {
+      scmUrl = pom.project?.scm?.url ?? pom.project?.scm?.connection
+        ?? pom.project?.scm?.developerConnection;
+    }
+    if (!projectUrl) projectUrl = pom.project?.url;
+
     const parent = pom.project?.parent;
-    if (!parent?.groupId || !parent?.artifactId || !parent?.version) return null;
+    if (!parent?.groupId || !parent?.artifactId || !parent?.version) break;
 
     groupId = parent.groupId;
     artifactId = parent.artifactId;
     ver = parent.version;
+  }
+
+  // Fall back to GitHub repo license API
+  for (const url of [scmUrl, projectUrl]) {
+    if (!url) continue;
+    const ghMatch = url.match(/github\.com[/:]([^/]+\/[^/.]+)/);
+    if (ghMatch) {
+      const repo = ghMatch[1].replace(/\.git$/, "");
+      const ghLicense = await fetchGitHubRepoLicense(repo, githubToken, licenseHeuristics);
+      if (ghLicense) return ghLicense;
+    }
   }
 
   return null;
@@ -1234,6 +1284,8 @@ export async function fetchLicense(
         dep.version,
         javaRepoMap.get(dep.name) ?? [],
         registries,
+        githubToken,
+        licenseHeuristics,
       );
     case "actions":
       return fetchGitHubRepoLicense(dep.name, githubToken, licenseHeuristics);

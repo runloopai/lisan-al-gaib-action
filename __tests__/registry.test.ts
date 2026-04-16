@@ -312,3 +312,23 @@ describe("archiveDate", () => {
     expect(await archiveDate("https://example.com/archive.tar.gz")).toBeNull();
   });
 });
+
+describe("fetch timeout", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("passes AbortSignal.timeout to fetch calls", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ time: { "1.0.0": "2024-01-01T00:00:00Z" } })),
+    );
+    await npmPublishDate("pkg", "1.0.0", registries);
+    const callArgs = fetchSpy.mock.calls[0];
+    expect(callArgs[1]).toHaveProperty("signal");
+  });
+
+  it("returns null on timeout (AbortError)", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(
+      new DOMException("The operation was aborted", "AbortError"),
+    );
+    expect(await npmPublishDate("pkg", "1.0.0", registries)).toBeNull();
+  });
+});

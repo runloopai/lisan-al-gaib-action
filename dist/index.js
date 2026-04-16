@@ -80159,9 +80159,10 @@ const MAVEN_CENTRAL_PREFIXES = [
     "http://repo1.maven.org/maven2",
     "http://central.maven.org/maven2",
 ];
+const FETCH_TIMEOUT_MS = 30_000;
 async function fetchJson(url, headers) {
     try {
-        const resp = await fetch(url, { headers });
+        const resp = await fetch(url, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         if (!resp.ok)
             return null;
         return await resp.json();
@@ -80205,7 +80206,7 @@ async function mavenPublishDate(group, artifact, version, repositories, registri
         const base = resolveMavenRepo(repo, registries);
         const pomUrl = `${base}/${groupPath}/${artifact}/${version}/${artifact}-${version}.pom`;
         try {
-            const resp = await fetch(pomUrl, { method: "HEAD" });
+            const resp = await fetch(pomUrl, { method: "HEAD", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
             if (resp.ok) {
                 const lastModified = resp.headers.get("Last-Modified");
                 if (lastModified) {
@@ -80251,7 +80252,7 @@ async function bcrPublishDate(name, version, token, bcrUrl) {
     }
     // Query the BCR repo for the commit that added this module version
     try {
-        const resp = await fetch(`https://api.github.com/repos/${bcrOwner}/${bcrRepo}/commits?path=modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/MODULE.bazel&per_page=1`, { headers });
+        const resp = await fetch(`https://api.github.com/repos/${bcrOwner}/${bcrRepo}/commits?path=modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/MODULE.bazel&per_page=1`, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         if (resp.ok) {
             const data = (await resp.json());
             const date = data?.[0]?.commit?.committer?.date;
@@ -80265,11 +80266,11 @@ async function bcrPublishDate(name, version, token, bcrUrl) {
     // Fallback: try fetching source.json and HEAD the archive URL for Last-Modified
     try {
         const sourceUrl = `${bcrUrl.replace(/\/$/, "")}/modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/source.json`;
-        const sourceResp = await fetch(sourceUrl);
+        const sourceResp = await fetch(sourceUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         if (sourceResp.ok) {
             const sourceData = (await sourceResp.json());
             if (sourceData.url) {
-                const archiveResp = await fetch(sourceData.url, { method: "HEAD" });
+                const archiveResp = await fetch(sourceData.url, { method: "HEAD", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
                 const lastModified = archiveResp.headers.get("Last-Modified");
                 if (lastModified)
                     return new Date(lastModified);
@@ -80304,7 +80305,7 @@ async function gitCommitDate(remote, ref, token) {
         headers.Authorization = `Bearer ${token}`;
     }
     try {
-        const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${ref}`, { headers });
+        const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${ref}`, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         if (!resp.ok)
             return null;
         const data = (await resp.json());
@@ -80320,7 +80321,7 @@ async function gitCommitDate(remote, ref, token) {
  */
 async function archiveDate(url) {
     try {
-        const resp = await fetch(url, { method: "HEAD" });
+        const resp = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         const lastModified = resp.headers.get("Last-Modified");
         return lastModified ? new Date(lastModified) : null;
     }
@@ -81598,6 +81599,10 @@ function stringify(obj, { maxDepth = 1000, numbersAsFloat = false } = {}) {
 
 
 
+/** Normalize PyPI package names per PEP 503: case-insensitive, [-_.] equivalent. */
+function normalizePypiName(name) {
+    return name.replace(/[-_.]+/g, "-").toLowerCase();
+}
 function detectFormat(file) {
     const base = external_node_path_namespaceObject.basename(file);
     if (base === "pylock.toml" || base.startsWith("pylock."))
@@ -81617,7 +81622,7 @@ function parseUvLock(content) {
                 const src = pkg.source;
                 if (src && (src.editable || src.directory || src.virtual))
                     continue;
-                result.set(pkg.name, pkg.version);
+                result.set(normalizePypiName(pkg.name), pkg.version);
             }
         }
     }
@@ -81634,7 +81639,7 @@ function parsePylockToml(content) {
         if (Array.isArray(data.packages)) {
             for (const pkg of data.packages) {
                 if (pkg.name && pkg.version) {
-                    result.set(pkg.name, pkg.version);
+                    result.set(normalizePypiName(pkg.name), pkg.version);
                 }
             }
         }
@@ -82469,9 +82474,13 @@ function parseMultitoolLock(content) {
         for (const [key, value] of Object.entries(data)) {
             if (key.startsWith("$"))
                 continue;
-            const firstUrl = value?.binaries?.[0]?.url;
-            if (firstUrl) {
-                result.set(key, firstUrl);
+            const urls = (value?.binaries ?? [])
+                .map((b) => b?.url)
+                .filter(Boolean)
+                .sort()
+                .join("\n");
+            if (urls) {
+                result.set(key, urls);
             }
         }
     }
@@ -86866,6 +86875,16 @@ function normalizeLicense(raw) {
         return "ZPL-2.0";
     if (lower === "zpl 2.1")
         return "ZPL-2.1";
+    // EDL (Eclipse Distribution License) — BSD-3-Clause
+    if (lower === "edl 1.0" || lower === "eclipse distribution license 1.0"
+        || lower === "eclipse distribution license - v 1.0"
+        || lower === "eclipse distribution license v. 1.0")
+        return "BSD-3-Clause";
+    // GPL w/ Classpath Exception variants (common in Jakarta/javax POMs)
+    if (((lower.includes("gpl") || lower.includes("general public license")) && lower.includes("classpath"))
+        || lower === "gpl2 w/ cpe" || lower === "gplv2+ce") {
+        return "GPL-2.0-only WITH Classpath-exception-2.0";
+    }
     // Bouncy Castle Licence — MIT-style permissive
     if (lower.includes("bouncy castle"))
         return "MIT";
@@ -86988,6 +87007,14 @@ function categorize(spdx) {
  * Can code under `depLicense` be incorporated into a project under `targetLicense`?
  */
 function isCompatibleWith(depLicense, targetLicense) {
+    // Handle OR expressions first: dep is compatible if ANY alternative is compatible
+    if (depLicense.includes(" OR ")) {
+        const alternatives = depLicense.split(" OR ").map((s) => s.trim());
+        return alternatives.some((alt) => isCompatibleWith(alt, targetLicense));
+    }
+    // GPL with Classpath Exception is effectively permissive for library consumers
+    if (depLicense.includes("WITH Classpath-exception"))
+        return true;
     // Special target aliases — use spdx-osi for robust identification
     if (targetLicense === "open-source") {
         return isOpenSource(depLicense);
@@ -87000,14 +87027,6 @@ function isCompatibleWith(depLicense, targetLicense) {
     }
     if (targetLicense === "open-source-no-relinkable-copyleft") {
         return isOpenSource(depLicense) && !isRelinkableCopyleft(depLicense);
-    }
-    // GPL with Classpath Exception is effectively permissive for library consumers
-    if (depLicense.includes("WITH Classpath-exception"))
-        return true;
-    // Handle OR expressions: dep is compatible if ANY alternative is compatible
-    if (depLicense.includes(" OR ")) {
-        const alternatives = depLicense.split(" OR ").map((s) => s.trim());
-        return alternatives.some((alt) => isCompatibleWith(alt, targetLicense));
     }
     const depCat = categorize(depLicense);
     const targetCat = categorize(targetLicense);
@@ -87171,8 +87190,11 @@ function evaluateExpr(node, targetLicenses) {
         return evaluateExpr(node.left, targetLicenses) &&
             evaluateExpr(node.right, targetLicenses);
     }
-    // Leaf: single license
-    const id = node.plus ? `${node.license}-or-later` : node.license;
+    // Leaf: single license (preserve WITH exception)
+    let id = node.plus ? `${node.license}-or-later` : node.license;
+    if ("exception" in node && node.exception) {
+        id = `${id} WITH ${node.exception}`;
+    }
     const normalized = normalizeLicense(id);
     const corrected = spdx_correct(normalized) ?? normalized;
     return targetLicenses.some((target) => {
@@ -87486,14 +87508,24 @@ function extractPomLicense(pom) {
     const licenses = pom.project?.licenses?.license;
     if (!licenses)
         return null;
-    const first = Array.isArray(licenses) ? licenses[0] : licenses;
-    return first?.name?.trim() ?? null;
+    if (Array.isArray(licenses)) {
+        const names = licenses.map((l) => l?.name?.trim()).filter(Boolean);
+        if (names.length === 0)
+            return null;
+        // Normalize each license name individually before joining
+        const normalized = names.map((n) => normalizeLicense(n));
+        if (normalized.length === 1)
+            return normalized[0];
+        // Multiple licenses in a POM means the consumer can choose (OR)
+        return normalized.join(" OR ");
+    }
+    return licenses?.name?.trim() ?? null;
 }
 /**
  * Fetch the license for a Maven artifact by parsing the POM.
  * Follows parent POM chain (up to 5 levels) if the artifact POM has no license.
  */
-async function fetchMavenLicense(name, version, repositories, registries) {
+async function fetchMavenLicense(name, version, repositories, registries, githubToken = "", licenseHeuristics = true) {
     const parts = name.split(":");
     if (parts.length < 2)
         return null;
@@ -87501,19 +87533,40 @@ async function fetchMavenLicense(name, version, repositories, registries) {
     let groupId = parts[0];
     let artifactId = parts[1];
     let ver = version;
+    let scmUrl;
+    let projectUrl;
     for (let depth = 0; depth < 5; depth++) {
         const pom = await fetchPom(groupId, artifactId, ver, repos);
         if (!pom)
-            return null;
+            break;
         const license = extractPomLicense(pom);
         if (license)
             return license;
+        // Capture SCM/URL for GitHub fallback
+        if (!scmUrl) {
+            scmUrl = pom.project?.scm?.url ?? pom.project?.scm?.connection
+                ?? pom.project?.scm?.developerConnection;
+        }
+        if (!projectUrl)
+            projectUrl = pom.project?.url;
         const parent = pom.project?.parent;
         if (!parent?.groupId || !parent?.artifactId || !parent?.version)
-            return null;
+            break;
         groupId = parent.groupId;
         artifactId = parent.artifactId;
         ver = parent.version;
+    }
+    // Fall back to GitHub repo license API
+    for (const url of [scmUrl, projectUrl]) {
+        if (!url)
+            continue;
+        const ghMatch = url.match(/github\.com[/:]([^/]+\/[^/.]+)/);
+        if (ghMatch) {
+            const repo = ghMatch[1].replace(/\.git$/, "");
+            const ghLicense = await fetchGitHubRepoLicense(repo, githubToken, licenseHeuristics);
+            if (ghLicense)
+                return ghLicense;
+        }
     }
     return null;
 }
@@ -87704,7 +87757,7 @@ async function fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, l
         case "rust":
             return fetchCrateLicense(dep.name, dep.version, registries);
         case "java":
-            return fetchMavenLicense(dep.name, dep.version, javaRepoMap.get(dep.name) ?? [], registries);
+            return fetchMavenLicense(dep.name, dep.version, javaRepoMap.get(dep.name) ?? [], registries, githubToken, licenseHeuristics);
         case "actions":
             return fetchGitHubRepoLicense(dep.name, githubToken, licenseHeuristics);
         case "bazel":

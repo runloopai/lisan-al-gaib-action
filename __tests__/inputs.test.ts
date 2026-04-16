@@ -7,7 +7,7 @@ vi.mock("@actions/core", () => ({
 }));
 
 import * as core from "@actions/core";
-import { getInputs } from "../src/inputs.js";
+import { getInputs, parseLicenseOverrides, parseAgeOverrides } from "../src/inputs.js";
 
 describe("getInputs", () => {
   beforeEach(() => {
@@ -89,5 +89,81 @@ describe("getInputs", () => {
     const inputs = getInputs();
     expect(inputs.moduleBazel).toBe("MODULE.bazel");
     expect(inputs.allowedLicenses).toBe("auto");
+  });
+});
+
+describe("parseLicenseOverrides", () => {
+  it("returns empty map for empty input", () => {
+    expect(parseLicenseOverrides("").size).toBe(0);
+  });
+
+  it("parses nested YAML structure", () => {
+    const input = `npm:
+  lodash: MIT
+  express: Apache-2.0
+python:
+  requests: Apache-2.0`;
+    const result = parseLicenseOverrides(input);
+    expect(result.size).toBe(2);
+    expect(result.get("npm")?.get("lodash")).toBe("MIT");
+    expect(result.get("npm")?.get("express")).toBe("Apache-2.0");
+    expect(result.get("python")?.get("requests")).toBe("Apache-2.0");
+  });
+
+  it("skips non-string values", () => {
+    const input = `npm:
+  lodash: MIT
+  bad: 123`;
+    const result = parseLicenseOverrides(input);
+    expect(result.get("npm")?.size).toBe(1);
+  });
+
+  it("handles malformed YAML gracefully", () => {
+    const result = parseLicenseOverrides(":::invalid yaml[[[");
+    expect(result.size).toBe(0);
+  });
+
+  it("skips ecosystem with no valid packages", () => {
+    const input = `npm:
+  bad: 123`;
+    const result = parseLicenseOverrides(input);
+    expect(result.size).toBe(0);
+  });
+});
+
+describe("parseAgeOverrides", () => {
+  it("returns empty map for empty input", () => {
+    expect(parseAgeOverrides("").size).toBe(0);
+  });
+
+  it("parses array format", () => {
+    const input = `npm:
+  - lodash
+  - express`;
+    const result = parseAgeOverrides(input);
+    expect(result.get("npm")?.has("lodash")).toBe(true);
+    expect(result.get("npm")?.has("express")).toBe(true);
+  });
+
+  it("parses legacy object format", () => {
+    const input = `npm:
+  lodash: ignore
+  express: ignore`;
+    const result = parseAgeOverrides(input);
+    expect(result.get("npm")?.has("lodash")).toBe(true);
+    expect(result.get("npm")?.has("express")).toBe(true);
+  });
+
+  it("handles malformed YAML gracefully", () => {
+    const result = parseAgeOverrides(":::bad");
+    expect(result.size).toBe(0);
+  });
+
+  it("skips non-string array items", () => {
+    const input = `npm:
+  - lodash
+  - 123`;
+    const result = parseAgeOverrides(input);
+    expect(result.get("npm")?.size).toBe(1);
   });
 });
