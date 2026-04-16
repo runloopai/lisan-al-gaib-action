@@ -8,12 +8,14 @@ const MAVEN_CENTRAL_PREFIXES = [
   "http://central.maven.org/maven2",
 ];
 
+const FETCH_TIMEOUT_MS = 30_000;
+
 async function fetchJson(
   url: string,
   headers?: Record<string, string>,
 ): Promise<unknown | null> {
   try {
-    const resp = await fetch(url, { headers });
+    const resp = await fetch(url, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     if (!resp.ok) return null;
     return await resp.json();
   } catch {
@@ -90,7 +92,7 @@ export async function mavenPublishDate(
     const base = resolveMavenRepo(repo, registries);
     const pomUrl = `${base}/${groupPath}/${artifact}/${version}/${artifact}-${version}.pom`;
     try {
-      const resp = await fetch(pomUrl, { method: "HEAD" });
+      const resp = await fetch(pomUrl, { method: "HEAD", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
       if (resp.ok) {
         const lastModified = resp.headers.get("Last-Modified");
         if (lastModified) {
@@ -154,7 +156,7 @@ export async function bcrPublishDate(
   try {
     const resp = await fetch(
       `https://api.github.com/repos/${bcrOwner}/${bcrRepo}/commits?path=modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/MODULE.bazel&per_page=1`,
-      { headers },
+      { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
     );
     if (resp.ok) {
       const data = (await resp.json()) as Array<{
@@ -170,11 +172,11 @@ export async function bcrPublishDate(
   // Fallback: try fetching source.json and HEAD the archive URL for Last-Modified
   try {
     const sourceUrl = `${bcrUrl.replace(/\/$/, "")}/modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/source.json`;
-    const sourceResp = await fetch(sourceUrl);
+    const sourceResp = await fetch(sourceUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     if (sourceResp.ok) {
       const sourceData = (await sourceResp.json()) as { url?: string };
       if (sourceData.url) {
-        const archiveResp = await fetch(sourceData.url, { method: "HEAD" });
+        const archiveResp = await fetch(sourceData.url, { method: "HEAD", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         const lastModified = archiveResp.headers.get("Last-Modified");
         if (lastModified) return new Date(lastModified);
       }
@@ -220,7 +222,7 @@ export async function gitCommitDate(
   try {
     const resp = await fetch(
       `https://api.github.com/repos/${owner}/${repo}/commits/${ref}`,
-      { headers },
+      { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
     );
     if (!resp.ok) return null;
     const data = (await resp.json()) as {
@@ -238,7 +240,7 @@ export async function gitCommitDate(
  */
 export async function archiveDate(url: string): Promise<Date | null> {
   try {
-    const resp = await fetch(url, { method: "HEAD" });
+    const resp = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     const lastModified = resp.headers.get("Last-Modified");
     return lastModified ? new Date(lastModified) : null;
   } catch {

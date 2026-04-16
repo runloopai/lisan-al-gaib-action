@@ -8,6 +8,11 @@ import type { ChangedDep } from "./types.js";
 
 type LockFormat = "uv" | "pylock";
 
+/** Normalize PyPI package names per PEP 503: case-insensitive, [-_.] equivalent. */
+function normalizePypiName(name: string): string {
+  return name.replace(/[-_.]+/g, "-").toLowerCase();
+}
+
 function detectFormat(file: string): LockFormat {
   const base = path.basename(file);
   if (base === "pylock.toml" || base.startsWith("pylock.")) return "pylock";
@@ -36,7 +41,7 @@ function parseUvLock(content: string): Map<string, string> {
         // Skip local/editable/virtual packages (workspace deps)
         const src = pkg.source;
         if (src && (src.editable || src.directory || src.virtual)) continue;
-        result.set(pkg.name, pkg.version);
+        result.set(normalizePypiName(pkg.name), pkg.version);
       }
     }
   } catch (e) {
@@ -53,7 +58,7 @@ function parsePylockToml(content: string): Map<string, string> {
     if (Array.isArray(data.packages)) {
       for (const pkg of data.packages) {
         if (pkg.name && pkg.version) {
-          result.set(pkg.name, pkg.version);
+          result.set(normalizePypiName(pkg.name), pkg.version);
         }
       }
     }

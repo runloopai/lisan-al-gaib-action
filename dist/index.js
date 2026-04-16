@@ -80159,9 +80159,10 @@ const MAVEN_CENTRAL_PREFIXES = [
     "http://repo1.maven.org/maven2",
     "http://central.maven.org/maven2",
 ];
+const FETCH_TIMEOUT_MS = 30_000;
 async function fetchJson(url, headers) {
     try {
-        const resp = await fetch(url, { headers });
+        const resp = await fetch(url, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         if (!resp.ok)
             return null;
         return await resp.json();
@@ -80205,7 +80206,7 @@ async function mavenPublishDate(group, artifact, version, repositories, registri
         const base = resolveMavenRepo(repo, registries);
         const pomUrl = `${base}/${groupPath}/${artifact}/${version}/${artifact}-${version}.pom`;
         try {
-            const resp = await fetch(pomUrl, { method: "HEAD" });
+            const resp = await fetch(pomUrl, { method: "HEAD", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
             if (resp.ok) {
                 const lastModified = resp.headers.get("Last-Modified");
                 if (lastModified) {
@@ -80251,7 +80252,7 @@ async function bcrPublishDate(name, version, token, bcrUrl) {
     }
     // Query the BCR repo for the commit that added this module version
     try {
-        const resp = await fetch(`https://api.github.com/repos/${bcrOwner}/${bcrRepo}/commits?path=modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/MODULE.bazel&per_page=1`, { headers });
+        const resp = await fetch(`https://api.github.com/repos/${bcrOwner}/${bcrRepo}/commits?path=modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/MODULE.bazel&per_page=1`, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         if (resp.ok) {
             const data = (await resp.json());
             const date = data?.[0]?.commit?.committer?.date;
@@ -80265,11 +80266,11 @@ async function bcrPublishDate(name, version, token, bcrUrl) {
     // Fallback: try fetching source.json and HEAD the archive URL for Last-Modified
     try {
         const sourceUrl = `${bcrUrl.replace(/\/$/, "")}/modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/source.json`;
-        const sourceResp = await fetch(sourceUrl);
+        const sourceResp = await fetch(sourceUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         if (sourceResp.ok) {
             const sourceData = (await sourceResp.json());
             if (sourceData.url) {
-                const archiveResp = await fetch(sourceData.url, { method: "HEAD" });
+                const archiveResp = await fetch(sourceData.url, { method: "HEAD", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
                 const lastModified = archiveResp.headers.get("Last-Modified");
                 if (lastModified)
                     return new Date(lastModified);
@@ -80304,7 +80305,7 @@ async function gitCommitDate(remote, ref, token) {
         headers.Authorization = `Bearer ${token}`;
     }
     try {
-        const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${ref}`, { headers });
+        const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${ref}`, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         if (!resp.ok)
             return null;
         const data = (await resp.json());
@@ -80320,7 +80321,7 @@ async function gitCommitDate(remote, ref, token) {
  */
 async function archiveDate(url) {
     try {
-        const resp = await fetch(url, { method: "HEAD" });
+        const resp = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         const lastModified = resp.headers.get("Last-Modified");
         return lastModified ? new Date(lastModified) : null;
     }
@@ -81598,6 +81599,10 @@ function stringify(obj, { maxDepth = 1000, numbersAsFloat = false } = {}) {
 
 
 
+/** Normalize PyPI package names per PEP 503: case-insensitive, [-_.] equivalent. */
+function normalizePypiName(name) {
+    return name.replace(/[-_.]+/g, "-").toLowerCase();
+}
 function detectFormat(file) {
     const base = external_node_path_namespaceObject.basename(file);
     if (base === "pylock.toml" || base.startsWith("pylock."))
@@ -81617,7 +81622,7 @@ function parseUvLock(content) {
                 const src = pkg.source;
                 if (src && (src.editable || src.directory || src.virtual))
                     continue;
-                result.set(pkg.name, pkg.version);
+                result.set(normalizePypiName(pkg.name), pkg.version);
             }
         }
     }
@@ -81634,7 +81639,7 @@ function parsePylockToml(content) {
         if (Array.isArray(data.packages)) {
             for (const pkg of data.packages) {
                 if (pkg.name && pkg.version) {
-                    result.set(pkg.name, pkg.version);
+                    result.set(normalizePypiName(pkg.name), pkg.version);
                 }
             }
         }
@@ -82469,9 +82474,13 @@ function parseMultitoolLock(content) {
         for (const [key, value] of Object.entries(data)) {
             if (key.startsWith("$"))
                 continue;
-            const firstUrl = value?.binaries?.[0]?.url;
-            if (firstUrl) {
-                result.set(key, firstUrl);
+            const urls = (value?.binaries ?? [])
+                .map((b) => b?.url)
+                .filter(Boolean)
+                .sort()
+                .join("\n");
+            if (urls) {
+                result.set(key, urls);
             }
         }
     }

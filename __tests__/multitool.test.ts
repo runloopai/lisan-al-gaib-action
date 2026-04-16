@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { parseMultitoolLock, findChangedTools } from "../src/ecosystems/multitool.js";
 
 describe("parseMultitoolLock", () => {
-  it("extracts tool names and first binary URL", () => {
+  it("extracts tool names and sorted binary URLs", () => {
     const content = JSON.stringify({
       "$schema": "...",
       "buildifier": {
@@ -28,7 +28,7 @@ describe("parseMultitoolLock", () => {
     expect(result.size).toBe(0);
   });
 
-  it("uses first binary URL when multiple platforms exist", () => {
+  it("sorts and joins all binary URLs when multiple platforms exist", () => {
     const content = JSON.stringify({
       "oras": {
         "binaries": [
@@ -39,7 +39,34 @@ describe("parseMultitoolLock", () => {
       },
     });
     const result = parseMultitoolLock(content);
-    expect(result.get("oras")).toBe("https://example.com/oras-linux-arm64.tar.gz");
+    // URLs should be sorted alphabetically and joined with newlines
+    expect(result.get("oras")).toBe(
+      "https://example.com/oras-darwin-arm64.tar.gz\n" +
+      "https://example.com/oras-linux-amd64.tar.gz\n" +
+      "https://example.com/oras-linux-arm64.tar.gz"
+    );
+  });
+
+  it("reordered binaries produce the same key (no false positive)", () => {
+    const contentA = JSON.stringify({
+      "tool": {
+        "binaries": [
+          { "url": "https://example.com/b", "sha256": "1" },
+          { "url": "https://example.com/a", "sha256": "2" },
+        ],
+      },
+    });
+    const contentB = JSON.stringify({
+      "tool": {
+        "binaries": [
+          { "url": "https://example.com/a", "sha256": "2" },
+          { "url": "https://example.com/b", "sha256": "1" },
+        ],
+      },
+    });
+    const resultA = parseMultitoolLock(contentA);
+    const resultB = parseMultitoolLock(contentB);
+    expect(resultA.get("tool")).toBe(resultB.get("tool"));
   });
 
   it("handles malformed JSON gracefully", () => {
@@ -119,6 +146,15 @@ describe("findChangedTools", () => {
   it("handles empty head (all tools removed)", () => {
     const head = new Map<string, string>();
     const base = new Map([["helm", "https://b.com/v1"]]);
+    const deps = findChangedTools(head, base, "tools.json");
+    expect(deps).toHaveLength(0);
+  });
+
+  it("no change when binaries are reordered", () => {
+    // Simulate parseMultitoolLock output (sorted+joined URLs)
+    const urls = "https://a.com/darwin\nhttps://a.com/linux";
+    const head = new Map([["tool", urls]]);
+    const base = new Map([["tool", urls]]);
     const deps = findChangedTools(head, base, "tools.json");
     expect(deps).toHaveLength(0);
   });
