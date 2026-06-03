@@ -127,6 +127,10 @@ export async function getChangedDeps(
   } catch {
     core.debug(`rust: could not read MODULE.bazel.lock at ${lockPath}; version ranges will not be resolved`);
   }
+  // Parse the base lockfile to skip crates whose resolved version was already on the base branch.
+  // This prevents false positives when a no-op range edit (e.g. ^0.13.5 → ~0.13.5) resolves to
+  // the same concrete version as before — the version was already vetted and shouldn't be re-checked.
+  const baseLockVersions = parseCrateLockVersions((await gitShowFile(baseRef, lockPath)) ?? "");
 
   const allDeps: ChangedDep[] = [];
 
@@ -150,10 +154,15 @@ export async function getChangedDeps(
       if (spec.isGit) continue;
       if (baseKeys.has(specKey(spec))) continue;
 
+      const resolved = resolveCrateVersion(spec.package, spec.version, lockVersions);
+      // Skip if this exact concrete version was already present in the base lockfile —
+      // the PR didn't introduce it, so re-checking its age would be a false positive.
+      if (baseLockVersions.get(spec.package)?.includes(resolved)) continue;
+
       allDeps.push({
         ecosystem: "rust",
         name: spec.package,
-        version: resolveCrateVersion(spec.package, spec.version, lockVersions),
+        version: resolved,
         file,
       });
     }

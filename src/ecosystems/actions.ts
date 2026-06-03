@@ -13,9 +13,50 @@ interface ActionRef {
 
 const SHA_RE = /^[0-9a-f]{40}$/;
 const branchSkipLogged = new Set<string>();
+// Cache ref → resolved commit SHA (null = resolution failed / branch). Shared across files in a run.
+const refShaCache = new Map<string, string | null>();
 
 function isCommitSha(ref: string): boolean {
   return SHA_RE.test(ref);
+}
+
+/**
+ * Resolve a ref (SHA, tag, or branch) to its underlying commit SHA via the GitHub API.
+ * Returns the SHA, or null if resolution fails (unauthenticated, private repo, branch, error).
+ * Caches results to avoid redundant API calls within a run.
+ */
+async function resolveRefToSha(
+  owner: string,
+  repo: string,
+  ref: string,
+  headers: Record<string, string>,
+): Promise<string | null> {
+  const cacheKey = `${owner}/${repo}@${ref}`;
+  const cached = refShaCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  if (isCommitSha(ref)) {
+    refShaCache.set(cacheKey, ref);
+    return ref;
+  }
+
+  try {
+    const resp = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/commits/${ref}`,
+      { headers },
+    );
+    if (!resp.ok) {
+      refShaCache.set(cacheKey, null);
+      return null;
+    }
+    const data = (await resp.json()) as { sha?: string };
+    const sha = typeof data?.sha === "string" ? data.sha : null;
+    refShaCache.set(cacheKey, sha);
+    return sha;
+  } catch {
+    refShaCache.set(cacheKey, null);
+    return null;
+  }
 }
 
 /**
@@ -67,6 +108,7 @@ const DEFAULT_WORKFLOW_GLOBS = [
 export async function getChangedDeps(
   baseRef: string,
   workflowFilesInput: string,
+  token = "",
 ): Promise<ChangedDep[]> {
   let files: string[];
 
@@ -95,6 +137,15 @@ export async function getChangedDeps(
     return [];
   }
 
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "lisan-al-gaib-action",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
   const allDeps: ChangedDep[] = [];
 
   for (const file of files) {
@@ -113,17 +164,43 @@ export async function getChangedDeps(
     const headRefs = parseActionRefs(headContent);
     const baseRefs = baseContent ? parseActionRefs(baseContent) : new Map<string, ActionRef>();
 
+    // Group base refs by action name so we can compare commit SHAs when the ref string changes.
+    const baseByName = new Map<string, ActionRef[]>();
+    for (const bRef of baseRefs.values()) {
+      const n = `${bRef.owner}/${bRef.repo}${bRef.path ? "/" + bRef.path : ""}`;
+      const arr = baseByName.get(n) ?? [];
+      arr.push(bRef);
+      baseByName.set(n, arr);
+    }
+
     for (const [key, ref] of headRefs) {
-      // Skip if unchanged from base
+      // Skip if the exact ref string is unchanged from base
       if (baseRefs.has(key)) continue;
 
-      // Skip branch-based refs (not a SHA and not likely a tag)
-      // We'll determine this more precisely during publish date lookup
-      // For now, include all non-branch refs; the registry query will skip branches
+      const name = `${ref.owner}/${ref.repo}${ref.path ? "/" + ref.path : ""}`;
+      const sameNameBase = baseByName.get(name);
+
+      if (sameNameBase) {
+        // Base had this action with a different ref string — resolve both sides to commit SHAs.
+        // If the underlying commit is unchanged, the PR didn't actually change the action's code,
+        // so skip it. If resolution fails for either side, flag conservatively (never skip on doubt).
+        const headSha = await resolveRefToSha(ref.owner, ref.repo, ref.ref, headers);
+        if (headSha !== null) {
+          let sameCommit = false;
+          for (const bRef of sameNameBase) {
+            const baseSha = await resolveRefToSha(bRef.owner, bRef.repo, bRef.ref, headers);
+            if (baseSha === headSha) {
+              sameCommit = true;
+              break;
+            }
+          }
+          if (sameCommit) continue;
+        }
+      }
 
       allDeps.push({
         ecosystem: "actions",
-        name: `${ref.owner}/${ref.repo}${ref.path ? "/" + ref.path : ""}`,
+        name,
         version: ref.ref,
         file,
       });

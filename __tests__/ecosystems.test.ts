@@ -269,6 +269,101 @@ describe("rust.getChangedDeps", () => {
     expect(deps[0].name).toBe("tokio");
     expect(deps[0].version).toBe("1.37.0");
   });
+
+  it("skips crate whose resolved version was already in base lockfile (no-op range edit)", async () => {
+    const prost013 = JSON.stringify({
+      moduleExtensions: {
+        "@@rules_rust+//crate_universe:extension.bzl%crate": {
+          general: {
+            generatedRepoSpecs: {
+              "crates__prost-0.13.5": {
+                attributes: {
+                  urls: ["https://static.crates.io/crates/prost/0.13.5/download"],
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    vi.mocked(bazel.resolveModuleFiles).mockResolvedValue(["MODULE.bazel"]);
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["MODULE.bazel"]);
+    vi.mocked(fs.readFile).mockImplementation((p: unknown) => {
+      if (typeof p === "string" && p.endsWith(".lock")) {
+        return Promise.resolve(prost013 as unknown as Buffer);
+      }
+      return Promise.resolve("head content" as unknown as Buffer);
+    });
+    vi.mocked(diff.gitShowFile).mockImplementation((_ref: string, p: string) => {
+      if (p.endsWith(".lock")) return Promise.resolve(prost013);
+      return Promise.resolve("base content");
+    });
+    // Head: ~0.13.5 (range edit), base: ^0.13.5 — both resolve to the same 0.13.5 already on base.
+    vi.mocked(bazel.extractCrateSpecs)
+      .mockResolvedValueOnce([{ package: "prost", version: "~0.13.5", isGit: false }])
+      .mockResolvedValueOnce([{ package: "prost", version: "^0.13.5", isGit: false }]);
+
+    const rust = await import("../src/ecosystems/rust.js");
+    const deps = await rust.getChangedDeps("HEAD~1", "MODULE.bazel");
+    expect(deps).toEqual([]);
+  });
+
+  it("flags crate whose resolved version is genuinely new vs base lockfile", async () => {
+    const headLock = JSON.stringify({
+      moduleExtensions: {
+        "@@rules_rust+//crate_universe:extension.bzl%crate": {
+          general: {
+            generatedRepoSpecs: {
+              "crates__prost-0.14.3": {
+                attributes: {
+                  urls: ["https://static.crates.io/crates/prost/0.14.3/download"],
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+    const baseLock = JSON.stringify({
+      moduleExtensions: {
+        "@@rules_rust+//crate_universe:extension.bzl%crate": {
+          general: {
+            generatedRepoSpecs: {
+              "crates__prost-0.13.5": {
+                attributes: {
+                  urls: ["https://static.crates.io/crates/prost/0.13.5/download"],
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    vi.mocked(bazel.resolveModuleFiles).mockResolvedValue(["MODULE.bazel"]);
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["MODULE.bazel"]);
+    vi.mocked(fs.readFile).mockImplementation((p: unknown) => {
+      if (typeof p === "string" && p.endsWith(".lock")) {
+        return Promise.resolve(headLock as unknown as Buffer);
+      }
+      return Promise.resolve("head content" as unknown as Buffer);
+    });
+    vi.mocked(diff.gitShowFile).mockImplementation((_ref: string, p: string) => {
+      if (p.endsWith(".lock")) return Promise.resolve(baseLock);
+      return Promise.resolve("base content");
+    });
+    // Head: ~0.14.0 resolves to 0.14.3 (new), base: ~0.13.5 resolves to 0.13.5 (old).
+    vi.mocked(bazel.extractCrateSpecs)
+      .mockResolvedValueOnce([{ package: "prost", version: "~0.14.0", isGit: false }])
+      .mockResolvedValueOnce([{ package: "prost", version: "~0.13.5", isGit: false }]);
+
+    const rust = await import("../src/ecosystems/rust.js");
+    const deps = await rust.getChangedDeps("HEAD~1", "MODULE.bazel");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("prost");
+    expect(deps[0].version).toBe("0.14.3");
+  });
 });
 
 // ─── java ecosystem ─────────────────────────────────────────────────────────
@@ -424,9 +519,13 @@ steps:
   - uses: actions/checkout@v4
   - uses: actions/setup-node@v4
 ` as any);
+    // checkout v3 and v4 resolve to different SHAs → both deps are flagged.
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ sha: "0000000000000000000000000000000000000004" })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ sha: "0000000000000000000000000000000000000003" })));
 
     const actions = await import("../src/ecosystems/actions.js");
-    const deps = await actions.getChangedDeps("HEAD~1", ".github/workflows/*.yml");
+    const deps = await actions.getChangedDeps("HEAD~1", ".github/workflows/*.yml", "");
     expect(deps).toHaveLength(2);
   });
 
@@ -437,6 +536,54 @@ steps:
     const actions = await import("../src/ecosystems/actions.js");
     const deps = await actions.getChangedDeps("HEAD~1", ".github/workflows/*.yml");
     expect(deps).toEqual([]);
+  });
+
+  it("skips action when ref change points to the same commit SHA", async () => {
+    const sameSha = "dddddddddddddddddddddddddddddddddddddddd";
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue([".github/workflows/deploy.yml"]);
+    vi.mocked(diff.resolveFiles).mockResolvedValue([".github/workflows/deploy.yml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("some diff");
+    vi.mocked(diff.gitShowFile).mockResolvedValue(`
+steps:
+  - uses: actions/deploy-pages@v1
+  - uses: actions/configure-pages@v5
+`);
+    vi.mocked(fs.readFile).mockResolvedValue(`
+steps:
+  - uses: actions/deploy-pages@v1.1.0
+  - uses: actions/configure-pages@v5
+` as any);
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ sha: sameSha })))  // deploy-pages v1.1.0
+      .mockResolvedValueOnce(new Response(JSON.stringify({ sha: sameSha }))); // deploy-pages v1 — same commit
+
+    const actions = await import("../src/ecosystems/actions.js");
+    const deps = await actions.getChangedDeps("HEAD~1", ".github/workflows/deploy.yml", "token");
+    // deploy-pages ref changed but resolves to the same commit → skipped.
+    // configure-pages unchanged (same key in base and head) → skipped by key check.
+    expect(deps).toEqual([]);
+  });
+
+  it("flags action conservatively when SHA resolution fails", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue([".github/workflows/upload.yml"]);
+    vi.mocked(diff.resolveFiles).mockResolvedValue([".github/workflows/upload.yml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("some diff");
+    vi.mocked(diff.gitShowFile).mockResolvedValue(`
+steps:
+  - uses: actions/upload-artifact@v3
+`);
+    vi.mocked(fs.readFile).mockResolvedValue(`
+steps:
+  - uses: actions/upload-artifact@v4
+` as any);
+    // SHA resolution fails for both refs → headSha is null → flag conservatively.
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 500 }));
+
+    const actions = await import("../src/ecosystems/actions.js");
+    const deps = await actions.getChangedDeps("HEAD~1", ".github/workflows/upload.yml", "token");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("actions/upload-artifact");
+    expect(deps[0].version).toBe("v4");
   });
 });
 
