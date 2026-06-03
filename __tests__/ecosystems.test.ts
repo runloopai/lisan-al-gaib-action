@@ -232,6 +232,43 @@ describe("rust.getChangedDeps", () => {
     const deps = await rust.getChangedDeps("HEAD~1", "MODULE.bazel");
     expect(deps).toEqual([]);
   });
+
+  it("resolves crate.spec range to concrete version from MODULE.bazel.lock", async () => {
+    const lockJson = JSON.stringify({
+      moduleExtensions: {
+        "@@rules_rust+//crate_universe:extension.bzl%crate": {
+          general: {
+            generatedRepoSpecs: {
+              "crates__tokio-1.37.0": {
+                attributes: {
+                  urls: ["https://static.crates.io/crates/tokio/1.37.0/download"],
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    vi.mocked(bazel.resolveModuleFiles).mockResolvedValue(["MODULE.bazel"]);
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["MODULE.bazel"]);
+    vi.mocked(fs.readFile).mockImplementation((p: unknown) => {
+      if (typeof p === "string" && p.endsWith(".lock")) {
+        return Promise.resolve(lockJson as unknown as Buffer);
+      }
+      return Promise.resolve("head content" as unknown as Buffer);
+    });
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+    vi.mocked(bazel.extractCrateSpecs).mockResolvedValueOnce([
+      { package: "tokio", version: "~1.37.0", isGit: false },
+    ]);
+
+    const rust = await import("../src/ecosystems/rust.js");
+    const deps = await rust.getChangedDeps("HEAD~1", "MODULE.bazel");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("tokio");
+    expect(deps[0].version).toBe("1.37.0");
+  });
 });
 
 // ─── java ecosystem ─────────────────────────────────────────────────────────
