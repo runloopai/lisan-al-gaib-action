@@ -16,6 +16,12 @@ const branchSkipLogged = new Set<string>();
 // Cache ref → resolved commit SHA (null = resolution failed / branch). Shared across files in a run.
 const refShaCache = new Map<string, string | null>();
 
+// Exported for test isolation only — clears module-level caches between test cases.
+export function __resetCaches(): void {
+  refShaCache.clear();
+  branchSkipLogged.clear();
+}
+
 function isCommitSha(ref: string): boolean {
   return SHA_RE.test(ref);
 }

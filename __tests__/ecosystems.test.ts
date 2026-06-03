@@ -504,7 +504,12 @@ describe("bazel-module.getChangedDeps", () => {
 // ─── actions ecosystem ───────────────────────────────────────────────────────
 
 describe("actions.getChangedDeps", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    // Clear module-level caches so each test starts with no cached SHA resolutions.
+    const actionsModule = await import("../src/ecosystems/actions.js");
+    actionsModule.__resetCaches();
+  });
 
   it("finds changed action refs in workflow files", async () => {
     vi.mocked(diff.gitDiffNameOnly).mockResolvedValue([".github/workflows/ci.yml"]);
@@ -584,6 +589,29 @@ steps:
     expect(deps).toHaveLength(1);
     expect(deps[0].name).toBe("actions/upload-artifact");
     expect(deps[0].version).toBe("v4");
+  });
+
+  it("skips action when SHA-pinned base matches tag head; no fetch for SHA ref (short-circuit)", async () => {
+    const sha = "aaaa000000000000000000000000000000000000";
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue([".github/workflows/cache.yml"]);
+    vi.mocked(diff.resolveFiles).mockResolvedValue([".github/workflows/cache.yml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("some diff");
+    // Base is pinned to a commit SHA; head upgrades to a named tag resolving to that same SHA.
+    vi.mocked(diff.gitShowFile).mockResolvedValue(
+      `steps:\n  - uses: actions/cache@${sha}`,
+    );
+    vi.mocked(fs.readFile).mockResolvedValue(
+      `steps:\n  - uses: actions/cache@v4` as any,
+    );
+    // Only one fetch: resolving the v4 tag. The base SHA short-circuits without a network call.
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ sha })),
+    );
+
+    const actions = await import("../src/ecosystems/actions.js");
+    const deps = await actions.getChangedDeps("HEAD~1", ".github/workflows/cache.yml", "token");
+    expect(deps).toEqual([]);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
   });
 });
 
