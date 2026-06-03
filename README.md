@@ -8,7 +8,7 @@ A GitHub Action that acts as a supply-chain security gate by failing if newly ad
 |-----------|-----------|----------|
 | **npm** | `pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, `bun.lock` | npm registry |
 | **python** | `uv.lock`, `*.py.lock` (script lockfiles), `pylock.toml` (PEP 751) | PyPI |
-| **rust** | `MODULE.bazel` with `crate.spec()` | crates.io |
+| **rust** | `MODULE.bazel` with `crate.spec()` + `MODULE.bazel.lock` | crates.io |
 | **java** | `MODULE.bazel` with `maven.install()` + JSON lock files | Maven Central / custom repos |
 | **bazel** | `MODULE.bazel.lock` | Bazel Central Registry (BCR) |
 | **actions** | `.github/workflows/*.yml`, `action.yml` | GitHub API |
@@ -334,7 +334,7 @@ When violations are detected, the action suggests package manager-level settings
 5. **Query registries** for each changed package's publish date
 6. **Report** results as GitHub annotations (errors/warnings) and a job summary table
 
-For Rust and Java ecosystems, the action parses `MODULE.bazel` using a tree-sitter Starlark grammar, resolving recursive `include()` statements to find all `crate.spec()` and `maven.install()` blocks.
+For Rust and Java ecosystems, the action parses `MODULE.bazel` using a tree-sitter Starlark grammar, resolving recursive `include()` statements to find all `crate.spec()` and `maven.install()` blocks. For Rust, `crate.spec()` version requirements are semver ranges (e.g. `~0.13.5`) — the action resolves each to its concrete pinned version via `MODULE.bazel.lock`'s crate_universe extension data, so the exact published version is checked rather than the range string.
 
 For the Bazel ecosystem, it parses `MODULE.bazel.lock` (JSON) to find resolved module versions and extracts override directives (`git_override`, `archive_override`, etc.) from `MODULE.bazel` files.
 

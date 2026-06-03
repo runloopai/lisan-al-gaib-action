@@ -34,7 +34,7 @@ src/
     types.ts           # Shared interfaces (ChangedDep, CheckResult, etc.)
     npm.ts             # Parse pnpm/npm/yarn/bun lockfiles via lockparse
     python.ts          # Parse uv.lock and pylock.toml via smol-toml
-    rust.ts            # Extract crate.spec() from MODULE.bazel, diff HEAD vs base
+    rust.ts            # Extract crate.spec() from MODULE.bazel, diff HEAD vs base; resolve version ranges to concrete versions via MODULE.bazel.lock
     java.ts            # Extract maven.install() from MODULE.bazel, diff lock JSON
     bazel-module.ts    # Parse MODULE.bazel.lock for bazel_dep modules, handle overrides
     actions.ts         # Parse workflow YAML for uses: directives, query GitHub API
