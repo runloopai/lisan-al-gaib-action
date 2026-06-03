@@ -191,9 +191,15 @@ steps:
       kubernetes-files: rendered/manifests.yaml
 ```
 
-Only images on anonymously-accessible registries (Docker Hub, `public.ecr.aws`,
-`ghcr.io`, `quay.io`, `registry.k8s.io`) can be checked. Images on private
-registries (AWS ECR, GCP Artifact Registry, self-hosted) are reported as `unknown`.
+Push timestamps are sourced from registry-specific APIs where available:
+- **Docker Hub** (`docker.io`): Hub API `tag_last_pushed` (accurate, per-tag push time)
+- **Other public registries** (`public.ecr.aws`, `ghcr.io`, `quay.io`, `registry.k8s.io`):
+  `Last-Modified` HTTP header on the manifest response — a best-effort signal not
+  guaranteed by the OCI Distribution spec; registries that don't emit this header
+  will report `unknown` even for publicly accessible images
+
+Images on private registries (AWS ECR private, GCP Artifact Registry, self-hosted)
+that reject anonymous pulls are always reported as `unknown`.
 
 ### License compliance
 

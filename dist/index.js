@@ -82698,13 +82698,22 @@ function parseImageRef(raw) {
     const trimmed = raw.trim();
     if (!trimmed)
         return null;
-    // Split off digest (everything after the last '@')
+    // Split off digest (everything after the last '@').
+    // Only treat as a digest if it has the algorithm:hex form (e.g. sha256:...).
+    // Bare @tag typos like "nginx@latest" don't contain ':' and are left as-is
+    // (digest remains null, treated as mutable tag-only → unknown).
     const atIdx = trimmed.lastIndexOf("@");
     let digest = null;
     let refPart;
     if (atIdx !== -1) {
-        digest = trimmed.slice(atIdx + 1) || null;
-        refPart = trimmed.slice(0, atIdx);
+        const candidate = trimmed.slice(atIdx + 1);
+        if (candidate.includes(":")) {
+            digest = candidate;
+            refPart = trimmed.slice(0, atIdx);
+        }
+        else {
+            refPart = trimmed;
+        }
     }
     else {
         refPart = trimmed;

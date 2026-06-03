@@ -508,6 +508,55 @@ describe("fetchImagePublishDate", () => {
     expect(date).toBeNull();
   });
 
+  it("returns null when OCI index has empty manifests array", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 })) // ping → no auth
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ manifests: [] }), {
+          headers: { "content-type": "application/vnd.oci.image.index.v1+json" },
+        }),
+      );
+    const date = await fetchImagePublishDate(
+      "registry.k8s.io",
+      "pause",
+      "sha256:idx",
+      null,
+    );
+    expect(date).toBeNull();
+  });
+
+  it("falls back to first child when no linux/amd64 child in OCI index", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 })) // ping → no auth
+      // index: only arm64 available
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            manifests: [
+              { digest: "sha256:arm", platform: { os: "linux", architecture: "arm64" } },
+            ],
+          }),
+          { headers: { "content-type": "application/vnd.oci.image.index.v1+json" } },
+        ),
+      )
+      // first child manifest
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({}), {
+          headers: {
+            "content-type": "application/vnd.oci.image.manifest.v1+json",
+            "last-modified": "Fri, 01 Mar 2024 00:00:00 GMT",
+          },
+        }),
+      );
+    const date = await fetchImagePublishDate(
+      "registry.k8s.io",
+      "pause",
+      "sha256:idx",
+      null,
+    );
+    expect(date).toEqual(new Date("Fri, 01 Mar 2024 00:00:00 GMT"));
+  });
+
   it("returns null on fetch error", async () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("network error"));
     const date = await fetchImagePublishDate(
