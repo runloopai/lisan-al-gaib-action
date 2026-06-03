@@ -153,6 +153,8 @@ jobs:
 
 Actions pinned to a branch (e.g. `@main`) are skipped. Actions pinned to a tag (e.g. `@v4`) or commit SHA are checked against the GitHub API for their publish/commit date.
 
+When a `uses:` ref changes between base and HEAD (e.g. `@v4` → `@v4.1.0`), both refs are resolved to their underlying commit SHA via the GitHub API. If they resolve to the same commit, the action is **skipped** — the PR didn't actually introduce a new version and checking it would be a false positive. If resolution fails or the SHAs differ, the action is checked (conservative fallback).
+
 ### Check Bazel module dependencies
 
 ```yaml
@@ -334,7 +336,7 @@ When violations are detected, the action suggests package manager-level settings
 5. **Query registries** for each changed package's publish date
 6. **Report** results as GitHub annotations (errors/warnings) and a job summary table
 
-For Rust and Java ecosystems, the action parses `MODULE.bazel` using a tree-sitter Starlark grammar, resolving recursive `include()` statements to find all `crate.spec()` and `maven.install()` blocks. For Rust, `crate.spec()` version requirements are semver ranges (e.g. `~0.13.5`) — the action resolves each to its concrete pinned version via `MODULE.bazel.lock`'s crate_universe extension data, so the exact published version is checked rather than the range string.
+For Rust and Java ecosystems, the action parses `MODULE.bazel` using a tree-sitter Starlark grammar, resolving recursive `include()` statements to find all `crate.spec()` and `maven.install()` blocks. For Rust, `crate.spec()` version requirements are semver ranges (e.g. `~0.13.5`) — the action resolves each to its concrete pinned version via `MODULE.bazel.lock`'s crate_universe extension data, so the exact published version is checked rather than the range string. Only crates whose resolved concrete version is **newly introduced** vs the base `MODULE.bazel.lock` are checked — a no-op range edit (e.g. `^0.13.5` → `~0.13.5`) that resolves to the same version already on the base branch is **skipped**.
 
 For the Bazel ecosystem, it parses `MODULE.bazel.lock` (JSON) to find resolved module versions and extracts override directives (`git_override`, `archive_override`, etc.) from `MODULE.bazel` files.
 
