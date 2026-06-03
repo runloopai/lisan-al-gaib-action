@@ -42,6 +42,7 @@ vi.mock("../src/registry.js", () => ({
   cratesPublishDate: vi.fn(),
   npmPublishDate: vi.fn(),
   pypiPublishDate: vi.fn(),
+  fetchImagePublishDate: vi.fn(),
 }));
 
 import * as fs from "node:fs/promises";
@@ -466,5 +467,191 @@ describe("actions.getPublishDate", () => {
     const actions = await import("../src/ecosystems/actions.js");
     const date = await actions.getPublishDate("actions/checkout", "v4", "");
     expect(date).toEqual(new Date("2024-03-01T00:00:00Z"));
+  });
+});
+
+// ─── kubernetes ecosystem ────────────────────────────────────────────────────
+
+describe("kubernetes.getChangedDeps", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("auto-detects changed YAML manifests and returns new images", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["k8s/deploy.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("some diff");
+    vi.mocked(fs.readFile).mockResolvedValue(`
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.25@sha256:abc123
+` as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps, imageRefs } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("docker.io/library/nginx");
+    expect(deps[0].version).toBe("1.25@sha256:abc123");
+    expect(imageRefs.size).toBe(1);
+    expect(imageRefs.has("docker.io/library/nginx@1.25@sha256:abc123")).toBe(true);
+  });
+
+  it("skips images present in both HEAD and base (unchanged)", async () => {
+    const manifest = `
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.25@sha256:abc123
+`;
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["k8s/deploy.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(manifest as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(manifest);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(0);
+  });
+
+  it("skips non-manifest YAML files (no containers)", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["config.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(`
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-config
+data:
+  key: value
+` as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(0);
+  });
+
+  it("returns empty when no YAML files changed", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["src/main.ts"]);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(0);
+  });
+
+  it("uses provided kubernetes-files input", async () => {
+    vi.mocked(diff.resolveFiles).mockResolvedValue(["rendered/manifests.yaml"]);
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["rendered/manifests.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(`
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: public.ecr.aws/aws-cli/aws-cli:2.34.56@sha256:c6b9b4f1
+` as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "rendered/manifests.yaml");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("public.ecr.aws/aws-cli/aws-cli");
+  });
+
+  it("includes tag-only images as deps with version equal to tag", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["k8s/deploy.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(`
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: db
+          image: postgres:16-alpine
+` as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].version).toBe("16-alpine");
+  });
+});
+
+describe("kubernetes.getPublishDate", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("returns null for tag-only ref without calling fetchImagePublishDate", async () => {
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const date = await kubernetes.getPublishDate({
+      raw: "nginx:1.25",
+      registry: "docker.io",
+      repository: "library/nginx",
+      tag: "1.25",
+      digest: null,
+    });
+    expect(date).toBeNull();
+    expect(vi.mocked(registry.fetchImagePublishDate)).not.toHaveBeenCalled();
+  });
+
+  it("delegates to fetchImagePublishDate for digest-pinned refs", async () => {
+    vi.mocked(registry.fetchImagePublishDate).mockResolvedValueOnce(
+      new Date("2024-03-01T00:00:00Z"),
+    );
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const date = await kubernetes.getPublishDate({
+      raw: "alpine/psql@sha256:5e2b",
+      registry: "docker.io",
+      repository: "alpine/psql",
+      tag: null,
+      digest: "sha256:5e2b",
+    });
+    expect(date).toEqual(new Date("2024-03-01T00:00:00Z"));
+    expect(vi.mocked(registry.fetchImagePublishDate)).toHaveBeenCalledWith(
+      "docker.io",
+      "alpine/psql",
+      "sha256:5e2b",
+      null,
+    );
+  });
+
+  it("passes tag to fetchImagePublishDate when both tag and digest present", async () => {
+    vi.mocked(registry.fetchImagePublishDate).mockResolvedValueOnce(
+      new Date("2024-05-01T00:00:00Z"),
+    );
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    await kubernetes.getPublishDate({
+      raw: "public.ecr.aws/aws-cli/aws-cli:2.34.56@sha256:c6b9b4f1",
+      registry: "public.ecr.aws",
+      repository: "aws-cli/aws-cli",
+      tag: "2.34.56",
+      digest: "sha256:c6b9b4f1",
+    });
+    expect(vi.mocked(registry.fetchImagePublishDate)).toHaveBeenCalledWith(
+      "public.ecr.aws",
+      "aws-cli/aws-cli",
+      "sha256:c6b9b4f1",
+      "2.34.56",
+    );
+  });
+
+  it("returns null for undefined ref", async () => {
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const date = await kubernetes.getPublishDate(undefined);
+    expect(date).toBeNull();
   });
 });

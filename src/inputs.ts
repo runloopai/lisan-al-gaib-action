@@ -24,6 +24,7 @@ export interface ActionInputs {
   strictThirdParty: boolean;
   bypassKeyword: string;
   workflowFiles: string;
+  kubernetesFiles: string;
   githubToken: string;
   bcrUrl: string;
   allowedLicenses: string;
@@ -81,6 +82,7 @@ export function getInputs(): ActionInputs {
     strictThirdParty: core.getBooleanInput("strict-third-party"),
     bypassKeyword: core.getInput("bypass-keyword"),
     workflowFiles: core.getInput("workflow-files"),
+    kubernetesFiles: core.getInput("kubernetes-files"),
     githubToken: core.getInput("github-token"),
     bcrUrl: trimSlash(core.getInput("bcr-url") || "https://bcr.bazel.build"),
     allowedLicenses: effectiveLicenses,

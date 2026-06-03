@@ -247,3 +247,179 @@ export async function archiveDate(url: string): Promise<Date | null> {
     return null;
   }
 }
+
+// ─── OCI / Container Registry ────────────────────────────────────────────────
+
+const OCI_INDEX_MEDIA_TYPES = new Set([
+  "application/vnd.oci.image.index.v1+json",
+  "application/vnd.docker.distribution.manifest.list.v2+json",
+]);
+
+const MANIFEST_ACCEPT = [
+  "application/vnd.oci.image.index.v1+json",
+  "application/vnd.docker.distribution.manifest.list.v2+json",
+  "application/vnd.oci.image.manifest.v1+json",
+  "application/vnd.docker.distribution.manifest.v2+json",
+].join(", ");
+
+/**
+ * Obtain an anonymous OCI bearer token for the given registry and repository
+ * using the WWW-Authenticate challenge flow. Returns null if the registry
+ * allows unauthenticated access (HTTP 200 on /v2/) or if authentication
+ * fails (private registry).
+ */
+async function getOciToken(
+  host: string,
+  repository: string,
+): Promise<string | null> {
+  try {
+    const pingResp = await fetch(`https://${host}/v2/`, {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    if (pingResp.status === 200) return null; // no auth needed
+    if (pingResp.status !== 401) return null; // private or unreachable
+
+    const wwwAuth = pingResp.headers.get("www-authenticate") ?? "";
+    const realmMatch = wwwAuth.match(/realm="([^"]+)"/);
+    if (!realmMatch) return null;
+    const realm = realmMatch[1];
+
+    const serviceMatch = wwwAuth.match(/service="([^"]+)"/);
+    const service = serviceMatch ? serviceMatch[1] : "";
+
+    const tokenUrl =
+      `${realm}?service=${encodeURIComponent(service)}` +
+      `&scope=${encodeURIComponent(`repository:${repository}:pull`)}`;
+
+    const data = (await fetchJson(tokenUrl)) as
+      | { token?: string; access_token?: string }
+      | null;
+    return data?.token ?? data?.access_token ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchOciManifest(
+  host: string,
+  repository: string,
+  reference: string,
+  token: string | null,
+): Promise<{ contentType: string; body: unknown; lastModified: string | null } | null> {
+  const headers: Record<string, string> = { Accept: MANIFEST_ACCEPT };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  try {
+    const resp = await fetch(
+      `https://${host}/v2/${repository}/manifests/${reference}`,
+      { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
+    );
+    if (!resp.ok) return null;
+    const contentType = resp.headers.get("content-type") ?? "";
+    const lastModified = resp.headers.get("last-modified");
+    const body = (await resp.json()) as unknown;
+    return { contentType, body, lastModified };
+  } catch {
+    return null;
+  }
+}
+
+function parseLastModified(value: string | null | undefined): Date | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (isNaN(date.getTime()) || date.getFullYear() < 2000) return null;
+  return date;
+}
+
+/**
+ * Docker Hub Hub API: returns the tag_last_pushed timestamp for a tag — the
+ * actual time the image was pushed to Docker Hub, not the build time.
+ * repository is already normalized to "library/<name>" or "user/repo" form.
+ */
+async function dockerHubPushDate(
+  repository: string,
+  tag: string,
+): Promise<Date | null> {
+  const [namespace, ...rest] = repository.split("/");
+  const repoName = rest.join("/");
+  const url =
+    `https://hub.docker.com/v2/repositories/${namespace}/${repoName}/tags` +
+    `?name=${encodeURIComponent(tag)}&page_size=25`;
+  const data = (await fetchJson(url)) as {
+    results?: Array<{ name: string; tag_last_pushed?: string }>;
+  } | null;
+  const result = data?.results?.find((r) => r.name === tag);
+  return parseLastModified(result?.tag_last_pushed ?? null);
+}
+
+/**
+ * Fetch the push timestamp for a container image via registry-specific APIs
+ * and the OCI Distribution v2 protocol.
+ *
+ * For Docker Hub images with a known tag, queries the Hub API for
+ * `tag_last_pushed` (the actual push timestamp). For all other registries,
+ * or as a fallback, reads the `Last-Modified` HTTP header from the manifest
+ * GET response — the time the registry stored that content-addressed manifest,
+ * which is the push time.
+ *
+ * Returns null for private registries (anonymous auth rejected), unreachable
+ * registries, or registries that do not expose a push timestamp.
+ */
+export async function fetchImagePublishDate(
+  registry: string,
+  repository: string,
+  digest: string,
+  tag: string | null = null,
+): Promise<Date | null> {
+  const host =
+    registry === "docker.io" || registry === "index.docker.io"
+      ? "registry-1.docker.io"
+      : registry;
+
+  try {
+    // Docker Hub exposes tag_last_pushed via the Hub web API — the real push time
+    if ((registry === "docker.io" || registry === "index.docker.io") && tag) {
+      const date = await dockerHubPushDate(repository, tag);
+      if (date) return date;
+    }
+
+    // Universal fallback: Last-Modified on the manifest response = push time
+    const token = await getOciToken(host, repository);
+
+    const manifest = await fetchOciManifest(host, repository, digest, token);
+    if (!manifest) return null;
+
+    const mediaType = manifest.contentType.split(";")[0].trim();
+
+    if (OCI_INDEX_MEDIA_TYPES.has(mediaType)) {
+      // Multi-arch index: drill into preferred child and use its Last-Modified
+      const index = manifest.body as {
+        manifests?: Array<{
+          digest: string;
+          platform?: { os?: string; architecture?: string };
+        }>;
+      };
+      if (!index.manifests?.length) return null;
+
+      const child =
+        index.manifests.find(
+          (m) =>
+            m.platform?.os === "linux" &&
+            m.platform?.architecture === "amd64",
+        ) ?? index.manifests[0];
+
+      const childManifest = await fetchOciManifest(
+        host,
+        repository,
+        child.digest,
+        token,
+      );
+      if (!childManifest) return null;
+      return parseLastModified(childManifest.lastModified);
+    }
+
+    return parseLastModified(manifest.lastModified);
+  } catch {
+    return null;
+  }
+}

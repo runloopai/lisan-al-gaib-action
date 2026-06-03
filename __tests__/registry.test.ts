@@ -11,6 +11,7 @@ import {
   mavenPublishDate,
   gitCommitDate,
   archiveDate,
+  fetchImagePublishDate,
 } from "../src/registry.js";
 
 const registries = {
@@ -330,5 +331,191 @@ describe("fetch timeout", () => {
       new DOMException("The operation was aborted", "AbortError"),
     );
     expect(await npmPublishDate("pkg", "1.0.0", registries)).toBeNull();
+  });
+});
+
+describe("fetchImagePublishDate", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("uses Docker Hub Hub API tag_last_pushed when tag is provided", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          results: [{ name: "3.20", tag_last_pushed: "2024-05-01T00:00:00Z" }],
+        }),
+      ),
+    );
+    const date = await fetchImagePublishDate(
+      "docker.io",
+      "library/alpine",
+      "sha256:abc123",
+      "3.20",
+    );
+    expect(date).toEqual(new Date("2024-05-01T00:00:00Z"));
+  });
+
+  it("uses Last-Modified header from manifest for non-Docker Hub registries", async () => {
+    vi.spyOn(globalThis, "fetch")
+      // ping → 401
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 401,
+          headers: {
+            "www-authenticate":
+              'Bearer realm="https://auth.example.com/token",service="example.com"',
+          },
+        }),
+      )
+      // token
+      .mockResolvedValueOnce(new Response(JSON.stringify({ token: "tok123" })))
+      // manifest with Last-Modified
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({}), {
+          headers: {
+            "content-type": "application/vnd.oci.image.manifest.v1+json",
+            "last-modified": "Mon, 01 Jan 2024 12:00:00 GMT",
+          },
+        }),
+      );
+    const date = await fetchImagePublishDate(
+      "registry.k8s.io",
+      "pause",
+      "sha256:abc",
+      null,
+    );
+    expect(date).toEqual(new Date("Mon, 01 Jan 2024 12:00:00 GMT"));
+  });
+
+  it("falls back to Last-Modified when Docker Hub Hub API returns no match", async () => {
+    vi.spyOn(globalThis, "fetch")
+      // Hub API → empty results
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: [] })))
+      // ping → 401
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 401,
+          headers: {
+            "www-authenticate":
+              'Bearer realm="https://auth.docker.io/token",service="registry.docker.io"',
+          },
+        }),
+      )
+      // token
+      .mockResolvedValueOnce(new Response(JSON.stringify({ token: "tok" })))
+      // manifest with Last-Modified
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({}), {
+          headers: {
+            "content-type": "application/vnd.oci.image.manifest.v1+json",
+            "last-modified": "Wed, 15 Mar 2024 00:00:00 GMT",
+          },
+        }),
+      );
+    const date = await fetchImagePublishDate(
+      "docker.io",
+      "library/nginx",
+      "sha256:def",
+      "1.25",
+    );
+    expect(date).toEqual(new Date("Wed, 15 Mar 2024 00:00:00 GMT"));
+  });
+
+  it("drills into linux/amd64 child for OCI image index", async () => {
+    vi.spyOn(globalThis, "fetch")
+      // ping → 401
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 401,
+          headers: {
+            "www-authenticate":
+              'Bearer realm="https://auth.example.com/token",service="example.com"',
+          },
+        }),
+      )
+      // token
+      .mockResolvedValueOnce(new Response(JSON.stringify({ token: "tok" })))
+      // index manifest
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            manifests: [
+              { digest: "sha256:arm", platform: { os: "linux", architecture: "arm64" } },
+              { digest: "sha256:amd", platform: { os: "linux", architecture: "amd64" } },
+            ],
+          }),
+          { headers: { "content-type": "application/vnd.oci.image.index.v1+json" } },
+        ),
+      )
+      // linux/amd64 child manifest with Last-Modified
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({}), {
+          headers: {
+            "content-type": "application/vnd.oci.image.manifest.v1+json",
+            "last-modified": "Tue, 20 Feb 2024 00:00:00 GMT",
+          },
+        }),
+      );
+    const date = await fetchImagePublishDate(
+      "public.ecr.aws",
+      "docker/library/alpine",
+      "sha256:idx",
+      null,
+    );
+    expect(date).toEqual(new Date("Tue, 20 Feb 2024 00:00:00 GMT"));
+  });
+
+  it("returns null when private registry rejects anonymous token fetch", async () => {
+    vi.spyOn(globalThis, "fetch")
+      // ping → 401
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 401,
+          headers: {
+            "www-authenticate":
+              'Bearer realm="https://private.ecr.aws/token",service="priv"',
+          },
+        }),
+      )
+      // token endpoint → 401 (private, credentials required)
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      // manifest → 401 (no valid token)
+      .mockResolvedValueOnce(new Response(null, { status: 401 }));
+    const date = await fetchImagePublishDate(
+      "992382648534.dkr.ecr.us-east-2.amazonaws.com",
+      "mux_repo",
+      "sha256:priv",
+      null,
+    );
+    expect(date).toBeNull();
+  });
+
+  it("returns null when manifest has no Last-Modified header", async () => {
+    vi.spyOn(globalThis, "fetch")
+      // ping → 200 (no auth needed)
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      // manifest with no Last-Modified
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({}), {
+          headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" },
+        }),
+      );
+    const date = await fetchImagePublishDate(
+      "registry.k8s.io",
+      "pause",
+      "sha256:xyz",
+      null,
+    );
+    expect(date).toBeNull();
+  });
+
+  it("returns null on fetch error", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("network error"));
+    const date = await fetchImagePublishDate(
+      "ghcr.io",
+      "owner/image",
+      "sha256:abc",
+      null,
+    );
+    expect(date).toBeNull();
   });
 });

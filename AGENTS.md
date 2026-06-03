@@ -1,6 +1,6 @@
 # Project overview
 
-This is a GitHub Action (TypeScript, node24 runtime) that checks whether newly added or updated dependencies were published recently enough to be a supply-chain risk. It supports npm/pnpm/yarn/bun, Python (uv/pylock), Rust (Bazel crate.spec), Java (Bazel maven.install), Bazel module dependencies (MODULE.bazel.lock + BCR), GitHub Actions (workflow/composite action `uses:` directives), and Bazel multitool binaries.
+This is a GitHub Action (TypeScript, node24 runtime) that checks whether newly added or updated dependencies were published recently enough to be a supply-chain risk. It supports npm/pnpm/yarn/bun, Python (uv/pylock), Rust (Bazel crate.spec), Java (Bazel maven.install), Bazel module dependencies (MODULE.bazel.lock + BCR), GitHub Actions (workflow/composite action `uses:` directives), Bazel multitool binaries, and container images in rendered Kubernetes manifests.
 
 # Commands
 
@@ -26,7 +26,7 @@ src/
   inputs.ts            # Parse action.yml inputs
   base-ref.ts          # Auto-detect base git ref from event context
   diff.ts              # Git operations (diff, show, glob resolution)
-  registry.ts          # Fetch publish dates from npm/pypi/crates.io/maven/BCR/GitHub
+  registry.ts          # Fetch publish dates from npm/pypi/crates.io/maven/BCR/GitHub/OCI
   report.ts            # GitHub annotations, job summary, remediation hints
   bazel.ts             # tree-sitter Starlark parser for MODULE.bazel
   license.ts           # SPDX license compatibility checking, registry license fetching
@@ -39,6 +39,7 @@ src/
     bazel-module.ts    # Parse MODULE.bazel.lock for bazel_dep modules, handle overrides
     actions.ts         # Parse workflow YAML for uses: directives, query GitHub API
     multitool.ts       # Parse multitool.hub() lockfiles, diff HEAD vs base
+    kubernetes.ts      # Parse rendered k8s manifests for container images, query OCI registry
 ```
 
 ## Flow
@@ -51,7 +52,8 @@ src/
 
 ## Key design decisions
 
-- **Structured parsers only**: `lockparse` for JS lockfiles, `smol-toml` for Python TOML, `web-tree-sitter` (WASM) for Starlark. No regex-based parsing.
+- **Structured parsers only**: `lockparse` for JS lockfiles, `smol-toml` for Python TOML, `web-tree-sitter` (WASM) for Starlark, `js-yaml` for k8s manifests. No regex-based parsing.
+- **Kubernetes ecosystem — rendered manifests only**: The action parses already-rendered YAML (output of `helm template` or similar), not raw Helm chart sources. Only `@sha256:`-digest-pinned images are age-gated; tag-only images are mutable and reported as `unknown`. Registry lookup uses the OCI Distribution v2 API anonymously; private registries → `unknown`.
 - **Diff-aware**: Only packages that changed between base and HEAD are checked. Unchanged packages are skipped.
 - **`web-tree-sitter` over native `tree-sitter`**: WASM-based to avoid native addon issues with `@vercel/ncc` bundling.
 - **`minimumReleaseAge`**: The project itself uses pnpm's `minimumReleaseAge` (in `pnpm-workspace.yaml`) to prevent installing packages younger than 14 days.
@@ -86,6 +88,7 @@ Tests are in `__tests__/` using vitest:
 - `license.test.ts` — SPDX license compatibility and detection
 - `multitool.test.ts` — Multitool lockfile parsing and diffing
 - `actions.test.ts` — GitHub Actions workflow parsing
+- `kubernetes.test.ts` — Kubernetes manifest image parsing, diff logic, and OCI registry lookups
 
 Run tests: `pnpm test`
 

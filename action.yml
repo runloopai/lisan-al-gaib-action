@@ -2,11 +2,12 @@ name: Lisan al-Gaib
 description: >
   Supply-chain security gate that fails if newly added/updated packages were
   published less than a configurable number of days ago. Supports npm/pnpm/yarn/bun,
-  Python (uv), Rust (Bazel crate.spec), and Java (Bazel maven_install).
+  Python (uv), Rust (Bazel crate.spec), Java (Bazel maven_install), GitHub Actions,
+  Bazel modules, multitool binaries, and container images in Kubernetes manifests.
 
 inputs:
   ecosystems:
-    description: Comma-separated list of ecosystems to check (npm, python, rust, java, bazel, actions, multitool)
+    description: Comma-separated list of ecosystems to check (npm, python, rust, java, bazel, actions, multitool, kubernetes)
     required: true
   min-age-days:
     description: Minimum number of days since publication to pass
@@ -49,6 +50,17 @@ inputs:
       Newline-separated glob patterns for GitHub Actions workflow files.
       If empty, auto-detects changed files from .github/workflows/*.yml,
       .github/workflows/*.yaml, action.yml, and action.yaml.
+    required: false
+    default: ""
+  kubernetes-files:
+    description: >
+      Newline-separated glob patterns for rendered Kubernetes manifest files
+      (used by the kubernetes ecosystem). The consuming repo is responsible for
+      rendering Helm charts or other templating tools to plain YAML manifests
+      before invoking this action. Only @sha256-digest-pinned images are
+      age-gated; tag-only images and images on private registries report
+      unknown. If empty, auto-detects changed .yaml/.yml files that contain
+      workload manifests (Deployment, StatefulSet, DaemonSet, Job, etc.).
     required: false
     default: ""
   github-token:

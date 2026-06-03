@@ -79319,6 +79319,7 @@ function getInputs() {
         strictThirdParty: core.getBooleanInput("strict-third-party"),
         bypassKeyword: core.getInput("bypass-keyword"),
         workflowFiles: core.getInput("workflow-files"),
+        kubernetesFiles: core.getInput("kubernetes-files"),
         githubToken: core.getInput("github-token"),
         bcrUrl: trimSlash(core.getInput("bcr-url") || "https://bcr.bazel.build"),
         allowedLicenses: effectiveLicenses,
@@ -80324,6 +80325,135 @@ async function archiveDate(url) {
         const resp = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         const lastModified = resp.headers.get("Last-Modified");
         return lastModified ? new Date(lastModified) : null;
+    }
+    catch {
+        return null;
+    }
+}
+// ─── OCI / Container Registry ────────────────────────────────────────────────
+const OCI_INDEX_MEDIA_TYPES = new Set([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+]);
+const MANIFEST_ACCEPT = [
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+].join(", ");
+/**
+ * Obtain an anonymous OCI bearer token for the given registry and repository
+ * using the WWW-Authenticate challenge flow. Returns null if the registry
+ * allows unauthenticated access (HTTP 200 on /v2/) or if authentication
+ * fails (private registry).
+ */
+async function getOciToken(host, repository) {
+    try {
+        const pingResp = await fetch(`https://${host}/v2/`, {
+            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        });
+        if (pingResp.status === 200)
+            return null; // no auth needed
+        if (pingResp.status !== 401)
+            return null; // private or unreachable
+        const wwwAuth = pingResp.headers.get("www-authenticate") ?? "";
+        const realmMatch = wwwAuth.match(/realm="([^"]+)"/);
+        if (!realmMatch)
+            return null;
+        const realm = realmMatch[1];
+        const serviceMatch = wwwAuth.match(/service="([^"]+)"/);
+        const service = serviceMatch ? serviceMatch[1] : "";
+        const tokenUrl = `${realm}?service=${encodeURIComponent(service)}` +
+            `&scope=${encodeURIComponent(`repository:${repository}:pull`)}`;
+        const data = (await fetchJson(tokenUrl));
+        return data?.token ?? data?.access_token ?? null;
+    }
+    catch {
+        return null;
+    }
+}
+async function fetchOciManifest(host, repository, reference, token) {
+    const headers = { Accept: MANIFEST_ACCEPT };
+    if (token)
+        headers.Authorization = `Bearer ${token}`;
+    try {
+        const resp = await fetch(`https://${host}/v2/${repository}/manifests/${reference}`, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+        if (!resp.ok)
+            return null;
+        const contentType = resp.headers.get("content-type") ?? "";
+        const lastModified = resp.headers.get("last-modified");
+        const body = (await resp.json());
+        return { contentType, body, lastModified };
+    }
+    catch {
+        return null;
+    }
+}
+function parseLastModified(value) {
+    if (!value)
+        return null;
+    const date = new Date(value);
+    if (isNaN(date.getTime()) || date.getFullYear() < 2000)
+        return null;
+    return date;
+}
+/**
+ * Docker Hub Hub API: returns the tag_last_pushed timestamp for a tag — the
+ * actual time the image was pushed to Docker Hub, not the build time.
+ * repository is already normalized to "library/<name>" or "user/repo" form.
+ */
+async function dockerHubPushDate(repository, tag) {
+    const [namespace, ...rest] = repository.split("/");
+    const repoName = rest.join("/");
+    const url = `https://hub.docker.com/v2/repositories/${namespace}/${repoName}/tags` +
+        `?name=${encodeURIComponent(tag)}&page_size=25`;
+    const data = (await fetchJson(url));
+    const result = data?.results?.find((r) => r.name === tag);
+    return parseLastModified(result?.tag_last_pushed ?? null);
+}
+/**
+ * Fetch the push timestamp for a container image via registry-specific APIs
+ * and the OCI Distribution v2 protocol.
+ *
+ * For Docker Hub images with a known tag, queries the Hub API for
+ * `tag_last_pushed` (the actual push timestamp). For all other registries,
+ * or as a fallback, reads the `Last-Modified` HTTP header from the manifest
+ * GET response — the time the registry stored that content-addressed manifest,
+ * which is the push time.
+ *
+ * Returns null for private registries (anonymous auth rejected), unreachable
+ * registries, or registries that do not expose a push timestamp.
+ */
+async function fetchImagePublishDate(registry, repository, digest, tag = null) {
+    const host = registry === "docker.io" || registry === "index.docker.io"
+        ? "registry-1.docker.io"
+        : registry;
+    try {
+        // Docker Hub exposes tag_last_pushed via the Hub web API — the real push time
+        if ((registry === "docker.io" || registry === "index.docker.io") && tag) {
+            const date = await dockerHubPushDate(repository, tag);
+            if (date)
+                return date;
+        }
+        // Universal fallback: Last-Modified on the manifest response = push time
+        const token = await getOciToken(host, repository);
+        const manifest = await fetchOciManifest(host, repository, digest, token);
+        if (!manifest)
+            return null;
+        const mediaType = manifest.contentType.split(";")[0].trim();
+        if (OCI_INDEX_MEDIA_TYPES.has(mediaType)) {
+            // Multi-arch index: drill into preferred child and use its Last-Modified
+            const index = manifest.body;
+            if (!index.manifests?.length)
+                return null;
+            const child = index.manifests.find((m) => m.platform?.os === "linux" &&
+                m.platform?.architecture === "amd64") ?? index.manifests[0];
+            const childManifest = await fetchOciManifest(host, repository, child.digest, token);
+            if (!childManifest)
+                return null;
+            return parseLastModified(childManifest.lastModified);
+        }
+        return parseLastModified(manifest.lastModified);
     }
     catch {
         return null;
@@ -82548,6 +82678,237 @@ async function multitool_getPublishDate(url) {
     return archiveDate(url);
 }
 //# sourceMappingURL=multitool.js.map
+;// CONCATENATED MODULE: ./out/ecosystems/kubernetes.js
+
+
+
+
+
+const mutableSkipLogged = new Set();
+/**
+ * Parse an OCI/Docker image reference string into its components.
+ *
+ * Grammar: [registry[:port]/]repository[:tag][@digest]
+ * Registry detection: first path segment is a host if it contains '.' or a
+ * numeric port suffix (':' + all-digits) or equals 'localhost'. Otherwise the
+ * image is on Docker Hub. Single-segment Docker Hub repos are normalized to
+ * library/<name> so API lookups work (e.g. "postgres" → "library/postgres").
+ */
+function parseImageRef(raw) {
+    const trimmed = raw.trim();
+    if (!trimmed)
+        return null;
+    // Split off digest (everything after the last '@')
+    const atIdx = trimmed.lastIndexOf("@");
+    let digest = null;
+    let refPart;
+    if (atIdx !== -1) {
+        digest = trimmed.slice(atIdx + 1) || null;
+        refPart = trimmed.slice(0, atIdx);
+    }
+    else {
+        refPart = trimmed;
+    }
+    // Determine registry host vs repository+tag
+    let registry;
+    let repoAndTag;
+    const slashIdx = refPart.indexOf("/");
+    if (slashIdx !== -1) {
+        const firstSegment = refPart.slice(0, slashIdx);
+        // A segment is a registry host if it has '.', a numeric ':port', or is 'localhost'
+        const isRegistryHost = firstSegment.includes(".") ||
+            /:\d+$/.test(firstSegment) ||
+            firstSegment === "localhost";
+        if (isRegistryHost) {
+            registry = firstSegment;
+            repoAndTag = refPart.slice(slashIdx + 1);
+        }
+        else {
+            registry = "docker.io";
+            repoAndTag = refPart;
+        }
+    }
+    else {
+        // No slash — entire refPart is 'name' or 'name:tag' on Docker Hub
+        registry = "docker.io";
+        repoAndTag = refPart;
+    }
+    // Split tag off repoAndTag: last ':' in the final path segment (never in an
+    // intermediate segment since repo path segments cannot contain ':')
+    let repository;
+    let tag = null;
+    const lastSlash = repoAndTag.lastIndexOf("/");
+    const lastSegment = lastSlash !== -1 ? repoAndTag.slice(lastSlash + 1) : repoAndTag;
+    const colonIdx = lastSegment.lastIndexOf(":");
+    if (colonIdx !== -1) {
+        const tagCandidate = lastSegment.slice(colonIdx + 1);
+        if (tagCandidate) {
+            tag = tagCandidate;
+            repository =
+                lastSlash !== -1
+                    ? repoAndTag.slice(0, lastSlash + 1) +
+                        lastSegment.slice(0, colonIdx)
+                    : lastSegment.slice(0, colonIdx);
+        }
+        else {
+            repository = repoAndTag;
+        }
+    }
+    else {
+        repository = repoAndTag;
+    }
+    // Docker Hub single-segment repos need the 'library/' prefix for API calls
+    // e.g. "postgres" → "library/postgres", "coredns/coredns" stays as-is
+    if (registry === "docker.io" && !repository.includes("/")) {
+        repository = `library/${repository}`;
+    }
+    return { raw, registry, repository, tag, digest };
+}
+/** Recursively walk a parsed YAML value and collect container image strings. */
+function extractImages(obj, out) {
+    if (!obj || typeof obj !== "object")
+        return;
+    if (Array.isArray(obj)) {
+        for (const item of obj)
+            extractImages(item, out);
+        return;
+    }
+    const rec = obj;
+    for (const key of Object.keys(rec)) {
+        if (key === "containers" ||
+            key === "initContainers" ||
+            key === "ephemeralContainers") {
+            const arr = rec[key];
+            if (Array.isArray(arr)) {
+                for (const container of arr) {
+                    if (container &&
+                        typeof container === "object" &&
+                        !Array.isArray(container)) {
+                        const imageStr = container.image;
+                        if (typeof imageStr === "string") {
+                            const ref = parseImageRef(imageStr);
+                            if (ref)
+                                out.set(imageStr, ref);
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            extractImages(rec[key], out);
+        }
+    }
+}
+/**
+ * Parse a rendered Kubernetes manifest (possibly multi-document YAML with '---'
+ * separators) and return a map of raw image strings to parsed refs.
+ *
+ * Works across all workload kinds by recursively finding containers/
+ * initContainers/ephemeralContainers arrays anywhere in the document tree —
+ * handles Deployment, StatefulSet, DaemonSet, Job, CronJob (nested), Pod,
+ * and CRDs like Argo Rollouts without hard-coding kinds.
+ */
+function parseManifestImages(content) {
+    const refs = new Map();
+    try {
+        jsYaml.loadAll(content, (doc) => {
+            try {
+                extractImages(doc, refs);
+            }
+            catch {
+                // skip individual malformed documents
+            }
+        });
+    }
+    catch {
+        // invalid YAML — return whatever was collected before the error
+    }
+    return refs;
+}
+function makeName(ref) {
+    return `${ref.registry}/${ref.repository}`;
+}
+function makeVersion(ref) {
+    if (ref.digest && ref.tag)
+        return `${ref.tag}@${ref.digest}`;
+    if (ref.digest)
+        return ref.digest;
+    if (ref.tag)
+        return ref.tag;
+    return "latest";
+}
+async function kubernetes_getChangedDeps(baseRef, kubernetesFilesInput) {
+    let files;
+    if (kubernetesFilesInput) {
+        const allFiles = new Set(await resolveFiles(kubernetesFilesInput));
+        const changedFiles = await gitDiffNameOnly(baseRef);
+        files = changedFiles.filter((f) => allFiles.has(f));
+    }
+    else {
+        // Auto-detect: any changed .yaml/.yml file that contains workload manifests
+        const changedFiles = await gitDiffNameOnly(baseRef);
+        files = changedFiles.filter((f) => f.endsWith(".yaml") || f.endsWith(".yml"));
+    }
+    if (files.length === 0) {
+        core.info("kubernetes: no changed YAML files");
+        return { deps: [], imageRefs: new Map() };
+    }
+    const allDeps = [];
+    const imageRefs = new Map();
+    for (const file of files) {
+        const diff = await gitDiff(baseRef, file);
+        if (!diff)
+            continue;
+        let headContent;
+        try {
+            headContent = await promises_.readFile(file, "utf8");
+        }
+        catch {
+            core.info(`kubernetes: could not read ${file}`);
+            continue;
+        }
+        const headRefs = parseManifestImages(headContent);
+        if (headRefs.size === 0)
+            continue; // not a manifest with containers
+        const baseContent = await gitShowFile(baseRef, file);
+        const baseRefs = baseContent
+            ? parseManifestImages(baseContent)
+            : new Map();
+        for (const [rawImage, ref] of headRefs) {
+            if (baseRefs.has(rawImage))
+                continue; // unchanged
+            const name = makeName(ref);
+            const version = makeVersion(ref);
+            imageRefs.set(`${name}@${version}`, ref);
+            allDeps.push({
+                ecosystem: "kubernetes",
+                name,
+                version,
+                file,
+            });
+        }
+    }
+    return { deps: allDeps, imageRefs };
+}
+/**
+ * Get the publish date for an image reference.
+ * Only digest-pinned (@sha256:...) refs are queried — tag-only refs are
+ * mutable and cannot be reliably age-gated, so they return null (unknown).
+ */
+async function kubernetes_getPublishDate(ref) {
+    if (!ref?.digest) {
+        const key = ref
+            ? `${makeName(ref)}:${ref.tag ?? "latest"}`
+            : "unknown";
+        if (!mutableSkipLogged.has(key)) {
+            mutableSkipLogged.add(key);
+            core.info(`kubernetes: ${key} has no digest (mutable tag), skipping age check`);
+        }
+        return null;
+    }
+    return fetchImagePublishDate(ref.registry, ref.repository, ref.digest, ref.tag);
+}
+//# sourceMappingURL=kubernetes.js.map
 // EXTERNAL MODULE: ./node_modules/.pnpm/semver@7.7.4/node_modules/semver/index.js
 var semver = __nccwpck_require__(9419);
 ;// CONCATENATED MODULE: ./out/report.js
@@ -88036,6 +88397,7 @@ async function emitLicenseAnnotations(licenseResults, checkResults, licenseHeuri
 
 
 
+
 const DAY_MS = 86_400_000;
 /**
  * Parse GITHUB_WORKFLOW_REF to extract the workflow file path.
@@ -88134,7 +88496,7 @@ async function checkBypass(keyword, token) {
     }
     return false;
 }
-async function lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides) {
+async function lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs) {
     switch (dep.ecosystem) {
         case "npm":
             return getPublishDate(dep.name, dep.version, inputs.registries);
@@ -88205,6 +88567,8 @@ async function lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides) {
             }
             return date;
         }
+        case "kubernetes":
+            return kubernetes_getPublishDate(kubernetesImageRefs.get(`${dep.name}@${dep.version}`));
         default:
             return null;
     }
@@ -88222,6 +88586,7 @@ async function run() {
     // Per-ecosystem metadata maps
     let javaRepoMap = new Map();
     let bazelOverrides = new Map();
+    let kubernetesImageRefs = new Map();
     for (const eco of inputs.ecosystems) {
         core.startGroup(`=== ${eco} ===`);
         let deps;
@@ -88253,6 +88618,12 @@ async function run() {
             case "multitool":
                 deps = await multitool_getChangedDeps(baseRef, inputs.moduleBazel);
                 break;
+            case "kubernetes": {
+                const result = await kubernetes_getChangedDeps(baseRef, inputs.kubernetesFiles);
+                deps = result.deps;
+                kubernetesImageRefs = result.imageRefs;
+                break;
+            }
             default:
                 core.setFailed(`Unknown ecosystem: ${eco}`);
                 return;
@@ -88283,7 +88654,7 @@ async function run() {
         // Fetch in batches of 10 to avoid rate limiting
         for (let i = 0; i < entries.length; i += 10) {
             const batch = entries.slice(i, i + 10);
-            const results = await Promise.allSettled(batch.map(([, dep]) => lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides)));
+            const results = await Promise.allSettled(batch.map(([, dep]) => lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs)));
             batch.forEach(([key], idx) => {
                 const r = results[idx];
                 if (r.status === "fulfilled") {
