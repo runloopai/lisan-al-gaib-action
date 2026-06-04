@@ -757,6 +757,26 @@ describe("docker.getChangedDeps", () => {
     const { deps } = await docker.getChangedDeps("HEAD~1", "");
     expect(deps).toHaveLength(0);
   });
+
+  it("passes dockerhubMirror to imageExists for copy-from refs", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("some diff");
+    vi.mocked(fs.readFile).mockResolvedValue(
+      "FROM alpine:3.18\nCOPY --from=myregistry.io/myimage:v1 /app /app\n" as any,
+    );
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+    vi.mocked(registry.imageExists).mockResolvedValue("found");
+
+    const docker = await import("../src/ecosystems/docker.js");
+    await docker.getChangedDeps("HEAD~1", "", "mirror.gcr.io");
+
+    expect(vi.mocked(registry.imageExists)).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      expect.any(String),
+      "mirror.gcr.io",
+    );
+  });
 });
 
 describe("docker.getPublishDate", () => {
@@ -795,5 +815,12 @@ describe("docker.getPublishDate", () => {
       "sha256:abc123",
       "1.25",
     );
+  });
+
+  it("returns null for undefined ref", async () => {
+    const docker = await import("../src/ecosystems/docker.js");
+    const date = await docker.getPublishDate(undefined);
+    expect(date).toBeNull();
+    expect(vi.mocked(registry.fetchImagePublishDate)).not.toHaveBeenCalled();
   });
 });

@@ -303,6 +303,7 @@ async function run(): Promise<void> {
         const result = await docker.getChangedDeps(
           baseRef,
           inputs.dockerfiles,
+          inputs.dockerhubMirror,
         );
         deps = result.deps;
         dockerImageRefs = result.imageRefs;

@@ -154,4 +154,36 @@ describe("parseDockerfileImages", () => {
     const candidates = parseDockerfileImages(content);
     expect(candidates.map((c) => c.source)).not.toContain("copy-from");
   });
+
+  it("RUN --mount=type=ssh is ignored entirely", () => {
+    const content = [
+      "FROM alpine:3.18",
+      "RUN --mount=type=ssh git clone git@github.com:org/repo.git",
+    ].join("\n");
+    const candidates = parseDockerfileImages(content);
+    expect(candidates.map((c) => c.source)).not.toContain("mount-from");
+    expect(candidates).toHaveLength(1);
+  });
+
+  it("RUN --mount=type=tmpfs is ignored entirely", () => {
+    const content = [
+      "FROM alpine:3.18",
+      "RUN --mount=type=tmpfs,target=/tmp echo build",
+    ].join("\n");
+    const candidates = parseDockerfileImages(content);
+    expect(candidates.map((c) => c.source)).not.toContain("mount-from");
+    expect(candidates).toHaveLength(1);
+  });
+
+  it("multiple --mount flags on one RUN: secret skipped, cache with from emitted", () => {
+    const content = [
+      "FROM alpine:3.18",
+      "RUN --mount=type=secret,id=tok --mount=type=cache,from=myregistry.io/buildcache:v1,target=/cache apk add git",
+    ].join("\n");
+    const candidates = parseDockerfileImages(content);
+    const mountFrom = candidates.filter((c) => c.source === "mount-from");
+    expect(mountFrom).toHaveLength(1);
+    expect(mountFrom[0].ref.registry).toBe("myregistry.io");
+    expect(mountFrom[0].ref.tag).toBe("v1");
+  });
 });

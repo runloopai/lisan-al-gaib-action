@@ -496,6 +496,27 @@ export async function fetchImageLabels(
   }
 }
 
+async function imageExistsOnHost(
+  host: string,
+  repository: string,
+  reference: string,
+): Promise<"found" | "notfound" | "unknown"> {
+  try {
+    const token = await getOciToken(host, repository);
+    const headers: Record<string, string> = { Accept: MANIFEST_ACCEPT };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const resp = await fetch(
+      `https://${host}/v2/${repository}/manifests/${reference}`,
+      { method: "HEAD", headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
+    );
+    if (resp.status === 200) return "found";
+    if (resp.status === 404) return "notfound";
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 /**
  * Check whether a manifest reference exists in an OCI registry without
  * downloading its content. Uses a HEAD request per the OCI Distribution v2
@@ -507,30 +528,30 @@ export async function fetchImageLabels(
  *   "unknown"  — any other status (401 private, 429 rate-limit, network
  *                error, or thrown exception) — caller should not treat the
  *                reference as either present or absent
+ *
+ * When `dockerhubMirror` is set and the primary check against Docker Hub
+ * returns "unknown" (e.g. rate-limited), the mirror is tried as a fallback.
+ * This lets CI environments that configure a Docker Hub mirror (e.g.
+ * mirror.gcr.io) resolve ambiguous COPY --from / RUN --mount=from references
+ * even when the primary registry is throttling anonymous requests.
  */
 export async function imageExists(
   registry: string,
   repository: string,
   reference: string,
+  dockerhubMirror?: string,
 ): Promise<"found" | "notfound" | "unknown"> {
   const host =
     registry === "docker.io" || registry === "index.docker.io"
       ? "registry-1.docker.io"
       : registry;
-  try {
-    const token = await getOciToken(host, repository);
-    const headers: Record<string, string> = { Accept: MANIFEST_ACCEPT };
-    if (token) headers.Authorization = `Bearer ${token}`;
-
-    const resp = await fetch(
-      `https://${host}/v2/${repository}/manifests/${reference}`,
-      { method: "HEAD", headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
-    );
-
-    if (resp.status === 200) return "found";
-    if (resp.status === 404) return "notfound";
-    return "unknown";
-  } catch {
-    return "unknown";
+  const result = await imageExistsOnHost(host, repository, reference);
+  if (
+    result === "unknown" &&
+    (registry === "docker.io" || registry === "index.docker.io") &&
+    dockerhubMirror
+  ) {
+    return imageExistsOnHost(dockerhubMirror, repository, reference);
   }
+  return result;
 }

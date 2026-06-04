@@ -53,7 +53,8 @@ You can always override with the `base-ref` input.
 | `module-bazel` | No | `MODULE.bazel` | Path to root MODULE.bazel (for rust/java/bazel/multitool ecosystems) |
 | `workflow-files` | No | auto-detect | Newline-separated glob patterns for workflow files (for actions ecosystem) |
 | `kubernetes-files` | No | auto-detect | Newline-separated glob patterns for rendered Kubernetes manifest files (for kubernetes ecosystem). See usage note below. |
-| `dockerfiles` | No | auto-detect | Newline-separated glob patterns for Dockerfile/Containerfile paths (for docker ecosystem). Auto-detect matches any changed file whose basename is `Dockerfile`, `Containerfile`, `*.dockerfile`, `*.containerfile`, `Dockerfile.*`, or `Containerfile.*` (case-insensitive). |
+| `dockerfiles` | No | auto-detect | Newline-separated glob patterns for Dockerfile/Containerfile paths (for docker ecosystem). Auto-detect matches any changed file whose basename is exactly `Dockerfile` or `Containerfile` (case-insensitive). Use this input for non-standard names (`myapp.Dockerfile`, `Dockerfile.prod`, etc.). |
+| `dockerhub-mirror` | No | `""` | Docker Hub mirror hostname (e.g. `mirror.gcr.io`) to use as a fallback when the primary Docker Hub check is rate-limited (HTTP 429) while resolving `COPY --from` / `RUN --mount=from` references. |
 | `strict-third-party` | No | `false` | Fail (instead of warn) on archive overrides without `Last-Modified` and third-party branch-pinned actions |
 | `bypass-keyword` | No | `""` | If the PR body contains this string on a line by itself, failures are downgraded to warnings |
 | `check-all-on-new-workflow` | No | `true` | Check all packages (not just changed) when the workflow file is newly added |
@@ -231,8 +232,8 @@ ignored.
 ```
 
 By default the action auto-detects any changed file whose basename (case-insensitive)
-matches `Dockerfile`, `Containerfile`, `*.dockerfile`, `*.containerfile`, `Dockerfile.*`,
-or `Containerfile.*`. To target specific paths:
+is exactly `Dockerfile` or `Containerfile`. For non-standard names (`Dockerfile.prod`,
+`myapp.Dockerfile`, etc.), use the `dockerfiles` input explicitly:
 
 ```yaml
 - uses: runloopai/lisan-al-gaib-action@main

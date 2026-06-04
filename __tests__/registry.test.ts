@@ -13,6 +13,7 @@ import {
   archiveDate,
   fetchImagePublishDate,
   fetchImageLabels,
+  imageExists,
 } from "../src/registry.js";
 
 const registries = {
@@ -700,5 +701,74 @@ describe("fetchImageLabels", () => {
       .mockResolvedValueOnce(new Response(null, { status: 404 }));
     const labels = await fetchImageLabels("ghcr.io", "owner/image", "sha256:abc");
     expect(labels).toBeNull();
+  });
+});
+
+describe("imageExists", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("returns 'found' on HTTP 200", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 })) // ping /v2/
+      .mockResolvedValueOnce(new Response(null, { status: 200 })); // HEAD manifest
+    const result = await imageExists("docker.io", "library/nginx", "latest");
+    expect(result).toBe("found");
+  });
+
+  it("returns 'notfound' on HTTP 404", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 })) // ping
+      .mockResolvedValueOnce(new Response(null, { status: 404 })); // HEAD manifest
+    const result = await imageExists("docker.io", "library/nginx", "latest");
+    expect(result).toBe("notfound");
+  });
+
+  it("returns 'unknown' on HTTP 429 (rate-limited)", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 })) // ping
+      .mockResolvedValueOnce(new Response(null, { status: 429 })); // HEAD manifest
+    const result = await imageExists("docker.io", "library/nginx", "latest");
+    expect(result).toBe("unknown");
+  });
+
+  it("falls back to mirror when docker.io returns 'unknown' and mirror is configured", async () => {
+    vi.spyOn(globalThis, "fetch")
+      // Primary: ping registry-1.docker.io + HEAD returns 429
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 429 }))
+      // Mirror: ping mirror.gcr.io + HEAD returns 200
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }));
+    const result = await imageExists("docker.io", "library/nginx", "latest", "mirror.gcr.io");
+    expect(result).toBe("found");
+  });
+
+  it("returns mirror 'notfound' when docker.io is rate-limited but mirror says 404", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 429 }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 404 }));
+    const result = await imageExists("docker.io", "library/builder-tools", "latest", "mirror.gcr.io");
+    expect(result).toBe("notfound");
+  });
+
+  it("does not use mirror when registry is not docker.io", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 })) // ping ghcr.io
+      .mockResolvedValueOnce(new Response(null, { status: 429 })); // HEAD returns unknown
+    const result = await imageExists("ghcr.io", "org/image", "latest", "mirror.gcr.io");
+    // mirror should NOT be tried for non-docker.io registries
+    expect(result).toBe("unknown");
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry when no mirror is configured", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 429 }));
+    const result = await imageExists("docker.io", "library/nginx", "latest");
+    expect(result).toBe("unknown");
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(2);
   });
 });

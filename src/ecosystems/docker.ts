@@ -122,15 +122,13 @@ function isDockerfileName(filePath: string): boolean {
     ? filePath.slice(filePath.lastIndexOf("/") + 1)
     : filePath;
   const lower = basename.toLowerCase();
-  if (lower === "dockerfile" || lower === "containerfile") return true;
-  if (lower.endsWith(".dockerfile") || lower.endsWith(".containerfile")) return true;
-  if (lower.startsWith("dockerfile.") || lower.startsWith("containerfile.")) return true;
-  return false;
+  return lower === "dockerfile" || lower === "containerfile";
 }
 
 export async function getChangedDeps(
   baseRef: string,
   dockerfilesInput: string,
+  dockerhubMirror?: string,
 ): Promise<{ deps: ChangedDep[]; imageRefs: Map<string, ParsedImageRef> }> {
   let files: string[];
 
@@ -183,7 +181,7 @@ export async function getChangedDeps(
       // in a registry before treating it as a real external image dependency.
       if (source === "copy-from" || source === "mount-from") {
         const reference = ref.digest ?? ref.tag ?? "latest";
-        const exists = await imageExists(ref.registry, ref.repository, reference);
+        const exists = await imageExists(ref.registry, ref.repository, reference, dockerhubMirror);
         if (exists === "notfound") {
           core.info(
             `docker: ${raw} not found in registry (build context or alias), skipping`,

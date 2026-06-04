@@ -106,6 +106,22 @@ describe("getInputs", () => {
     const inputs = getInputs();
     expect(inputs.dockerfiles).toBe("");
   });
+
+  it("reads dockerhub-mirror input", () => {
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      if (name === "ecosystems") return "docker";
+      if (name === "dockerhub-mirror") return "mirror.gcr.io";
+      return "";
+    });
+    vi.mocked(core.getBooleanInput).mockReturnValue(false);
+    const inputs = getInputs();
+    expect(inputs.dockerhubMirror).toBe("mirror.gcr.io");
+  });
+
+  it("defaults dockerhub-mirror to empty string when not provided", () => {
+    const inputs = getInputs();
+    expect(inputs.dockerhubMirror).toBe("");
+  });
 });
 
 describe("parseLicenseOverrides", () => {

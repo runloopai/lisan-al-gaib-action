@@ -78,6 +78,7 @@ async function main() {
     "workflow-files": args["workflow-files"] ?? "",
     "kubernetes-files": args["kubernetes-files"] ?? "",
     "dockerfiles": args["dockerfiles"] ?? "",
+    "dockerhub-mirror": args["dockerhub-mirror"] ?? "",
     "github-token": args["github-token"] ?? process.env.GITHUB_TOKEN ?? "",
     "bcr-url": args["bcr-url"] ?? "https://bcr.bazel.build",
     "npm-registry-url": args["npm-registry-url"] ?? "https://registry.npmjs.org",

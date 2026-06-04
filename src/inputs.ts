@@ -26,6 +26,7 @@ export interface ActionInputs {
   workflowFiles: string;
   kubernetesFiles: string;
   dockerfiles: string;
+  dockerhubMirror: string;
   githubToken: string;
   bcrUrl: string;
   allowedLicenses: string;
@@ -85,6 +86,7 @@ export function getInputs(): ActionInputs {
     workflowFiles: core.getInput("workflow-files"),
     kubernetesFiles: core.getInput("kubernetes-files"),
     dockerfiles: core.getInput("dockerfiles"),
+    dockerhubMirror: core.getInput("dockerhub-mirror"),
     githubToken: core.getInput("github-token"),
     bcrUrl: trimSlash(core.getInput("bcr-url") || "https://bcr.bazel.build"),
     allowedLicenses: effectiveLicenses,

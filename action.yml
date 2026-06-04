@@ -68,10 +68,20 @@ inputs:
     description: >
       Newline-separated glob patterns for Dockerfiles/Containerfiles to scan
       (e.g. '**/Dockerfile').
-      When empty, changed files matching standard Dockerfile/Containerfile
-      naming patterns are auto-detected.
+      When empty, changed files whose basename is exactly "Dockerfile" or
+      "Containerfile" (case-insensitive) are auto-detected.
       Only digest-pinned images (FROM ...@sha256:...) are age-gated;
       tag-only images appear as unknown.
+    required: false
+    default: ""
+  dockerhub-mirror:
+    description: >
+      Docker Hub mirror hostname to use as a fallback when the primary Docker
+      Hub registry returns an ambiguous response (e.g. HTTP 429 rate-limit)
+      while checking whether a COPY --from or RUN --mount=from value is a real
+      image. When set, a "unknown" result from registry-1.docker.io is retried
+      against this mirror before deciding whether to emit the reference as a
+      dependency. Example: mirror.gcr.io
     required: false
     default: ""
   github-token:
