@@ -193,8 +193,7 @@ steps:
 
 Push timestamps are sourced from registry-specific APIs where available:
 - **Docker Hub** (`docker.io`): Hub API `tag_last_pushed` (accurate, per-tag push time)
-- **Quay.io** (`quay.io`): Quay public API `last_modified` (accurate, per-tag push time)
-- **Other public registries** (`public.ecr.aws`, `ghcr.io`, `registry.k8s.io`):
+- **Other public registries** (`public.ecr.aws`, `ghcr.io`, `quay.io`, `registry.k8s.io`):
   `Last-Modified` HTTP header on the manifest response — a best-effort signal not
   guaranteed by the OCI Distribution spec; registries that don't emit this header
   will report `unknown` even for publicly accessible images

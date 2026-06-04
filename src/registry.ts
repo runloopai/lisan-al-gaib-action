@@ -352,38 +352,17 @@ async function dockerHubPushDate(
   return parseLastModified(result?.tag_last_pushed ?? null);
 }
 
-/**
- * Quay.io public API: returns the last_modified timestamp for a tag.
- * repository is in "namespace/name" form (e.g. "prometheus/node-exporter").
- */
-async function quayIoPushDate(
-  repository: string,
-  tag: string,
-): Promise<Date | null> {
-  const slashIdx = repository.indexOf("/");
-  if (slashIdx === -1) return null;
-  const namespace = repository.slice(0, slashIdx);
-  const repoName = repository.slice(slashIdx + 1);
-  const url =
-    `https://quay.io/api/v1/repository/${namespace}/${repoName}/tag/` +
-    `?specificTag=${encodeURIComponent(tag)}&onlyActiveTags=true`;
-  const data = (await fetchJson(url)) as {
-    tags?: Array<{ name: string; last_modified?: string }>;
-  } | null;
-  const result = data?.tags?.find((t) => t.name === tag);
-  return parseLastModified(result?.last_modified ?? null);
-}
 
 /**
  * Fetch the push timestamp for a container image via registry-specific APIs
  * and the OCI Distribution v2 protocol.
  *
  * For Docker Hub images with a known tag, queries the Hub API for
- * `tag_last_pushed`. For Quay.io images with a known tag, queries the Quay
- * public API for `last_modified`. For all other registries, or as a fallback,
- * reads the `Last-Modified` HTTP header from the manifest GET response — the
- * time the registry stored that content-addressed manifest, which is the push
- * time (best-effort; not guaranteed by the OCI Distribution spec).
+ * `tag_last_pushed` (the actual push timestamp). For all other registries,
+ * or as a fallback, reads the `Last-Modified` HTTP header from the manifest
+ * GET response — the time the registry stored that content-addressed manifest,
+ * which is the push time (best-effort; not guaranteed by the OCI Distribution
+ * spec).
  *
  * Returns null for private registries (anonymous auth rejected), unreachable
  * registries, or registries that do not expose a push timestamp.
@@ -403,12 +382,6 @@ export async function fetchImagePublishDate(
     // Docker Hub exposes tag_last_pushed via the Hub web API — the real push time
     if ((registry === "docker.io" || registry === "index.docker.io") && tag) {
       const date = await dockerHubPushDate(repository, tag);
-      if (date) return date;
-    }
-
-    // Quay.io exposes last_modified via its public tag API
-    if (registry === "quay.io" && tag) {
-      const date = await quayIoPushDate(repository, tag);
       if (date) return date;
     }
 

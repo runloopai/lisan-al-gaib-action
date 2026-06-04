@@ -354,23 +354,6 @@ describe("fetchImagePublishDate", () => {
     expect(date).toEqual(new Date("2024-05-01T00:00:00Z"));
   });
 
-  it("uses Quay.io public API last_modified when tag is provided", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      new Response(
-        JSON.stringify({
-          tags: [{ name: "v2.7.1", last_modified: "Thu, 01 Feb 2024 00:00:00 -0000" }],
-        }),
-      ),
-    );
-    const date = await fetchImagePublishDate(
-      "quay.io",
-      "prometheus/node-exporter",
-      "sha256:abc123",
-      "v2.7.1",
-    );
-    expect(date).toEqual(new Date("Thu, 01 Feb 2024 00:00:00 -0000"));
-  });
-
   it("uses Last-Modified header from manifest for non-Docker Hub registries", async () => {
     vi.spyOn(globalThis, "fetch")
       // ping → 401
