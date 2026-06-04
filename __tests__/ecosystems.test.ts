@@ -43,6 +43,7 @@ vi.mock("../src/registry.js", () => ({
   npmPublishDate: vi.fn(),
   pypiPublishDate: vi.fn(),
   fetchImagePublishDate: vi.fn(),
+  imageExists: vi.fn(),
 }));
 
 import * as fs from "node:fs/promises";
@@ -653,5 +654,146 @@ describe("kubernetes.getPublishDate", () => {
     const kubernetes = await import("../src/ecosystems/kubernetes.js");
     const date = await kubernetes.getPublishDate(undefined);
     expect(date).toBeNull();
+  });
+});
+
+// ─── docker ecosystem ────────────────────────────────────────────────────────
+
+describe("docker.getChangedDeps", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("auto-detects changed Dockerfiles and emits FROM refs", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("some diff");
+    vi.mocked(fs.readFile).mockResolvedValue("FROM nginx:1.25\n" as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps, imageRefs } = await docker.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("docker.io/library/nginx");
+    expect(imageRefs.size).toBe(1);
+  });
+
+  it("COPY --from ref found in registry is emitted as a dep", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(
+      "FROM alpine:3.18\nCOPY --from=myregistry.io/myimage:v1 /src /dst\n" as any,
+    );
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+    vi.mocked(registry.imageExists).mockResolvedValue("found");
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps } = await docker.getChangedDeps("HEAD~1", "");
+    const names = deps.map((d) => d.name);
+    expect(names).toContain("myregistry.io/myimage");
+  });
+
+  it("COPY --from ref not found in registry is omitted", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(
+      "FROM alpine:3.18\nCOPY --from=myregistry.io/myimage:v1 /src /dst\n" as any,
+    );
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+    vi.mocked(registry.imageExists).mockResolvedValue("notfound");
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps } = await docker.getChangedDeps("HEAD~1", "");
+    const names = deps.map((d) => d.name);
+    expect(names).not.toContain("myregistry.io/myimage");
+    // alpine:3.18 (FROM) is still present
+    expect(names).toContain("docker.io/library/alpine");
+  });
+
+  it("COPY --from ref returning 'unknown' (private registry) is emitted", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(
+      "FROM alpine:3.18\nCOPY --from=myregistry.io/myimage:v1 /src /dst\n" as any,
+    );
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+    vi.mocked(registry.imageExists).mockResolvedValue("unknown");
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps } = await docker.getChangedDeps("HEAD~1", "");
+    const names = deps.map((d) => d.name);
+    expect(names).toContain("myregistry.io/myimage");
+  });
+
+  it("FROM ref with digest pin has correct name, version, and imageRefs key", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(
+      "FROM nginx:1.25@sha256:abc123\n" as any,
+    );
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps, imageRefs } = await docker.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("docker.io/library/nginx");
+    expect(deps[0].version).toBe("1.25@sha256:abc123");
+    expect(imageRefs.has("docker.io/library/nginx@1.25@sha256:abc123")).toBe(true);
+  });
+
+  it("unchanged images (present in both HEAD and base) are skipped", async () => {
+    const content = "FROM nginx:1.25\n";
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(content as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(content);
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps } = await docker.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(0);
+  });
+
+  it("returns empty when no Dockerfile files changed", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["src/main.ts"]);
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps } = await docker.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(0);
+  });
+});
+
+describe("docker.getPublishDate", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("returns null for tag-only ref without calling fetchImagePublishDate", async () => {
+    const docker = await import("../src/ecosystems/docker.js");
+    const date = await docker.getPublishDate({
+      raw: "nginx:1.25",
+      registry: "docker.io",
+      repository: "library/nginx",
+      tag: "1.25",
+      digest: null,
+    });
+    expect(date).toBeNull();
+    expect(vi.mocked(registry.fetchImagePublishDate)).not.toHaveBeenCalled();
+  });
+
+  it("delegates to fetchImagePublishDate for digest-pinned refs", async () => {
+    vi.mocked(registry.fetchImagePublishDate).mockResolvedValueOnce(
+      new Date("2024-03-01T00:00:00Z"),
+    );
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const date = await docker.getPublishDate({
+      raw: "nginx:1.25@sha256:abc123",
+      registry: "docker.io",
+      repository: "library/nginx",
+      tag: "1.25",
+      digest: "sha256:abc123",
+    });
+    expect(date).toEqual(new Date("2024-03-01T00:00:00Z"));
+    expect(vi.mocked(registry.fetchImagePublishDate)).toHaveBeenCalledWith(
+      "docker.io",
+      "library/nginx",
+      "sha256:abc123",
+      "1.25",
+    );
   });
 });

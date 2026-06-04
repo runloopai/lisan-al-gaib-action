@@ -324,6 +324,48 @@ describe("fetchLicense dispatching", () => {
     );
     expect(result).toBe("Apache-2.0");
   });
+
+  it("docker: dispatches to fetchImageLicense when imageRef is available", async () => {
+    vi.spyOn(globalThis, "fetch")
+      // ping → 200 (no auth)
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      // manifest with config.digest
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ config: { digest: "sha256:cfg" } }),
+          { headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" } },
+        ),
+      )
+      // config blob with licenses label
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            config: { Labels: { "org.opencontainers.image.licenses": "Apache-2.0" } },
+          }),
+        ),
+      );
+
+    const ref: ParsedImageRef = {
+      raw: "nginx:1.25",
+      registry: "docker.io",
+      repository: "library/nginx",
+      tag: "1.25",
+      digest: null,
+    };
+    const dockerImageRefs = new Map([["docker.io/library/nginx@1.25", ref]]);
+
+    const result = await fetchLicense(
+      { ecosystem: "docker", name: "docker.io/library/nginx", version: "1.25" },
+      registries,
+      new Map(),
+      "",
+      "",
+      true,
+      new Map(),
+      dockerImageRefs,
+    );
+    expect(result).toBe("Apache-2.0");
+  });
 });
 
 describe("checkLicenses", () => {

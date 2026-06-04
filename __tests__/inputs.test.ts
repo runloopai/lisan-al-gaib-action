@@ -90,6 +90,22 @@ describe("getInputs", () => {
     expect(inputs.moduleBazel).toBe("MODULE.bazel");
     expect(inputs.allowedLicenses).toBe("auto");
   });
+
+  it("reads dockerfiles input", () => {
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      if (name === "ecosystems") return "docker";
+      if (name === "dockerfiles") return "path/to/Dockerfile";
+      return "";
+    });
+    vi.mocked(core.getBooleanInput).mockReturnValue(false);
+    const inputs = getInputs();
+    expect(inputs.dockerfiles).toBe("path/to/Dockerfile");
+  });
+
+  it("defaults dockerfiles to empty string when not provided", () => {
+    const inputs = getInputs();
+    expect(inputs.dockerfiles).toBe("");
+  });
 });
 
 describe("parseLicenseOverrides", () => {
