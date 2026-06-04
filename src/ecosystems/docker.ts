@@ -71,7 +71,7 @@ export function parseDockerfileImages(content: string): DockerImageCandidate[] {
     if (instruction instanceof From) {
       const image = instruction.getImage();
       if (image == null) continue;
-      if (image === "scratch") continue;
+      if (image.trim().toLowerCase() === "scratch") continue;
       if (image.includes("$")) continue; // unresolved ARG/ENV variable
       if (stageAliases.has(image.trim().toLowerCase())) continue; // stage alias ref
       emit(image, "from");
