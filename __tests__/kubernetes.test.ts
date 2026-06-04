@@ -1,8 +1,6 @@
 import { describe, it, expect } from "vitest";
-import {
-  parseImageRef,
-  parseManifestImages,
-} from "../src/ecosystems/kubernetes.js";
+import { parseImageRef } from "../src/ecosystems/image.js";
+import { parseManifestImages } from "../src/ecosystems/kubernetes.js";
 
 describe("parseImageRef", () => {
   it("parses a bare Docker Hub single-segment image with tag", () => {

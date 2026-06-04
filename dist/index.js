@@ -73682,7 +73682,7 @@ const inherits = (__nccwpck_require__(7975).inherits)
 
 const StreamSearch = __nccwpck_require__(5868)
 
-const PartStream = __nccwpck_require__(2424)
+const PartStream = __nccwpck_require__(43)
 const HeaderParser = __nccwpck_require__(2035)
 
 const DASH = 45
@@ -73999,7 +73999,7 @@ module.exports = HeaderParser
 
 /***/ }),
 
-/***/ 2424:
+/***/ 43:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
@@ -82730,10 +82730,7 @@ async function multitool_getPublishDate(url) {
     return archiveDate(url);
 }
 //# sourceMappingURL=multitool.js.map
-;// CONCATENATED MODULE: ./out/ecosystems/kubernetes.js
-
-
-
+;// CONCATENATED MODULE: ./out/ecosystems/image.js
 
 
 const mutableSkipLogged = new Set();
@@ -82825,6 +82822,47 @@ function parseImageRef(raw) {
     }
     return { raw, registry, repository, tag, digest };
 }
+function makeName(ref) {
+    return `${ref.registry}/${ref.repository}`;
+}
+function makeVersion(ref) {
+    if (ref.digest && ref.tag)
+        return `${ref.tag}@${ref.digest}`;
+    if (ref.digest)
+        return ref.digest;
+    if (ref.tag)
+        return ref.tag;
+    return "latest";
+}
+/**
+ * Get the publish date for an image reference.
+ * Only digest-pinned (@sha256:...) refs are queried — tag-only refs are
+ * mutable and cannot be reliably age-gated, so they return null (unknown).
+ *
+ * @param ref   Parsed image ref (may be undefined for lookup-miss cases).
+ * @param label Ecosystem label used in log messages (e.g. "kubernetes", "docker").
+ */
+async function getImagePublishDate(ref, label) {
+    if (!ref?.digest) {
+        const key = ref
+            ? `${makeName(ref)}:${ref.tag ?? "latest"}`
+            : "unknown";
+        const dedupKey = `${label}:${key}`;
+        if (!mutableSkipLogged.has(dedupKey)) {
+            mutableSkipLogged.add(dedupKey);
+            core.info(`${label}: ${key} has no digest (mutable tag), skipping age check`);
+        }
+        return null;
+    }
+    return fetchImagePublishDate(ref.registry, ref.repository, ref.digest, ref.tag);
+}
+//# sourceMappingURL=image.js.map
+;// CONCATENATED MODULE: ./out/ecosystems/kubernetes.js
+
+
+
+
+
 /** Recursively walk a parsed YAML value and collect container image strings. */
 function extractImages(obj, out) {
     if (!obj || typeof obj !== "object")
@@ -82886,18 +82924,6 @@ function parseManifestImages(content) {
     }
     return refs;
 }
-function makeName(ref) {
-    return `${ref.registry}/${ref.repository}`;
-}
-function makeVersion(ref) {
-    if (ref.digest && ref.tag)
-        return `${ref.tag}@${ref.digest}`;
-    if (ref.digest)
-        return ref.digest;
-    if (ref.tag)
-        return ref.tag;
-    return "latest";
-}
 async function kubernetes_getChangedDeps(baseRef, kubernetesFilesInput) {
     let files;
     if (kubernetesFilesInput) {
@@ -82957,17 +82983,7 @@ async function kubernetes_getChangedDeps(baseRef, kubernetesFilesInput) {
  * mutable and cannot be reliably age-gated, so they return null (unknown).
  */
 async function kubernetes_getPublishDate(ref) {
-    if (!ref?.digest) {
-        const key = ref
-            ? `${makeName(ref)}:${ref.tag ?? "latest"}`
-            : "unknown";
-        if (!mutableSkipLogged.has(key)) {
-            mutableSkipLogged.add(key);
-            core.info(`kubernetes: ${key} has no digest (mutable tag), skipping age check`);
-        }
-        return null;
-    }
-    return fetchImagePublishDate(ref.registry, ref.repository, ref.digest, ref.tag);
+    return getImagePublishDate(ref, "kubernetes");
 }
 //# sourceMappingURL=kubernetes.js.map
 // EXTERNAL MODULE: ./node_modules/.pnpm/semver@7.7.4/node_modules/semver/index.js
