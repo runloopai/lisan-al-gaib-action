@@ -18,7 +18,7 @@ import {
   fetchLicense,
   checkLicenses,
   emitLicenseAnnotations,
-  fetchKubernetesLicense,
+  fetchImageLicense,
 } from "../src/license.js";
 import type { CheckResult, ParsedImageRef } from "../src/ecosystems/types.js";
 
@@ -354,7 +354,7 @@ describe("checkLicenses", () => {
   });
 });
 
-describe("fetchKubernetesLicense", () => {
+describe("fetchImageLicense", () => {
   beforeEach(() => vi.restoreAllMocks());
 
   const makeRef = (overrides: Partial<ParsedImageRef> = {}): ParsedImageRef => ({
@@ -386,7 +386,7 @@ describe("fetchKubernetesLicense", () => {
 
   it("returns the licenses label when present", async () => {
     mockOciChain({ "org.opencontainers.image.licenses": "Apache-2.0" });
-    const license = await fetchKubernetesLicense(makeRef(), "");
+    const license = await fetchImageLicense(makeRef(), "");
     expect(license).toBe("Apache-2.0");
   });
 
@@ -394,19 +394,19 @@ describe("fetchKubernetesLicense", () => {
     mockOciChain({ "org.opencontainers.image.source": "https://github.com/owner/repo" })
       // 4th mock chained on the same spy: GitHub license API
       .mockResolvedValueOnce(new Response(JSON.stringify({ license: { spdx_id: "MIT" } })));
-    const license = await fetchKubernetesLicense(makeRef(), "");
+    const license = await fetchImageLicense(makeRef(), "");
     expect(license).toBe("MIT");
   });
 
   it("returns null when both labels are absent", async () => {
     mockOciChain({});
-    const license = await fetchKubernetesLicense(makeRef(), "");
+    const license = await fetchImageLicense(makeRef(), "");
     expect(license).toBeNull();
   });
 
   it("uses tag when digest is null", async () => {
     mockOciChain({ "org.opencontainers.image.licenses": "MIT" });
-    const license = await fetchKubernetesLicense(
+    const license = await fetchImageLicense(
       makeRef({ digest: null, tag: "1.0" }),
       "",
     );
@@ -415,7 +415,7 @@ describe("fetchKubernetesLicense", () => {
 
   it("returns null when source label is present but not a GitHub URL", async () => {
     mockOciChain({ "org.opencontainers.image.source": "https://gitlab.com/owner/repo" });
-    const license = await fetchKubernetesLicense(makeRef(), "");
+    const license = await fetchImageLicense(makeRef(), "");
     expect(license).toBeNull();
   });
 });
@@ -431,7 +431,7 @@ describe("fetchLicense kubernetes dispatch", () => {
     digest: "sha256:abc",
   };
 
-  it("dispatches to fetchKubernetesLicense using the imageRefs map", async () => {
+  it("dispatches to fetchImageLicense using the imageRefs map", async () => {
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(null, { status: 200 }))
       .mockResolvedValueOnce(

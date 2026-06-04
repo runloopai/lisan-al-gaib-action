@@ -1294,8 +1294,7 @@ export async function fetchImageLicense(
   return null;
 }
 
-/** @deprecated Use fetchImageLicense instead */
-export const fetchKubernetesLicense = fetchImageLicense;
+
 
 /**
  * Fetch the license for a dependency based on its ecosystem.
