@@ -89708,14 +89708,6 @@ function parseDockerfileImages(content) {
     }
     return Array.from(seen.values());
 }
-/**
- * Returns true if the given file basename looks like a Dockerfile or Containerfile.
- *
- * Matches (case-insensitive):
- *   - "Dockerfile" or "Containerfile" exactly
- *   - Ending in ".dockerfile" or ".containerfile"
- *   - Starting with "Dockerfile." or "Containerfile."
- */
 function isDockerfileName(filePath) {
     const basename = filePath.includes("/")
         ? filePath.slice(filePath.lastIndexOf("/") + 1)

@@ -14,7 +14,7 @@ A GitHub Action that acts as a supply-chain security gate by failing if newly ad
 | **actions** | `.github/workflows/*.yml`, `action.yml` | GitHub API |
 | **multitool** | `multitool.hub()` lockfiles via `MODULE.bazel` | Archive `Last-Modified` headers |
 | **kubernetes** | Rendered Kubernetes manifests (`*.yaml`/`*.yml`) | OCI registry v2 API (anonymous; digest-pinned only) |
-| **docker** | `Dockerfile`, `Containerfile`, `*.dockerfile`, `Dockerfile.*`, etc. | OCI registry v2 API (anonymous; digest-pinned only) |
+| **docker** | `Dockerfile`, `Containerfile` (exact basename; use `dockerfiles:` input for other names) | OCI registry v2 API (anonymous; digest-pinned only) |
 
 ## Quick start
 

@@ -81,7 +81,10 @@ inputs:
       while checking whether a COPY --from or RUN --mount=from value is a real
       image. When set, a "unknown" result from registry-1.docker.io is retried
       against this mirror before deciding whether to emit the reference as a
-      dependency. Example: mirror.gcr.io
+      dependency. Example: mirror.gcr.io. The mirror must serve images under
+      the same repository path as Docker Hub (including the library/ prefix for
+      official images); mirrors that rewrite paths may incorrectly report
+      official images as not found.
     required: false
     default: ""
   github-token:
