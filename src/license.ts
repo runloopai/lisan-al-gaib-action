@@ -1266,7 +1266,7 @@ async function fetchMultitoolLicense(
  * Reads org.opencontainers.image.licenses; falls back to org.opencontainers.image.source
  * pointing at a GitHub repo. Returns null if neither is present or accessible.
  */
-export async function fetchKubernetesLicense(
+export async function fetchImageLicense(
   ref: ParsedImageRef,
   githubToken: string = "",
   licenseHeuristics: boolean = true,
@@ -1294,6 +1294,9 @@ export async function fetchKubernetesLicense(
   return null;
 }
 
+/** @deprecated Use fetchImageLicense instead */
+export const fetchKubernetesLicense = fetchImageLicense;
+
 /**
  * Fetch the license for a dependency based on its ecosystem.
  */
@@ -1305,6 +1308,7 @@ export async function fetchLicense(
   bcrUrl: string,
   licenseHeuristics: boolean = true,
   kubernetesImageRefs: Map<string, ParsedImageRef> = new Map(),
+  dockerImageRefs: Map<string, ParsedImageRef> = new Map(),
 ): Promise<string | null> {
   switch (dep.ecosystem) {
     case "npm":
@@ -1330,7 +1334,11 @@ export async function fetchLicense(
       return fetchMultitoolLicense(dep.version, githubToken, licenseHeuristics);
     case "kubernetes": {
       const ref = kubernetesImageRefs.get(`${dep.name}@${dep.version}`);
-      return ref ? fetchKubernetesLicense(ref, githubToken, licenseHeuristics) : null;
+      return ref ? fetchImageLicense(ref, githubToken, licenseHeuristics) : null;
+    }
+    case "docker": {
+      const ref = dockerImageRefs.get(`${dep.name}@${dep.version}`);
+      return ref ? fetchImageLicense(ref, githubToken, licenseHeuristics) : null;
     }
     default:
       return null;
@@ -1350,6 +1358,7 @@ export async function checkLicenses(
   overrides?: LicenseOverrides,
   licenseHeuristics: boolean = true,
   kubernetesImageRefs: Map<string, ParsedImageRef> = new Map(),
+  dockerImageRefs: Map<string, ParsedImageRef> = new Map(),
 ): Promise<LicenseResult[]> {
   // Cache: "ecosystem:name@version" → raw license string | null
   const licenseCache = new Map<string, string | null>();
@@ -1377,7 +1386,7 @@ export async function checkLicenses(
   for (let i = 0; i < toFetch.length; i += 10) {
     const batch = toFetch.slice(i, i + 10);
     const settled = await Promise.allSettled(
-      batch.map(({ dep }) => fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics, kubernetesImageRefs)),
+      batch.map(({ dep }) => fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics, kubernetesImageRefs, dockerImageRefs)),
     );
     batch.forEach(({ cacheKey }, idx) => {
       const result = settled[idx];
