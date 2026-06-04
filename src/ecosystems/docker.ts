@@ -169,18 +169,20 @@ export async function getChangedDeps(
 
       const { raw, ref, source } = candidate;
 
-      // For COPY --from and RUN --mount=from, verify the image actually exists
-      // in a registry before treating it as a real external image dependency.
+      // For COPY --from and RUN --mount=from, require positive confirmation that
+      // the image exists before treating it as a real external image dependency.
+      // "unknown" (401/429/network error) is also treated as unconfirmed — these
+      // sources are ambiguous (build contexts, stage aliases, typos) and we
+      // prefer false-negatives over false-positives.
       if (source === "copy-from" || source === "mount-from") {
         const reference = ref.digest ?? ref.tag ?? "latest";
         const exists = await imageExists(ref.registry, ref.repository, reference, dockerhubMirror);
-        if (exists === "notfound") {
+        if (exists !== "found") {
           core.info(
-            `docker: ${raw} not found in registry (build context or alias), skipping`,
+            `docker: ${raw} not confirmed in registry (${exists}; build context, alias, or typo), skipping`,
           );
           continue;
         }
-        // "found" or "unknown" → proceed
       }
 
       const name = makeName(ref);

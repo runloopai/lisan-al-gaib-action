@@ -5,6 +5,18 @@ import type { ParsedImageRef } from "./types.js";
 const mutableSkipLogged = new Set<string>();
 
 /**
+ * OCI distribution reference grammar for repository paths (registry stripped).
+ * path-component = [a-z0-9]+ (separator [a-z0-9]+)*
+ * separator       = [._] | __ | -+
+ * repository      = path-component ('/' path-component)*
+ *
+ * This rejects placeholder tokens like __DIND_IMAGE__, {{image}}, %VAR%,
+ * uppercase names, and any other string that is not a legal image name.
+ */
+const REPOSITORY_RE =
+  /^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*)*$/;
+
+/**
  * Parse an OCI/Docker image reference string into its components.
  *
  * Grammar: [registry[:port]/]repository[:tag][@digest]
@@ -12,6 +24,8 @@ const mutableSkipLogged = new Set<string>();
  * numeric port suffix (':' + all-digits) or equals 'localhost'. Otherwise the
  * image is on Docker Hub. Single-segment Docker Hub repos are normalized to
  * library/<name> so API lookups work (e.g. "postgres" → "library/postgres").
+ * Returns null for references whose repository path is not a legal OCI name
+ * (e.g. placeholder tokens like __DIND_IMAGE__, uppercase refs, etc.).
  */
 export function parseImageRef(raw: string): ParsedImageRef | null {
   const trimmed = raw.trim();
@@ -92,6 +106,8 @@ export function parseImageRef(raw: string): ParsedImageRef | null {
   if (registry === "docker.io" && !repository.includes("/")) {
     repository = `library/${repository}`;
   }
+
+  if (!REPOSITORY_RE.test(repository)) return null;
 
   return { raw, registry, repository, tag, digest };
 }

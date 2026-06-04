@@ -117,6 +117,9 @@ export async function getChangedDeps(
       ? parseManifestImages(baseContent)
       : new Map<string, ParsedImageRef>();
 
+    // No imageExists gate here: k8s manifest `image:` fields are unambiguous real
+    // image references (unlike docker COPY --from which can be a build-context alias).
+    // parseImageRef already drops invalid names (placeholders, uppercase, etc.).
     for (const [rawImage, ref] of headRefs) {
       if (baseRefs.has(rawImage)) continue; // unchanged
 

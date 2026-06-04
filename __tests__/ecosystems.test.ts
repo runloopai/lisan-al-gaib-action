@@ -707,7 +707,10 @@ describe("docker.getChangedDeps", () => {
     expect(names).toContain("docker.io/library/alpine");
   });
 
-  it("COPY --from ref returning 'unknown' (private registry) is emitted", async () => {
+  it("COPY --from ref returning 'unknown' (private registry, unconfirmed) is skipped", async () => {
+    // "unknown" means the registry didn't give a definitive answer (401/429/network
+    // error). COPY --from sources are ambiguous (build contexts, stage aliases,
+    // real images) so we require a confirmed "found" and drop unconfirmed refs.
     vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
     vi.mocked(diff.gitDiff).mockResolvedValue("diff");
     vi.mocked(fs.readFile).mockResolvedValue(
@@ -719,7 +722,9 @@ describe("docker.getChangedDeps", () => {
     const docker = await import("../src/ecosystems/docker.js");
     const { deps } = await docker.getChangedDeps("HEAD~1", "");
     const names = deps.map((d) => d.name);
-    expect(names).toContain("myregistry.io/myimage");
+    expect(names).not.toContain("myregistry.io/myimage");
+    // alpine:3.18 (FROM) is still present — FROM refs are not existence-checked
+    expect(names).toContain("docker.io/library/alpine");
   });
 
   it("FROM ref with digest pin has correct name, version, and imageRefs key", async () => {

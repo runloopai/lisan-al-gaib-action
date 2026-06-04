@@ -186,4 +186,24 @@ describe("parseDockerfileImages", () => {
     expect(mountFrom[0].ref.registry).toBe("myregistry.io");
     expect(mountFrom[0].ref.tag).toBe("v1");
   });
+
+  it("FROM with a placeholder token (not a valid image name) yields no candidates", () => {
+    // __DIND_IMAGE__ is a CI/CD templating placeholder — not a real Docker image name.
+    // It uses leading underscores and uppercase, both of which violate the OCI
+    // distribution reference grammar. It must be silently ignored.
+    expect(parseDockerfileImages("FROM __DIND_IMAGE__\n")).toEqual([]);
+    expect(parseDockerfileImages("FROM {{BASE_IMAGE}}\n")).toEqual([]);
+  });
+
+  it("COPY --from with a placeholder token yields no candidates", () => {
+    // Placeholders in COPY --from= are also rejected at the parse layer (via
+    // parseImageRef) before reaching the imageExists network call.
+    const content = [
+      "FROM alpine:3.18",
+      "COPY --from={{CACHE_IMAGE}} /cache /cache",
+    ].join("\n");
+    const candidates = parseDockerfileImages(content);
+    expect(candidates.map((c) => c.source)).not.toContain("copy-from");
+    expect(candidates).toHaveLength(1); // only alpine FROM
+  });
 });

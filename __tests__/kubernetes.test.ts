@@ -112,17 +112,25 @@ describe("parseImageRef", () => {
     expect(ref.digest).toBeNull();
   });
 
-  it("treats @non-digest suffix (no colon) as mutable — digest remains null", () => {
-    // "nginx@latest" is a user typo; '@' without algorithm:hex is not a real digest
-    const ref = parseImageRef("nginx@latest")!;
-    expect(ref.digest).toBeNull();
-    // The '@latest' stays in the repository name — the ref is malformed but
-    // fails safe: getPublishDate sees no digest and returns null (unknown).
+  it("returns null for a malformed @non-digest reference (nginx@latest)", () => {
+    // "nginx@latest" is a typo — '@' without algorithm:hex form is not a real digest.
+    // The resulting repository name contains '@', which is not valid per the OCI grammar,
+    // so parseImageRef now returns null (drops the ref) rather than producing a malformed ref.
+    expect(parseImageRef("nginx@latest")).toBeNull();
   });
 
   it("returns null for an empty string", () => {
     expect(parseImageRef("")).toBeNull();
     expect(parseImageRef("   ")).toBeNull();
+  });
+
+  it("returns null for placeholder tokens that are not valid OCI repository names", () => {
+    expect(parseImageRef("__DIND_IMAGE__")).toBeNull(); // leading underscore, uppercase
+    expect(parseImageRef("__dind_image__")).toBeNull(); // leading underscore
+    expect(parseImageRef("{{image}}")).toBeNull(); // curly-brace placeholder
+    expect(parseImageRef("%IMAGE%")).toBeNull(); // percent placeholder
+    expect(parseImageRef("Foo/Bar")).toBeNull(); // uppercase
+    expect(parseImageRef("NGINX")).toBeNull(); // all uppercase
   });
 });
 

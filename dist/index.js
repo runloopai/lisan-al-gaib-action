@@ -89490,6 +89490,16 @@ var main = __nccwpck_require__(4908);
 
 const mutableSkipLogged = new Set();
 /**
+ * OCI distribution reference grammar for repository paths (registry stripped).
+ * path-component = [a-z0-9]+ (separator [a-z0-9]+)*
+ * separator       = [._] | __ | -+
+ * repository      = path-component ('/' path-component)*
+ *
+ * This rejects placeholder tokens like __DIND_IMAGE__, {{image}}, %VAR%,
+ * uppercase names, and any other string that is not a legal image name.
+ */
+const REPOSITORY_RE = /^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*)*$/;
+/**
  * Parse an OCI/Docker image reference string into its components.
  *
  * Grammar: [registry[:port]/]repository[:tag][@digest]
@@ -89497,6 +89507,8 @@ const mutableSkipLogged = new Set();
  * numeric port suffix (':' + all-digits) or equals 'localhost'. Otherwise the
  * image is on Docker Hub. Single-segment Docker Hub repos are normalized to
  * library/<name> so API lookups work (e.g. "postgres" → "library/postgres").
+ * Returns null for references whose repository path is not a legal OCI name
+ * (e.g. placeholder tokens like __DIND_IMAGE__, uppercase refs, etc.).
  */
 function parseImageRef(raw) {
     const trimmed = raw.trim();
@@ -89575,6 +89587,8 @@ function parseImageRef(raw) {
     if (registry === "docker.io" && !repository.includes("/")) {
         repository = `library/${repository}`;
     }
+    if (!REPOSITORY_RE.test(repository))
+        return null;
     return { raw, registry, repository, tag, digest };
 }
 function makeName(ref) {
@@ -89757,16 +89771,18 @@ async function docker_getChangedDeps(baseRef, dockerfilesInput, dockerhubMirror)
             if (baseRaws.has(candidate.raw))
                 continue; // unchanged
             const { raw, ref, source } = candidate;
-            // For COPY --from and RUN --mount=from, verify the image actually exists
-            // in a registry before treating it as a real external image dependency.
+            // For COPY --from and RUN --mount=from, require positive confirmation that
+            // the image exists before treating it as a real external image dependency.
+            // "unknown" (401/429/network error) is also treated as unconfirmed — these
+            // sources are ambiguous (build contexts, stage aliases, typos) and we
+            // prefer false-negatives over false-positives.
             if (source === "copy-from" || source === "mount-from") {
                 const reference = ref.digest ?? ref.tag ?? "latest";
                 const exists = await imageExists(ref.registry, ref.repository, reference, dockerhubMirror);
-                if (exists === "notfound") {
-                    core.info(`docker: ${raw} not found in registry (build context or alias), skipping`);
+                if (exists !== "found") {
+                    core.info(`docker: ${raw} not confirmed in registry (${exists}; build context, alias, or typo), skipping`);
                     continue;
                 }
-                // "found" or "unknown" → proceed
             }
             const name = makeName(ref);
             const version = makeVersion(ref);
@@ -89983,6 +89999,9 @@ async function kubernetes_getChangedDeps(baseRef, kubernetesFilesInput) {
         const baseRefs = baseContent
             ? parseManifestImages(baseContent)
             : new Map();
+        // No imageExists gate here: k8s manifest `image:` fields are unambiguous real
+        // image references (unlike docker COPY --from which can be a build-context alias).
+        // parseImageRef already drops invalid names (placeholders, uppercase, etc.).
         for (const [rawImage, ref] of headRefs) {
             if (baseRefs.has(rawImage))
                 continue; // unchanged
