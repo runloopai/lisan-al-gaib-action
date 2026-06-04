@@ -389,7 +389,7 @@ async function run(): Promise<void> {
       const unknowns = licenseResults.filter((lr) => lr.compatible === null && lr.license === null);
       for (const lr of unknowns) {
         const dep = { ecosystem: lr.ecosystem, name: lr.name, version: lr.version };
-        const inferred = await fetchLicense(dep, inputs.registries, javaRepoMap, inputs.githubToken, inputs.bcrUrl, true);
+        const inferred = await fetchLicense(dep, inputs.registries, javaRepoMap, inputs.githubToken, inputs.bcrUrl, true, kubernetesImageRefs);
         if (inferred) {
           inferredLicenses.set(`${lr.ecosystem}:${lr.name}`, inferred);
         }

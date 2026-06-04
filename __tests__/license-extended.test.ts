@@ -412,6 +412,12 @@ describe("fetchKubernetesLicense", () => {
     );
     expect(license).toBe("MIT");
   });
+
+  it("returns null when source label is present but not a GitHub URL", async () => {
+    mockOciChain({ "org.opencontainers.image.source": "https://gitlab.com/owner/repo" });
+    const license = await fetchKubernetesLicense(makeRef(), "");
+    expect(license).toBeNull();
+  });
 });
 
 describe("fetchLicense kubernetes dispatch", () => {

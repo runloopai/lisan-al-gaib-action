@@ -1262,9 +1262,6 @@ async function fetchMultitoolLicense(
 }
 
 /**
- * Fetch the license for a dependency based on its ecosystem.
- */
-/**
  * Fetch the license for a container image via OCI config-blob labels.
  * Reads org.opencontainers.image.licenses; falls back to org.opencontainers.image.source
  * pointing at a GitHub repo. Returns null if neither is present or accessible.
@@ -1274,12 +1271,14 @@ export async function fetchKubernetesLicense(
   githubToken: string = "",
   licenseHeuristics: boolean = true,
 ): Promise<string | null> {
+  // Unlike the age-gate (which skips tag-only refs as mutable), licenses are
+  // content-descriptive and rarely change, so we query by tag when digest is absent.
   const reference = ref.digest ?? ref.tag ?? "latest";
   const labels = await fetchImageLabels(ref.registry, ref.repository, reference);
   if (!labels) return null;
 
   const declared = labels["org.opencontainers.image.licenses"];
-  if (declared?.trim()) return declared;
+  if (declared?.trim()) return declared.trim();
 
   const source = labels["org.opencontainers.image.source"];
   if (source) {
@@ -1295,6 +1294,9 @@ export async function fetchKubernetesLicense(
   return null;
 }
 
+/**
+ * Fetch the license for a dependency based on its ecosystem.
+ */
 export async function fetchLicense(
   dep: { ecosystem: string; name: string; version: string },
   registries: RegistryUrls,

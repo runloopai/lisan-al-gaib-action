@@ -88169,21 +88169,20 @@ async function fetchMultitoolLicense(url, githubToken, licenseHeuristics = true)
     return null;
 }
 /**
- * Fetch the license for a dependency based on its ecosystem.
- */
-/**
  * Fetch the license for a container image via OCI config-blob labels.
  * Reads org.opencontainers.image.licenses; falls back to org.opencontainers.image.source
  * pointing at a GitHub repo. Returns null if neither is present or accessible.
  */
 async function fetchKubernetesLicense(ref, githubToken = "", licenseHeuristics = true) {
+    // Unlike the age-gate (which skips tag-only refs as mutable), licenses are
+    // content-descriptive and rarely change, so we query by tag when digest is absent.
     const reference = ref.digest ?? ref.tag ?? "latest";
     const labels = await fetchImageLabels(ref.registry, ref.repository, reference);
     if (!labels)
         return null;
     const declared = labels["org.opencontainers.image.licenses"];
     if (declared?.trim())
-        return declared;
+        return declared.trim();
     const source = labels["org.opencontainers.image.source"];
     if (source) {
         const ghMatch = source.match(/github\.com\/([^/]+\/[^/]+)/);
@@ -88193,6 +88192,9 @@ async function fetchKubernetesLicense(ref, githubToken = "", licenseHeuristics =
     }
     return null;
 }
+/**
+ * Fetch the license for a dependency based on its ecosystem.
+ */
 async function fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics = true, kubernetesImageRefs = new Map()) {
     switch (dep.ecosystem) {
         case "npm":
@@ -88782,7 +88784,7 @@ async function run() {
             const unknowns = licenseResults.filter((lr) => lr.compatible === null && lr.license === null);
             for (const lr of unknowns) {
                 const dep = { ecosystem: lr.ecosystem, name: lr.name, version: lr.version };
-                const inferred = await fetchLicense(dep, inputs.registries, javaRepoMap, inputs.githubToken, inputs.bcrUrl, true);
+                const inferred = await fetchLicense(dep, inputs.registries, javaRepoMap, inputs.githubToken, inputs.bcrUrl, true, kubernetesImageRefs);
                 if (inferred) {
                     inferredLicenses.set(`${lr.ecosystem}:${lr.name}`, inferred);
                 }

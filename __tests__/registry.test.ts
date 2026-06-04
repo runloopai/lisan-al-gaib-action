@@ -687,4 +687,18 @@ describe("fetchImageLabels", () => {
     const labels = await fetchImageLabels("ghcr.io", "owner/image", "sha256:abc");
     expect(labels).toBeNull();
   });
+
+  it("returns null when the config blob fetch returns a non-ok response", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ config: { digest: "sha256:cfg" } }),
+          { headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" } },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 404 }));
+    const labels = await fetchImageLabels("ghcr.io", "owner/image", "sha256:abc");
+    expect(labels).toBeNull();
+  });
 });
