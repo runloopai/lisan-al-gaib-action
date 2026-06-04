@@ -1,6 +1,6 @@
 # Project overview
 
-This is a GitHub Action (TypeScript, node24 runtime) that checks whether newly added or updated dependencies were published recently enough to be a supply-chain risk. It supports npm/pnpm/yarn/bun, Python (uv/pylock), Rust (Bazel crate.spec), Java (Bazel maven.install), Bazel module dependencies (MODULE.bazel.lock + BCR), GitHub Actions (workflow/composite action `uses:` directives), Bazel multitool binaries, and container images in rendered Kubernetes manifests.
+This is a GitHub Action (TypeScript, node24 runtime) that checks whether newly added or updated dependencies were published recently enough to be a supply-chain risk. It supports npm/pnpm/yarn/bun, Python (uv/pylock), Rust (Bazel crate.spec), Java (Bazel maven.install), Bazel module dependencies (MODULE.bazel.lock + BCR), GitHub Actions (workflow/composite action `uses:` directives), Bazel multitool binaries, container images in rendered Kubernetes manifests, and container images in Dockerfiles/Containerfiles.
 
 # Commands
 
@@ -40,6 +40,8 @@ src/
     actions.ts         # Parse workflow YAML for uses: directives, query GitHub API
     multitool.ts       # Parse multitool.hub() lockfiles, diff HEAD vs base
     kubernetes.ts      # Parse rendered k8s manifests for container images, query OCI registry
+    image.ts           # Shared OCI image helpers: parseImageRef, makeName, makeVersion, getImagePublishDate
+    docker.ts          # Parse Dockerfiles/Containerfiles for FROM/COPY/RUN base images, query OCI registry
 ```
 
 ## Flow
@@ -54,6 +56,7 @@ src/
 
 - **Structured parsers only**: `lockparse` for JS lockfiles, `smol-toml` for Python TOML, `web-tree-sitter` (WASM) for Starlark, `js-yaml` for k8s manifests. No regex-based parsing.
 - **Kubernetes ecosystem — rendered manifests only**: The action parses already-rendered YAML (output of `helm template` or similar), not raw Helm chart sources. Only `@sha256:`-digest-pinned images are age-gated; tag-only images are mutable and reported as `unknown`. Registry lookup uses the OCI Distribution v2 API anonymously; private registries → `unknown`. License checking reads the `org.opencontainers.image.licenses` OCI config-blob label, falling back to `org.opencontainers.image.source` (GitHub) if the licenses label is absent.
+- **Docker ecosystem — Dockerfile/Containerfile parsing**: Uses `dockerfile-ast` (structured parser, no regex) to extract `FROM`, `COPY --from=`, and `RUN --mount=...,from=` image references. Build-stage aliases, numeric stage indices, and unresolved `$VAR` references are filtered out. `COPY --from` and `RUN --mount=from` values that return HTTP 404 from the registry (named build contexts, typos) are info-logged and omitted from the report. Only `bind` and `cache` mount types are considered for `RUN --mount`. Shares the same OCI age-gate and license-check logic as the kubernetes ecosystem via `ecosystems/image.ts`.
 - **Diff-aware**: Only packages that changed between base and HEAD are checked. Unchanged packages are skipped.
 - **`web-tree-sitter` over native `tree-sitter`**: WASM-based to avoid native addon issues with `@vercel/ncc` bundling.
 - **`minimumReleaseAge`**: The project itself uses pnpm's `minimumReleaseAge` (in `pnpm-workspace.yaml`) to prevent installing packages younger than 14 days.
@@ -89,6 +92,7 @@ Tests are in `__tests__/` using vitest:
 - `multitool.test.ts` — Multitool lockfile parsing and diffing
 - `actions.test.ts` — GitHub Actions workflow parsing
 - `kubernetes.test.ts` — Kubernetes manifest image parsing, diff logic, and OCI registry lookups
+- `docker.test.ts` — Dockerfile/Containerfile image parsing (FROM, COPY --from, RUN --mount)
 
 Run tests: `pnpm test`
 
@@ -108,6 +112,7 @@ Run tests: `pnpm test`
 - `spdx-correct`, `spdx-satisfies`, `spdx-expression-parse`, `spdx-osi` — SPDX license parsing and compatibility
 - `fast-xml-parser` — Parse Maven POM XML for license extraction
 - `tar-stream` — Extract LICENSE files from tarballs
+- `dockerfile-ast` — Parse Dockerfiles/Containerfiles (from the VS Code Docker extension maintainer)
 - `js-yaml` — Parse YAML inputs (target-licenses, overrides)
 - `semver` — Semver version comparison
 

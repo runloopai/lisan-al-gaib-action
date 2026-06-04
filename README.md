@@ -14,6 +14,7 @@ A GitHub Action that acts as a supply-chain security gate by failing if newly ad
 | **actions** | `.github/workflows/*.yml`, `action.yml` | GitHub API |
 | **multitool** | `multitool.hub()` lockfiles via `MODULE.bazel` | Archive `Last-Modified` headers |
 | **kubernetes** | Rendered Kubernetes manifests (`*.yaml`/`*.yml`) | OCI registry v2 API (anonymous; digest-pinned only) |
+| **docker** | `Dockerfile`, `Containerfile`, `*.dockerfile`, `Dockerfile.*`, etc. | OCI registry v2 API (anonymous; digest-pinned only) |
 
 ## Quick start
 
@@ -43,7 +44,7 @@ You can always override with the `base-ref` input.
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `ecosystems` | Yes | | Comma-separated list: `npm`, `python`, `rust`, `java`, `bazel`, `actions`, `multitool`, `kubernetes` |
+| `ecosystems` | Yes | | Comma-separated list: `npm`, `python`, `rust`, `java`, `bazel`, `actions`, `multitool`, `kubernetes`, `docker` |
 | `min-age-days` | No | `14` | Minimum days since publication to pass |
 | `warn-age-days` | No | `21` | Age threshold for warnings (between min and warn = warning, above = pass) |
 | `base-ref` | No | auto-detect | Git ref to diff against |
@@ -52,6 +53,7 @@ You can always override with the `base-ref` input.
 | `module-bazel` | No | `MODULE.bazel` | Path to root MODULE.bazel (for rust/java/bazel/multitool ecosystems) |
 | `workflow-files` | No | auto-detect | Newline-separated glob patterns for workflow files (for actions ecosystem) |
 | `kubernetes-files` | No | auto-detect | Newline-separated glob patterns for rendered Kubernetes manifest files (for kubernetes ecosystem). See usage note below. |
+| `dockerfiles` | No | auto-detect | Newline-separated glob patterns for Dockerfile/Containerfile paths (for docker ecosystem). Auto-detect matches any changed file whose basename is `Dockerfile`, `Containerfile`, `*.dockerfile`, `*.containerfile`, `Dockerfile.*`, or `Containerfile.*` (case-insensitive). |
 | `strict-third-party` | No | `false` | Fail (instead of warn) on archive overrides without `Last-Modified` and third-party branch-pinned actions |
 | `bypass-keyword` | No | `""` | If the PR body contains this string on a line by itself, failures are downgraded to warnings |
 | `check-all-on-new-workflow` | No | `true` | Check all packages (not just changed) when the workflow file is newly added |
@@ -206,6 +208,40 @@ OCI label from the image config blob, falling back to the `org.opencontainers.im
 label (if it points to a GitHub repo) for images that omit the licenses label. Images
 with neither label report `unknown`. This is the primary application's declared license —
 not a full inventory of every OS package baked into the image.
+
+### Check Dockerfile base images
+
+The `docker` ecosystem parses `Dockerfile` and `Containerfile` files for base image
+references in `FROM`, `COPY --from=`, and `RUN --mount=...,from=` directives. The same
+OCI age-gate and license-check logic as the kubernetes ecosystem applies: only
+`@sha256:`-digest-pinned images are age-gated; tag-only references are reported as
+`unknown`.
+
+Build-stage aliases (from `FROM ... AS <name>`), numeric stage indices (e.g. `--from=0`),
+and unresolved ARG/ENV variables (`$VAR`) are filtered out automatically. `COPY --from`
+and `RUN --mount=from` values that don't resolve to a real registry image (named build
+contexts, typos) are info-logged and omitted from the report. Only `bind` and `cache`
+mount types are considered; `secret`, `ssh`, `tmpfs`, and other special mounts are
+ignored.
+
+```yaml
+- uses: runloopai/lisan-al-gaib-action@main
+  with:
+    ecosystems: docker
+```
+
+By default the action auto-detects any changed file whose basename (case-insensitive)
+matches `Dockerfile`, `Containerfile`, `*.dockerfile`, `*.containerfile`, `Dockerfile.*`,
+or `Containerfile.*`. To target specific paths:
+
+```yaml
+- uses: runloopai/lisan-al-gaib-action@main
+  with:
+    ecosystems: docker
+    dockerfiles: |
+      services/*/Dockerfile
+      infra/Containerfile
+```
 
 ### License compliance
 
