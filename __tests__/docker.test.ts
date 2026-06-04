@@ -3,6 +3,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { parseDockerfileImages } from "../src/ecosystems/docker.js";
+import { imageIdentity } from "../src/ecosystems/image.js";
 
 describe("parseDockerfileImages", () => {
   it("FROM nginx:1.25 yields one candidate with source 'from' and tag '1.25'", () => {
@@ -205,5 +206,17 @@ describe("parseDockerfileImages", () => {
     const candidates = parseDockerfileImages(content);
     expect(candidates.map((c) => c.source)).not.toContain("copy-from");
     expect(candidates).toHaveLength(1); // only alpine FROM
+  });
+
+  it("relabeled digest-pinned FROM (same digest, tag bumped) has the same imageIdentity as base", () => {
+    const digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab";
+    const baseCandidates = parseDockerfileImages(`FROM alpine:3.18@${digest}\n`);
+    const headCandidates = parseDockerfileImages(`FROM alpine:3.19@${digest}\n`);
+
+    const baseIdentities = new Set(baseCandidates.map((c) => imageIdentity(c.ref)));
+    const newInHead = headCandidates.filter(
+      (c) => !baseIdentities.has(imageIdentity(c.ref)),
+    );
+    expect(newInHead).toHaveLength(0);
   });
 });

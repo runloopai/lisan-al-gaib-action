@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import yaml from "js-yaml";
 import { resolveFiles, gitDiff, gitDiffNameOnly, gitShowFile } from "../diff.js";
 import type { ChangedDep, ParsedImageRef } from "./types.js";
-import { parseImageRef, makeName, makeVersion, getImagePublishDate } from "./image.js";
+import { parseImageRef, makeName, makeVersion, imageIdentity, getImagePublishDate } from "./image.js";
 
 /** Recursively walk a parsed YAML value and collect container image strings. */
 function extractImages(
@@ -120,8 +120,15 @@ export async function getChangedDeps(
     // No imageExists gate here: k8s manifest `image:` fields are unambiguous real
     // image references (unlike docker COPY --from which can be a build-context alias).
     // parseImageRef already drops invalid names (placeholders, uppercase, etc.).
-    for (const [rawImage, ref] of headRefs) {
-      if (baseRefs.has(rawImage)) continue; // unchanged
+    //
+    // Compare by resolved identity (digest), not the raw manifest string: a
+    // no-op relabel of an image whose digest is already on base must not be
+    // re-flagged, since that exact content was already vetted on the base branch.
+    const baseIdentities = new Set<string>();
+    for (const bRef of baseRefs.values()) baseIdentities.add(imageIdentity(bRef));
+
+    for (const ref of headRefs.values()) {
+      if (baseIdentities.has(imageIdentity(ref))) continue; // identity already on base
 
       const name = makeName(ref);
       const version = makeVersion(ref);
