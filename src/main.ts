@@ -10,6 +10,7 @@ import * as rust from "./ecosystems/rust.js";
 import * as java from "./ecosystems/java.js";
 import * as bazelModule from "./ecosystems/bazel-module.js";
 import * as actions from "./ecosystems/actions.js";
+import * as docker from "./ecosystems/docker.js";
 import * as multitool from "./ecosystems/multitool.js";
 import * as kubernetes from "./ecosystems/kubernetes.js";
 import { bcrPublishDate, gitCommitDate, archiveDate } from "./registry.js";
@@ -143,6 +144,7 @@ async function lookupPublishDate(
   javaRepoMap: Map<string, string[]>,
   bazelOverrides: Map<string, BazelOverride>,
   kubernetesImageRefs: Map<string, ParsedImageRef>,
+  dockerImageRefs: Map<string, ParsedImageRef>,
 ): Promise<Date | null> {
   switch (dep.ecosystem) {
     case "npm":
@@ -215,6 +217,10 @@ async function lookupPublishDate(
       return kubernetes.getPublishDate(
         kubernetesImageRefs.get(`${dep.name}@${dep.version}`),
       );
+    case "docker":
+      return docker.getPublishDate(
+        dockerImageRefs.get(`${dep.name}@${dep.version}`),
+      );
     default:
       return null;
   }
@@ -243,6 +249,7 @@ async function run(): Promise<void> {
   let javaRepoMap = new Map<string, string[]>();
   let bazelOverrides = new Map<string, BazelOverride>();
   let kubernetesImageRefs = new Map<string, ParsedImageRef>();
+  let dockerImageRefs = new Map<string, ParsedImageRef>();
 
   for (const eco of inputs.ecosystems) {
     core.startGroup(`=== ${eco} ===`);
@@ -292,6 +299,15 @@ async function run(): Promise<void> {
         kubernetesImageRefs = result.imageRefs;
         break;
       }
+      case "docker": {
+        const result = await docker.getChangedDeps(
+          baseRef,
+          inputs.dockerfiles,
+        );
+        deps = result.deps;
+        dockerImageRefs = result.imageRefs;
+        break;
+      }
       default:
         core.setFailed(`Unknown ecosystem: ${eco}`);
         return;
@@ -327,7 +343,7 @@ async function run(): Promise<void> {
     for (let i = 0; i < entries.length; i += 10) {
       const batch = entries.slice(i, i + 10);
       const results = await Promise.allSettled(
-        batch.map(([, dep]) => lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs)),
+        batch.map(([, dep]) => lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs, dockerImageRefs)),
       );
       batch.forEach(([key], idx) => {
         const r = results[idx];
@@ -381,6 +397,7 @@ async function run(): Promise<void> {
       inputs.licenseOverrides,
       inputs.licenseHeuristics,
       kubernetesImageRefs,
+      dockerImageRefs,
     );
     // When heuristics is off, still try to infer licenses for suggestion purposes
     let inferredLicenses: Map<string, string> | undefined;
@@ -389,7 +406,7 @@ async function run(): Promise<void> {
       const unknowns = licenseResults.filter((lr) => lr.compatible === null && lr.license === null);
       for (const lr of unknowns) {
         const dep = { ecosystem: lr.ecosystem, name: lr.name, version: lr.version };
-        const inferred = await fetchLicense(dep, inputs.registries, javaRepoMap, inputs.githubToken, inputs.bcrUrl, true, kubernetesImageRefs);
+        const inferred = await fetchLicense(dep, inputs.registries, javaRepoMap, inputs.githubToken, inputs.bcrUrl, true, kubernetesImageRefs, dockerImageRefs);
         if (inferred) {
           inferredLicenses.set(`${lr.ecosystem}:${lr.name}`, inferred);
         }

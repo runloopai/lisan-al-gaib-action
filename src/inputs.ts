@@ -25,6 +25,7 @@ export interface ActionInputs {
   bypassKeyword: string;
   workflowFiles: string;
   kubernetesFiles: string;
+  dockerfiles: string;
   githubToken: string;
   bcrUrl: string;
   allowedLicenses: string;
@@ -83,6 +84,7 @@ export function getInputs(): ActionInputs {
     bypassKeyword: core.getInput("bypass-keyword"),
     workflowFiles: core.getInput("workflow-files"),
     kubernetesFiles: core.getInput("kubernetes-files"),
+    dockerfiles: core.getInput("dockerfiles"),
     githubToken: core.getInput("github-token"),
     bcrUrl: trimSlash(core.getInput("bcr-url") || "https://bcr.bazel.build"),
     allowedLicenses: effectiveLicenses,

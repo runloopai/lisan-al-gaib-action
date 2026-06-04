@@ -3,11 +3,12 @@ description: >
   Supply-chain security gate that fails if newly added/updated packages were
   published less than a configurable number of days ago. Supports npm/pnpm/yarn/bun,
   Python (uv), Rust (Bazel crate.spec), Java (Bazel maven_install), GitHub Actions,
-  Bazel modules, multitool binaries, and container images in Kubernetes manifests.
+  Bazel modules, multitool binaries, container images in Kubernetes manifests, and
+  Dockerfile/Containerfile base images.
 
 inputs:
   ecosystems:
-    description: Comma-separated list of ecosystems to check (npm, python, rust, java, bazel, actions, multitool, kubernetes)
+    description: Comma-separated list of ecosystems to check (npm, python, rust, java, bazel, actions, multitool, kubernetes, docker)
     required: true
   min-age-days:
     description: Minimum number of days since publication to pass
@@ -61,6 +62,16 @@ inputs:
       age-gated; tag-only images and images on private registries report
       unknown. If empty, auto-detects changed .yaml/.yml files that contain
       workload manifests (Deployment, StatefulSet, DaemonSet, Job, etc.).
+    required: false
+    default: ""
+  dockerfiles:
+    description: >
+      Newline-separated glob patterns for Dockerfiles/Containerfiles to scan
+      (e.g. '**/Dockerfile').
+      When empty, changed files matching standard Dockerfile/Containerfile
+      naming patterns are auto-detected.
+      Only digest-pinned images (FROM ...@sha256:...) are age-gated;
+      tag-only images appear as unknown.
     required: false
     default: ""
   github-token:
