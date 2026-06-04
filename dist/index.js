@@ -86113,6 +86113,7 @@ function getInputs() {
         workflowFiles: core.getInput("workflow-files"),
         kubernetesFiles: core.getInput("kubernetes-files"),
         dockerfiles: core.getInput("dockerfiles"),
+        dockerhubMirror: core.getInput("dockerhub-mirror"),
         githubToken: core.getInput("github-token"),
         bcrUrl: trimSlash(core.getInput("bcr-url") || "https://bcr.bazel.build"),
         allowedLicenses: effectiveLicenses,
@@ -87304,22 +87305,7 @@ async function fetchImageLabels(registry, repository, reference) {
         return null;
     }
 }
-/**
- * Check whether a manifest reference exists in an OCI registry without
- * downloading its content. Uses a HEAD request per the OCI Distribution v2
- * spec.
- *
- * Returns:
- *   "found"    — HTTP 200 (manifest exists and is publicly accessible)
- *   "notfound" — HTTP 404 (reference does not exist in the registry)
- *   "unknown"  — any other status (401 private, 429 rate-limit, network
- *                error, or thrown exception) — caller should not treat the
- *                reference as either present or absent
- */
-async function imageExists(registry, repository, reference) {
-    const host = registry === "docker.io" || registry === "index.docker.io"
-        ? "registry-1.docker.io"
-        : registry;
+async function imageExistsOnHost(host, repository, reference) {
     try {
         const token = await getOciToken(host, repository);
         const headers = { Accept: MANIFEST_ACCEPT };
@@ -87335,6 +87321,36 @@ async function imageExists(registry, repository, reference) {
     catch {
         return "unknown";
     }
+}
+/**
+ * Check whether a manifest reference exists in an OCI registry without
+ * downloading its content. Uses a HEAD request per the OCI Distribution v2
+ * spec.
+ *
+ * Returns:
+ *   "found"    — HTTP 200 (manifest exists and is publicly accessible)
+ *   "notfound" — HTTP 404 (reference does not exist in the registry)
+ *   "unknown"  — any other status (401 private, 429 rate-limit, network
+ *                error, or thrown exception) — caller should not treat the
+ *                reference as either present or absent
+ *
+ * When `dockerhubMirror` is set and the primary check against Docker Hub
+ * returns "unknown" (e.g. rate-limited), the mirror is tried as a fallback.
+ * This lets CI environments that configure a Docker Hub mirror (e.g.
+ * mirror.gcr.io) resolve ambiguous COPY --from / RUN --mount=from references
+ * even when the primary registry is throttling anonymous requests.
+ */
+async function imageExists(registry, repository, reference, dockerhubMirror) {
+    const host = registry === "docker.io" || registry === "index.docker.io"
+        ? "registry-1.docker.io"
+        : registry;
+    const result = await imageExistsOnHost(host, repository, reference);
+    if (result === "unknown" &&
+        (registry === "docker.io" || registry === "index.docker.io") &&
+        dockerhubMirror) {
+        return imageExistsOnHost(dockerhubMirror, repository, reference);
+    }
+    return result;
 }
 //# sourceMappingURL=registry.js.map
 ;// CONCATENATED MODULE: ./out/ecosystems/npm.js
@@ -89705,15 +89721,9 @@ function isDockerfileName(filePath) {
         ? filePath.slice(filePath.lastIndexOf("/") + 1)
         : filePath;
     const lower = basename.toLowerCase();
-    if (lower === "dockerfile" || lower === "containerfile")
-        return true;
-    if (lower.endsWith(".dockerfile") || lower.endsWith(".containerfile"))
-        return true;
-    if (lower.startsWith("dockerfile.") || lower.startsWith("containerfile."))
-        return true;
-    return false;
+    return lower === "dockerfile" || lower === "containerfile";
 }
-async function docker_getChangedDeps(baseRef, dockerfilesInput) {
+async function docker_getChangedDeps(baseRef, dockerfilesInput, dockerhubMirror) {
     let files;
     if (dockerfilesInput) {
         const allFiles = new Set(await resolveFiles(dockerfilesInput));
@@ -89759,7 +89769,7 @@ async function docker_getChangedDeps(baseRef, dockerfilesInput) {
             // in a registry before treating it as a real external image dependency.
             if (source === "copy-from" || source === "mount-from") {
                 const reference = ref.digest ?? ref.tag ?? "latest";
-                const exists = await imageExists(ref.registry, ref.repository, reference);
+                const exists = await imageExists(ref.registry, ref.repository, reference, dockerhubMirror);
                 if (exists === "notfound") {
                     core.info(`docker: ${raw} not found in registry (build context or alias), skipping`);
                     continue;
@@ -95759,7 +95769,7 @@ async function run() {
                 break;
             }
             case "docker": {
-                const result = await docker_getChangedDeps(baseRef, inputs.dockerfiles);
+                const result = await docker_getChangedDeps(baseRef, inputs.dockerfiles, inputs.dockerhubMirror);
                 deps = result.deps;
                 dockerImageRefs = result.imageRefs;
                 break;
