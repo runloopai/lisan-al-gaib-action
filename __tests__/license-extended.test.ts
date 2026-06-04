@@ -18,8 +18,9 @@ import {
   fetchLicense,
   checkLicenses,
   emitLicenseAnnotations,
+  fetchKubernetesLicense,
 } from "../src/license.js";
-import type { CheckResult } from "../src/ecosystems/types.js";
+import type { CheckResult, ParsedImageRef } from "../src/ecosystems/types.js";
 
 const registries = {
   npm: "https://registry.npmjs.org",
@@ -350,5 +351,117 @@ describe("checkLicenses", () => {
     );
     expect(lr).toHaveLength(1);
     expect(lr[0].compatible).toBe(true);
+  });
+});
+
+describe("fetchKubernetesLicense", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  const makeRef = (overrides: Partial<ParsedImageRef> = {}): ParsedImageRef => ({
+    raw: "quay.io/prometheus/prometheus@sha256:abc",
+    registry: "quay.io",
+    repository: "prometheus/prometheus",
+    tag: "latest",
+    digest: "sha256:abc",
+    ...overrides,
+  });
+
+  // Returns the spy so callers can chain additional .mockResolvedValueOnce() calls.
+  function mockOciChain(labels: Record<string, string>) {
+    return vi.spyOn(globalThis, "fetch")
+      // ping → 200 (no auth)
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      // manifest with config.digest
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ config: { digest: "sha256:cfg" } }),
+          { headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" } },
+        ),
+      )
+      // config blob
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ config: { Labels: labels } })),
+      );
+  }
+
+  it("returns the licenses label when present", async () => {
+    mockOciChain({ "org.opencontainers.image.licenses": "Apache-2.0" });
+    const license = await fetchKubernetesLicense(makeRef(), "");
+    expect(license).toBe("Apache-2.0");
+  });
+
+  it("falls back to GitHub source label when licenses label is absent", async () => {
+    mockOciChain({ "org.opencontainers.image.source": "https://github.com/owner/repo" })
+      // 4th mock chained on the same spy: GitHub license API
+      .mockResolvedValueOnce(new Response(JSON.stringify({ license: { spdx_id: "MIT" } })));
+    const license = await fetchKubernetesLicense(makeRef(), "");
+    expect(license).toBe("MIT");
+  });
+
+  it("returns null when both labels are absent", async () => {
+    mockOciChain({});
+    const license = await fetchKubernetesLicense(makeRef(), "");
+    expect(license).toBeNull();
+  });
+
+  it("uses tag when digest is null", async () => {
+    mockOciChain({ "org.opencontainers.image.licenses": "MIT" });
+    const license = await fetchKubernetesLicense(
+      makeRef({ digest: null, tag: "1.0" }),
+      "",
+    );
+    expect(license).toBe("MIT");
+  });
+});
+
+describe("fetchLicense kubernetes dispatch", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  const ref: ParsedImageRef = {
+    raw: "quay.io/p/p@sha256:abc",
+    registry: "quay.io",
+    repository: "p/p",
+    tag: null,
+    digest: "sha256:abc",
+  };
+
+  it("dispatches to fetchKubernetesLicense using the imageRefs map", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ config: { digest: "sha256:cfg" } }),
+          { headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ config: { Labels: { "org.opencontainers.image.licenses": "Apache-2.0" } } }),
+        ),
+      );
+    const refs = new Map([["quay.io/p/p@sha256:abc", ref]]);
+    const result = await fetchLicense(
+      { ecosystem: "kubernetes", name: "quay.io/p/p", version: "sha256:abc" },
+      registries,
+      new Map(),
+      "",
+      "",
+      true,
+      refs,
+    );
+    expect(result).toBe("Apache-2.0");
+  });
+
+  it("returns null when the ref is not in kubernetesImageRefs", async () => {
+    const result = await fetchLicense(
+      { ecosystem: "kubernetes", name: "docker.io/library/nginx", version: "latest" },
+      registries,
+      new Map(),
+      "",
+      "",
+      true,
+      new Map(),
+    );
+    expect(result).toBeNull();
   });
 });

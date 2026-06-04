@@ -425,3 +425,73 @@ export async function fetchImagePublishDate(
     return null;
   }
 }
+
+async function fetchOciBlobJson(
+  host: string,
+  repository: string,
+  digest: string,
+  token: string | null,
+): Promise<unknown | null> {
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  try {
+    const resp = await fetch(
+      `https://${host}/v2/${repository}/blobs/${digest}`,
+      { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
+    );
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch the OCI image config labels for a container image.
+ * Returns the image's config.Labels map, or null on any failure.
+ * Works anonymously on public registries; private registries → null.
+ */
+export async function fetchImageLabels(
+  registry: string,
+  repository: string,
+  reference: string,
+): Promise<Record<string, string> | null> {
+  const host =
+    registry === "docker.io" || registry === "index.docker.io"
+      ? "registry-1.docker.io"
+      : registry;
+  try {
+    const token = await getOciToken(host, repository);
+    let manifest = await fetchOciManifest(host, repository, reference, token);
+    if (!manifest) return null;
+
+    const mediaType = manifest.contentType.split(";")[0].trim();
+    if (OCI_INDEX_MEDIA_TYPES.has(mediaType)) {
+      const index = manifest.body as {
+        manifests?: Array<{
+          digest: string;
+          platform?: { os?: string; architecture?: string };
+        }>;
+      };
+      if (!index.manifests?.length) return null;
+      const child =
+        index.manifests.find(
+          (m) =>
+            m.platform?.os === "linux" &&
+            m.platform?.architecture === "amd64",
+        ) ?? index.manifests[0];
+      manifest = await fetchOciManifest(host, repository, child.digest, token);
+      if (!manifest) return null;
+    }
+
+    const body = manifest.body as { config?: { digest?: string } };
+    const configDigest = body.config?.digest;
+    if (!configDigest) return null;
+
+    const config = await fetchOciBlobJson(host, repository, configDigest, token);
+    const cfg = config as { config?: { Labels?: Record<string, string> } } | null;
+    return cfg?.config?.Labels ?? null;
+  } catch {
+    return null;
+  }
+}

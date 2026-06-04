@@ -380,6 +380,7 @@ async function run(): Promise<void> {
       inputs.bcrUrl,
       inputs.licenseOverrides,
       inputs.licenseHeuristics,
+      kubernetesImageRefs,
     );
     // When heuristics is off, still try to infer licenses for suggestion purposes
     let inferredLicenses: Map<string, string> | undefined;

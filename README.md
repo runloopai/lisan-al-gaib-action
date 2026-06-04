@@ -201,6 +201,12 @@ Push timestamps are sourced from registry-specific APIs where available:
 Images on private registries (AWS ECR private, GCP Artifact Registry, self-hosted)
 that reject anonymous pulls are always reported as `unknown`.
 
+**License checking** for container images reads the `org.opencontainers.image.licenses`
+OCI label from the image config blob, falling back to the `org.opencontainers.image.source`
+label (if it points to a GitHub repo) for images that omit the licenses label. Images
+with neither label report `unknown`. This is the primary application's declared license —
+not a full inventory of every OS package baked into the image.
+
 ### License compliance
 
 ```yaml
@@ -230,7 +236,7 @@ that reject anonymous pulls are always reported as `unknown`.
     # target-licenses: ""
 ```
 
-For every analyzed dependency, the action fetches the license from the package registry (npm, PyPI, crates.io, Maven POM, GitHub API, BCR metadata) and checks **directional compatibility** — whether the dependency's license allows incorporation into a project under your target license. This uses a full SPDX compatibility matrix (permissive → copyleft flow, GPL version compatibility, weak copyleft rules, etc.). Incompatible licenses produce error annotations and fail the check.
+For every analyzed dependency, the action fetches the license from the package registry (npm, PyPI, crates.io, Maven POM, GitHub API, BCR metadata, OCI image labels) and checks **directional compatibility** — whether the dependency's license allows incorporation into a project under your target license. This uses a full SPDX compatibility matrix (permissive → copyleft flow, GPL version compatibility, weak copyleft rules, etc.). Incompatible licenses produce error annotations and fail the check.
 
 ### License and age overrides
 

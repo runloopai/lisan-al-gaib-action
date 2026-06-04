@@ -80460,6 +80460,57 @@ async function fetchImagePublishDate(registry, repository, digest, tag = null) {
         return null;
     }
 }
+async function fetchOciBlobJson(host, repository, digest, token) {
+    const headers = {};
+    if (token)
+        headers.Authorization = `Bearer ${token}`;
+    try {
+        const resp = await fetch(`https://${host}/v2/${repository}/blobs/${digest}`, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+        if (!resp.ok)
+            return null;
+        return await resp.json();
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Fetch the OCI image config labels for a container image.
+ * Returns the image's config.Labels map, or null on any failure.
+ * Works anonymously on public registries; private registries → null.
+ */
+async function fetchImageLabels(registry, repository, reference) {
+    const host = registry === "docker.io" || registry === "index.docker.io"
+        ? "registry-1.docker.io"
+        : registry;
+    try {
+        const token = await getOciToken(host, repository);
+        let manifest = await fetchOciManifest(host, repository, reference, token);
+        if (!manifest)
+            return null;
+        const mediaType = manifest.contentType.split(";")[0].trim();
+        if (OCI_INDEX_MEDIA_TYPES.has(mediaType)) {
+            const index = manifest.body;
+            if (!index.manifests?.length)
+                return null;
+            const child = index.manifests.find((m) => m.platform?.os === "linux" &&
+                m.platform?.architecture === "amd64") ?? index.manifests[0];
+            manifest = await fetchOciManifest(host, repository, child.digest, token);
+            if (!manifest)
+                return null;
+        }
+        const body = manifest.body;
+        const configDigest = body.config?.digest;
+        if (!configDigest)
+            return null;
+        const config = await fetchOciBlobJson(host, repository, configDigest, token);
+        const cfg = config;
+        return cfg?.config?.Labels ?? null;
+    }
+    catch {
+        return null;
+    }
+}
 //# sourceMappingURL=registry.js.map
 ;// CONCATENATED MODULE: ./out/ecosystems/npm.js
 
@@ -87016,6 +87067,7 @@ var tar_stream = __nccwpck_require__(3761);
 
 
 
+
 /** Quote a string for YAML if needed, using js-yaml's serializer. */
 function license_yamlQuote(s) {
     return jsYaml.dump(s, { flowLevel: 0 }).trimEnd();
@@ -88119,7 +88171,29 @@ async function fetchMultitoolLicense(url, githubToken, licenseHeuristics = true)
 /**
  * Fetch the license for a dependency based on its ecosystem.
  */
-async function fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics = true) {
+/**
+ * Fetch the license for a container image via OCI config-blob labels.
+ * Reads org.opencontainers.image.licenses; falls back to org.opencontainers.image.source
+ * pointing at a GitHub repo. Returns null if neither is present or accessible.
+ */
+async function fetchKubernetesLicense(ref, githubToken = "", licenseHeuristics = true) {
+    const reference = ref.digest ?? ref.tag ?? "latest";
+    const labels = await fetchImageLabels(ref.registry, ref.repository, reference);
+    if (!labels)
+        return null;
+    const declared = labels["org.opencontainers.image.licenses"];
+    if (declared?.trim())
+        return declared;
+    const source = labels["org.opencontainers.image.source"];
+    if (source) {
+        const ghMatch = source.match(/github\.com\/([^/]+\/[^/]+)/);
+        if (ghMatch) {
+            return fetchGitHubRepoLicense(ghMatch[1].replace(/\.git$/, ""), githubToken, licenseHeuristics);
+        }
+    }
+    return null;
+}
+async function fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics = true, kubernetesImageRefs = new Map()) {
     switch (dep.ecosystem) {
         case "npm":
             return fetchNpmLicense(dep.name, dep.version, registries, githubToken, licenseHeuristics);
@@ -88135,6 +88209,10 @@ async function fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, l
             return fetchBcrLicense(dep.name, dep.version, bcrUrl, githubToken, licenseHeuristics);
         case "multitool":
             return fetchMultitoolLicense(dep.version, githubToken, licenseHeuristics);
+        case "kubernetes": {
+            const ref = kubernetesImageRefs.get(`${dep.name}@${dep.version}`);
+            return ref ? fetchKubernetesLicense(ref, githubToken, licenseHeuristics) : null;
+        }
         default:
             return null;
     }
@@ -88142,7 +88220,7 @@ async function fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, l
 /**
  * Check licenses for all analyzed dependencies and return results.
  */
-async function checkLicenses(results, targetLicenseMap, registries, javaRepoMap, githubToken, bcrUrl, overrides, licenseHeuristics = true) {
+async function checkLicenses(results, targetLicenseMap, registries, javaRepoMap, githubToken, bcrUrl, overrides, licenseHeuristics = true, kubernetesImageRefs = new Map()) {
     // Cache: "ecosystem:name@version" → raw license string | null
     const licenseCache = new Map();
     // Identify deps that need fetching (not overridden, not cached)
@@ -88170,7 +88248,7 @@ async function checkLicenses(results, targetLicenseMap, registries, javaRepoMap,
     }
     for (let i = 0; i < toFetch.length; i += 10) {
         const batch = toFetch.slice(i, i + 10);
-        const settled = await Promise.allSettled(batch.map(({ dep }) => fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics)));
+        const settled = await Promise.allSettled(batch.map(({ dep }) => fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics, kubernetesImageRefs)));
         batch.forEach(({ cacheKey }, idx) => {
             const result = settled[idx];
             licenseCache.set(cacheKey, result.status === "fulfilled" ? result.value : null);
@@ -88696,7 +88774,7 @@ async function run() {
         for (const [eco, licenses] of targetLicenses) {
             core.info(`Target licenses [${eco}]: ${licenses.join(", ")}`);
         }
-        licenseResults = await checkLicenses(allResults, targetLicenses, inputs.registries, javaRepoMap, inputs.githubToken, inputs.bcrUrl, inputs.licenseOverrides, inputs.licenseHeuristics);
+        licenseResults = await checkLicenses(allResults, targetLicenses, inputs.registries, javaRepoMap, inputs.githubToken, inputs.bcrUrl, inputs.licenseOverrides, inputs.licenseHeuristics, kubernetesImageRefs);
         // When heuristics is off, still try to infer licenses for suggestion purposes
         let inferredLicenses;
         if (!inputs.licenseHeuristics) {

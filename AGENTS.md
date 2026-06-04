@@ -26,10 +26,10 @@ src/
   inputs.ts            # Parse action.yml inputs
   base-ref.ts          # Auto-detect base git ref from event context
   diff.ts              # Git operations (diff, show, glob resolution)
-  registry.ts          # Fetch publish dates from npm/pypi/crates.io/maven/BCR/GitHub/OCI
+  registry.ts          # Fetch publish dates from npm/pypi/crates.io/maven/BCR/GitHub/OCI; OCI image config labels
   report.ts            # GitHub annotations, job summary, remediation hints
   bazel.ts             # tree-sitter Starlark parser for MODULE.bazel
-  license.ts           # SPDX license compatibility checking, registry license fetching
+  license.ts           # SPDX license compatibility checking, registry license fetching (npm/PyPI/crates/Maven/GitHub/BCR/OCI image labels)
   ecosystems/
     types.ts           # Shared interfaces (ChangedDep, CheckResult, etc.)
     npm.ts             # Parse pnpm/npm/yarn/bun lockfiles via lockparse
@@ -53,7 +53,7 @@ src/
 ## Key design decisions
 
 - **Structured parsers only**: `lockparse` for JS lockfiles, `smol-toml` for Python TOML, `web-tree-sitter` (WASM) for Starlark, `js-yaml` for k8s manifests. No regex-based parsing.
-- **Kubernetes ecosystem — rendered manifests only**: The action parses already-rendered YAML (output of `helm template` or similar), not raw Helm chart sources. Only `@sha256:`-digest-pinned images are age-gated; tag-only images are mutable and reported as `unknown`. Registry lookup uses the OCI Distribution v2 API anonymously; private registries → `unknown`.
+- **Kubernetes ecosystem — rendered manifests only**: The action parses already-rendered YAML (output of `helm template` or similar), not raw Helm chart sources. Only `@sha256:`-digest-pinned images are age-gated; tag-only images are mutable and reported as `unknown`. Registry lookup uses the OCI Distribution v2 API anonymously; private registries → `unknown`. License checking reads the `org.opencontainers.image.licenses` OCI config-blob label, falling back to `org.opencontainers.image.source` (GitHub) if the licenses label is absent.
 - **Diff-aware**: Only packages that changed between base and HEAD are checked. Unchanged packages are skipped.
 - **`web-tree-sitter` over native `tree-sitter`**: WASM-based to avoid native addon issues with `@vercel/ncc` bundling.
 - **`minimumReleaseAge`**: The project itself uses pnpm's `minimumReleaseAge` (in `pnpm-workspace.yaml`) to prevent installing packages younger than 14 days.

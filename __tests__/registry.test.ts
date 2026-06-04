@@ -12,6 +12,7 @@ import {
   gitCommitDate,
   archiveDate,
   fetchImagePublishDate,
+  fetchImageLabels,
 } from "../src/registry.js";
 
 const registries = {
@@ -566,5 +567,124 @@ describe("fetchImagePublishDate", () => {
       null,
     );
     expect(date).toBeNull();
+  });
+});
+
+describe("fetchImageLabels", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("returns Labels from a single-arch manifest (no-auth registry)", async () => {
+    vi.spyOn(globalThis, "fetch")
+      // ping → 200 (no auth needed)
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      // manifest
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ config: { digest: "sha256:cfg123" } }),
+          { headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" } },
+        ),
+      )
+      // config blob
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            config: {
+              Labels: {
+                "org.opencontainers.image.licenses": "Apache-2.0",
+                "org.opencontainers.image.source": "https://github.com/owner/repo",
+              },
+            },
+          }),
+        ),
+      );
+    const labels = await fetchImageLabels("quay.io", "owner/image", "sha256:abc");
+    expect(labels).toEqual({
+      "org.opencontainers.image.licenses": "Apache-2.0",
+      "org.opencontainers.image.source": "https://github.com/owner/repo",
+    });
+  });
+
+  it("drills into the linux/amd64 child of an image index", async () => {
+    vi.spyOn(globalThis, "fetch")
+      // ping → 401 + token
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 401,
+          headers: {
+            "www-authenticate": 'Bearer realm="https://auth.example.com/token",service="example.com"',
+          },
+        }),
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ token: "tok" })))
+      // index manifest
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            manifests: [
+              { digest: "sha256:arm", platform: { os: "linux", architecture: "arm64" } },
+              { digest: "sha256:amd", platform: { os: "linux", architecture: "amd64" } },
+            ],
+          }),
+          { headers: { "content-type": "application/vnd.oci.image.index.v1+json" } },
+        ),
+      )
+      // child manifest (amd64)
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ config: { digest: "sha256:cfg" } }),
+          { headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" } },
+        ),
+      )
+      // config blob
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ config: { Labels: { "org.opencontainers.image.licenses": "MIT" } } }),
+        ),
+      );
+    const labels = await fetchImageLabels("registry.example.com", "owner/image", "sha256:index");
+    expect(labels?.["org.opencontainers.image.licenses"]).toBe("MIT");
+  });
+
+  it("returns null when the manifest has no config.digest", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ layers: [] }),
+          { headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" } },
+        ),
+      );
+    const labels = await fetchImageLabels("ghcr.io", "owner/image", "sha256:abc");
+    expect(labels).toBeNull();
+  });
+
+  it("returns null on private-registry 401 (anonymous token rejected)", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 401,
+          headers: { "www-authenticate": 'Bearer realm="https://private.example.com/token",service="private"' },
+        }),
+      )
+      // token endpoint returns 401
+      .mockResolvedValueOnce(new Response(null, { status: 401 }));
+    const labels = await fetchImageLabels("private.example.com", "org/image", "sha256:abc");
+    expect(labels).toBeNull();
+  });
+
+  it("returns null when the config blob has no Labels", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ config: { digest: "sha256:cfg" } }),
+          { headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ config: {} })),
+      );
+    const labels = await fetchImageLabels("ghcr.io", "owner/image", "sha256:abc");
+    expect(labels).toBeNull();
   });
 });
