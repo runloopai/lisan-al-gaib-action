@@ -495,3 +495,42 @@ export async function fetchImageLabels(
     return null;
   }
 }
+
+/**
+ * Check whether a manifest reference exists in an OCI registry without
+ * downloading its content. Uses a HEAD request per the OCI Distribution v2
+ * spec.
+ *
+ * Returns:
+ *   "found"    — HTTP 200 (manifest exists and is publicly accessible)
+ *   "notfound" — HTTP 404 (reference does not exist in the registry)
+ *   "unknown"  — any other status (401 private, 429 rate-limit, network
+ *                error, or thrown exception) — caller should not treat the
+ *                reference as either present or absent
+ */
+export async function imageExists(
+  registry: string,
+  repository: string,
+  reference: string,
+): Promise<"found" | "notfound" | "unknown"> {
+  const host =
+    registry === "docker.io" || registry === "index.docker.io"
+      ? "registry-1.docker.io"
+      : registry;
+  try {
+    const token = await getOciToken(host, repository);
+    const headers: Record<string, string> = { Accept: MANIFEST_ACCEPT };
+    if (token) headers.Authorization = `Bearer ${token}`;
+
+    const resp = await fetch(
+      `https://${host}/v2/${repository}/manifests/${reference}`,
+      { method: "HEAD", headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
+    );
+
+    if (resp.status === 200) return "found";
+    if (resp.status === 404) return "notfound";
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
