@@ -447,8 +447,13 @@ async function fetchOciBlobJson(
 }
 
 /**
- * Fetch the OCI image config labels for a container image.
- * Returns the image's config.Labels map, or null on any failure.
+ * Fetch metadata labels for a container image, merging OCI manifest annotations
+ * and config-blob Labels. Sources (lowest → highest precedence):
+ *   1. index-level annotations (when top manifest is a multi-arch image index)
+ *   2. chosen child-descriptor annotations (per-platform entry in the index)
+ *   3. resolved image manifest top-level annotations
+ *   4. config-blob config.Labels
+ * Returns the merged map if any key is present, or null on total failure.
  * Works anonymously on public registries; private registries → null.
  */
 export async function fetchImageLabels(
@@ -465,32 +470,53 @@ export async function fetchImageLabels(
     let manifest = await fetchOciManifest(host, repository, reference, token);
     if (!manifest) return null;
 
+    const merged: Record<string, string> = {};
+
     const mediaType = manifest.contentType.split(";")[0].trim();
     if (OCI_INDEX_MEDIA_TYPES.has(mediaType)) {
       const index = manifest.body as {
         manifests?: Array<{
           digest: string;
+          annotations?: Record<string, string>;
           platform?: { os?: string; architecture?: string };
         }>;
+        annotations?: Record<string, string>;
       };
-      if (!index.manifests?.length) return null;
+      // 1. index-level annotations
+      Object.assign(merged, index.annotations ?? {});
+
+      if (!index.manifests?.length) return Object.keys(merged).length ? merged : null;
+
       const child =
         index.manifests.find(
           (m) =>
             m.platform?.os === "linux" &&
             m.platform?.architecture === "amd64",
         ) ?? index.manifests[0];
+
+      // 2. child-descriptor annotations
+      Object.assign(merged, child.annotations ?? {});
+
       manifest = await fetchOciManifest(host, repository, child.digest, token);
-      if (!manifest) return null;
+      if (!manifest) return Object.keys(merged).length ? merged : null;
     }
 
-    const body = manifest.body as { config?: { digest?: string } };
-    const configDigest = body.config?.digest;
-    if (!configDigest) return null;
+    // 3. image manifest annotations
+    const manifestBody = manifest.body as {
+      config?: { digest?: string };
+      annotations?: Record<string, string>;
+    };
+    Object.assign(merged, manifestBody.annotations ?? {});
 
-    const config = await fetchOciBlobJson(host, repository, configDigest, token);
-    const cfg = config as { config?: { Labels?: Record<string, string> } } | null;
-    return cfg?.config?.Labels ?? null;
+    // 4. config-blob Labels (highest precedence — overrides annotations on conflict)
+    const configDigest = manifestBody.config?.digest;
+    if (configDigest) {
+      const config = await fetchOciBlobJson(host, repository, configDigest, token);
+      const cfg = config as { config?: { Labels?: Record<string, string> } } | null;
+      Object.assign(merged, cfg?.config?.Labels ?? {});
+    }
+
+    return Object.keys(merged).length ? merged : null;
   } catch {
     return null;
   }

@@ -20,6 +20,7 @@ import {
   emitAnnotations,
   writeSummary,
   reportTotals,
+  dedupeResults,
 } from "./report.js";
 import {
   getTargetLicenses,
@@ -240,7 +241,7 @@ async function run(): Promise<void> {
     `Dependency age check — min: ${inputs.minAgeDays}d, warn: ${inputs.warnAgeDays}d, base: ${baseRef}`,
   );
 
-  const allResults: CheckResult[] = [];
+  let allResults: CheckResult[] = [];
 
   // Cache for publish date lookups: "ecosystem:name@version" → Date | null
   const publishDateCache = new Map<string, Date | null>();
@@ -377,6 +378,8 @@ async function run(): Promise<void> {
 
     core.endGroup();
   }
+
+  allResults = dedupeResults(allResults);
 
   // License compliance check
   const targetLicenses = await getTargetLicenses(inputs.allowedLicenses);

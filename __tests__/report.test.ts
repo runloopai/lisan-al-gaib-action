@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { determineStatus, sortedByStatus, reportTotals, versionAtLeast, parseExcludeNewerDays } from "../src/report.js";
+import { determineStatus, sortedByStatus, reportTotals, versionAtLeast, parseExcludeNewerDays, dedupeResults } from "../src/report.js";
 import type { CheckResult, DepStatus } from "../src/ecosystems/types.js";
 
 function makeResult(status: DepStatus, name = "pkg"): CheckResult {
@@ -142,5 +142,61 @@ describe("parseExcludeNewerDays", () => {
 
   it("returns null for empty string", () => {
     expect(parseExcludeNewerDays("")).toBe(null);
+  });
+});
+
+describe("dedupeResults", () => {
+  it("returns empty array for empty input", () => {
+    expect(dedupeResults([])).toEqual([]);
+  });
+
+  it("keeps only first occurrence of same ecosystem:name@version", () => {
+    const first: CheckResult = {
+      dep: { ecosystem: "docker", name: "docker.io/library/ubuntu", version: "latest", file: "a/Dockerfile" },
+      publishDate: null,
+      ageDays: null,
+      status: "unknown",
+    };
+    const dupe: CheckResult = {
+      dep: { ecosystem: "docker", name: "docker.io/library/ubuntu", version: "latest", file: "b/Dockerfile" },
+      publishDate: null,
+      ageDays: null,
+      status: "unknown",
+    };
+    const result = dedupeResults([first, dupe]);
+    expect(result).toHaveLength(1);
+    expect(result[0].dep.file).toBe("a/Dockerfile");
+  });
+
+  it("keeps distinct versions as separate entries", () => {
+    const v1: CheckResult = {
+      dep: { ecosystem: "docker", name: "docker.io/library/ubuntu", version: "22.04", file: "Dockerfile" },
+      publishDate: null,
+      ageDays: null,
+      status: "unknown",
+    };
+    const v2: CheckResult = {
+      dep: { ecosystem: "docker", name: "docker.io/library/ubuntu", version: "latest", file: "Dockerfile" },
+      publishDate: null,
+      ageDays: null,
+      status: "unknown",
+    };
+    expect(dedupeResults([v1, v2])).toHaveLength(2);
+  });
+
+  it("keeps same name/version in distinct ecosystems as separate entries", () => {
+    const npm: CheckResult = {
+      dep: { ecosystem: "npm", name: "lodash", version: "4.17.21", file: "package-lock.json" },
+      publishDate: null,
+      ageDays: null,
+      status: "pass",
+    };
+    const python: CheckResult = {
+      dep: { ecosystem: "python", name: "lodash", version: "4.17.21", file: "uv.lock" },
+      publishDate: null,
+      ageDays: null,
+      status: "pass",
+    };
+    expect(dedupeResults([npm, python])).toHaveLength(2);
   });
 });

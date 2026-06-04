@@ -712,6 +712,18 @@ async function showAgeGateDiffs(
   if (shownExclusions) core.endGroup();
 }
 
+export function dedupeResults(results: CheckResult[]): CheckResult[] {
+  const seen = new Set<string>();
+  const out: CheckResult[] = [];
+  for (const r of results) {
+    const key = `${r.dep.ecosystem}:${r.dep.name}@${r.dep.version}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+  }
+  return out;
+}
+
 export async function emitAnnotations(
   results: CheckResult[],
   ecosystems: string[],

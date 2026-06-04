@@ -87269,8 +87269,13 @@ async function fetchOciBlobJson(host, repository, digest, token) {
     }
 }
 /**
- * Fetch the OCI image config labels for a container image.
- * Returns the image's config.Labels map, or null on any failure.
+ * Fetch metadata labels for a container image, merging OCI manifest annotations
+ * and config-blob Labels. Sources (lowest → highest precedence):
+ *   1. index-level annotations (when top manifest is a multi-arch image index)
+ *   2. chosen child-descriptor annotations (per-platform entry in the index)
+ *   3. resolved image manifest top-level annotations
+ *   4. config-blob config.Labels
+ * Returns the merged map if any key is present, or null on total failure.
  * Works anonymously on public registries; private registries → null.
  */
 async function fetchImageLabels(registry, repository, reference) {
@@ -87282,24 +87287,33 @@ async function fetchImageLabels(registry, repository, reference) {
         let manifest = await fetchOciManifest(host, repository, reference, token);
         if (!manifest)
             return null;
+        const merged = {};
         const mediaType = manifest.contentType.split(";")[0].trim();
         if (OCI_INDEX_MEDIA_TYPES.has(mediaType)) {
             const index = manifest.body;
+            // 1. index-level annotations
+            Object.assign(merged, index.annotations ?? {});
             if (!index.manifests?.length)
-                return null;
+                return Object.keys(merged).length ? merged : null;
             const child = index.manifests.find((m) => m.platform?.os === "linux" &&
                 m.platform?.architecture === "amd64") ?? index.manifests[0];
+            // 2. child-descriptor annotations
+            Object.assign(merged, child.annotations ?? {});
             manifest = await fetchOciManifest(host, repository, child.digest, token);
             if (!manifest)
-                return null;
+                return Object.keys(merged).length ? merged : null;
         }
-        const body = manifest.body;
-        const configDigest = body.config?.digest;
-        if (!configDigest)
-            return null;
-        const config = await fetchOciBlobJson(host, repository, configDigest, token);
-        const cfg = config;
-        return cfg?.config?.Labels ?? null;
+        // 3. image manifest annotations
+        const manifestBody = manifest.body;
+        Object.assign(merged, manifestBody.annotations ?? {});
+        // 4. config-blob Labels (highest precedence — overrides annotations on conflict)
+        const configDigest = manifestBody.config?.digest;
+        if (configDigest) {
+            const config = await fetchOciBlobJson(host, repository, configDigest, token);
+            const cfg = config;
+            Object.assign(merged, cfg?.config?.Labels ?? {});
+        }
+        return Object.keys(merged).length ? merged : null;
     }
     catch {
         return null;
@@ -90756,6 +90770,18 @@ async function showAgeGateDiffs(results, ecosystems, minAgeDays) {
     }
     if (shownExclusions)
         core.endGroup();
+}
+function dedupeResults(results) {
+    const seen = new Set();
+    const out = [];
+    for (const r of results) {
+        const key = `${r.dep.ecosystem}:${r.dep.name}@${r.dep.version}`;
+        if (seen.has(key))
+            continue;
+        seen.add(key);
+        out.push(r);
+    }
+    return out;
 }
 async function emitAnnotations(results, ecosystems, minAgeDays) {
     for (const { dep, ageDays, status } of results) {
@@ -95734,7 +95760,7 @@ async function run() {
     const diffableRef = await ensureBaseRefAvailable(validatedRef);
     const baseRef = await resolveEffectiveBaseRef(diffableRef, inputs.checkAllOnNewWorkflow);
     core.info(`Dependency age check — min: ${inputs.minAgeDays}d, warn: ${inputs.warnAgeDays}d, base: ${baseRef}`);
-    const allResults = [];
+    let allResults = [];
     // Cache for publish date lookups: "ecosystem:name@version" → Date | null
     const publishDateCache = new Map();
     // Per-ecosystem metadata maps
@@ -95838,6 +95864,7 @@ async function run() {
         }
         core.endGroup();
     }
+    allResults = dedupeResults(allResults);
     // License compliance check
     const targetLicenses = await getTargetLicenses(inputs.allowedLicenses);
     let licenseViolations = 0;

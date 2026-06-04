@@ -702,6 +702,167 @@ describe("fetchImageLabels", () => {
     const labels = await fetchImageLabels("ghcr.io", "owner/image", "sha256:abc");
     expect(labels).toBeNull();
   });
+
+  it("returns manifest annotations when config.Labels is absent", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      // manifest with top-level annotations but no config Labels
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            config: { digest: "sha256:cfg" },
+            annotations: { "org.opencontainers.image.licenses": "MIT" },
+          }),
+          { headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" } },
+        ),
+      )
+      // config blob has no Labels
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ config: {} })),
+      );
+    const labels = await fetchImageLabels("ghcr.io", "owner/image", "sha256:abc");
+    expect(labels).toEqual({ "org.opencontainers.image.licenses": "MIT" });
+  });
+
+  it("returns null when no config digest and no annotations", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ layers: [] }),
+          { headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" } },
+        ),
+      );
+    const labels = await fetchImageLabels("ghcr.io", "owner/image", "sha256:abc");
+    expect(labels).toBeNull();
+  });
+
+  it("config.Labels take precedence over manifest annotations on key conflict", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            config: { digest: "sha256:cfg" },
+            annotations: { "org.opencontainers.image.licenses": "Apache-2.0" },
+          }),
+          { headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" } },
+        ),
+      )
+      // config blob overrides with MIT
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ config: { Labels: { "org.opencontainers.image.licenses": "MIT" } } }),
+        ),
+      );
+    const labels = await fetchImageLabels("ghcr.io", "owner/image", "sha256:abc");
+    expect(labels?.["org.opencontainers.image.licenses"]).toBe("MIT");
+  });
+
+  it("merges index annotations, child-descriptor annotations, and child manifest annotations", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      // image index with top-level annotations and per-descriptor annotations
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            manifests: [
+              {
+                digest: "sha256:amd",
+                platform: { os: "linux", architecture: "amd64" },
+                annotations: { "org.opencontainers.image.revision": "abc123" },
+              },
+            ],
+            annotations: { "org.opencontainers.image.vendor": "Acme" },
+          }),
+          { headers: { "content-type": "application/vnd.oci.image.index.v1+json" } },
+        ),
+      )
+      // child manifest has its own annotations, no config digest
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            annotations: { "org.opencontainers.image.licenses": "Apache-2.0" },
+          }),
+          { headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" } },
+        ),
+      )
+    const labels = await fetchImageLabels("ghcr.io", "owner/image", "sha256:index");
+    expect(labels).toEqual({
+      "org.opencontainers.image.vendor": "Acme",
+      "org.opencontainers.image.revision": "abc123",
+      "org.opencontainers.image.licenses": "Apache-2.0",
+    });
+  });
+
+  it("child manifest annotations override child-descriptor and index annotations on same key", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      // index: licenses=IndexValue at top level, child descriptor also sets licenses=DescriptorValue
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            manifests: [
+              {
+                digest: "sha256:amd",
+                platform: { os: "linux", architecture: "amd64" },
+                annotations: { "org.opencontainers.image.licenses": "DescriptorValue" },
+              },
+            ],
+            annotations: { "org.opencontainers.image.licenses": "IndexValue" },
+          }),
+          { headers: { "content-type": "application/vnd.oci.image.index.v1+json" } },
+        ),
+      )
+      // child manifest: licenses=ManifestValue (should win)
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            annotations: { "org.opencontainers.image.licenses": "ManifestValue" },
+          }),
+          { headers: { "content-type": "application/vnd.oci.image.manifest.v1+json" } },
+        ),
+      );
+    const labels = await fetchImageLabels("ghcr.io", "owner/image", "sha256:index");
+    expect(labels?.["org.opencontainers.image.licenses"]).toBe("ManifestValue");
+  });
+
+  it("returns index annotations even when the index manifests array is empty", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            manifests: [],
+            annotations: { "org.opencontainers.image.licenses": "MIT" },
+          }),
+          { headers: { "content-type": "application/vnd.oci.image.index.v1+json" } },
+        ),
+      );
+    const labels = await fetchImageLabels("ghcr.io", "owner/image", "sha256:index");
+    expect(labels).toEqual({ "org.opencontainers.image.licenses": "MIT" });
+  });
+
+  it("returns index annotations when child manifest fetch fails", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      // index with license annotation
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            manifests: [
+              { digest: "sha256:amd", platform: { os: "linux", architecture: "amd64" } },
+            ],
+            annotations: { "org.opencontainers.image.licenses": "MIT" },
+          }),
+          { headers: { "content-type": "application/vnd.oci.image.index.v1+json" } },
+        ),
+      )
+      // child manifest fetch fails
+      .mockResolvedValueOnce(new Response(null, { status: 404 }));
+    const labels = await fetchImageLabels("ghcr.io", "owner/image", "sha256:index");
+    expect(labels).toEqual({ "org.opencontainers.image.licenses": "MIT" });
+  });
 });
 
 describe("imageExists", () => {
