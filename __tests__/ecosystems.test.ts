@@ -801,6 +801,133 @@ spec:
     expect(deps).toHaveLength(1);
     expect(deps[0].version).toBe("16-alpine");
   });
+
+  it("skips image when only the tag label changes but digest is unchanged (no-op relabel)", async () => {
+    const baseManifest = `
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.25@sha256:abc123
+`;
+    const headManifest = `
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.25.1@sha256:abc123
+`;
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["k8s/deploy.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(headManifest as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(baseManifest);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(0);
+  });
+
+  it("skips image when registry spelling changes but digest is the same", async () => {
+    const baseManifest = `
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: db
+          image: postgres@sha256:xyz456
+`;
+    const headManifest = `
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: db
+          image: docker.io/library/postgres@sha256:xyz456
+`;
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["k8s/deploy.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(headManifest as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(baseManifest);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(0);
+  });
+
+  it("flags image when the digest genuinely changes", async () => {
+    const baseManifest = `
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.25@sha256:abc123
+`;
+    const headManifest = `
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.26@sha256:def456
+`;
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["k8s/deploy.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(headManifest as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(baseManifest);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("docker.io/library/nginx");
+    expect(deps[0].version).toBe("1.26@sha256:def456");
+  });
+
+  it("flags tag-only image when the tag genuinely changes (different name:tag identity)", async () => {
+    const baseManifest = `
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: db
+          image: postgres:15
+`;
+    const headManifest = `
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: db
+          image: postgres:16
+`;
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["k8s/deploy.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(headManifest as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(baseManifest);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].version).toBe("16");
+  });
 });
 
 describe("kubernetes.getPublishDate", () => {

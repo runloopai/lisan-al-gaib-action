@@ -176,6 +176,13 @@ image references and age-gates images pinned with a `@sha256:` digest against th
 OCI registry API. Tag-only images (no digest) are reported as `unknown` — they are
 mutable and cannot be reliably age-gated.
 
+When image references change between base and HEAD (e.g. `nginx:1.25@sha256:X` →
+`nginx:1.25.1@sha256:X`), the action compares by **resolved identity** —
+`registry/repository@digest` for digest-pinned images — rather than the raw
+manifest string. A relabeled tag pointing at a digest that was already on the base
+branch is **skipped** (that image content was already vetted). Genuinely new
+digests are checked regardless of tag label.
+
 **The consuming repo must render charts to plain YAML before invoking the action.**
 For example, run `helm template` in an earlier CI step and either commit the output
 or pass it via `kubernetes-files`.

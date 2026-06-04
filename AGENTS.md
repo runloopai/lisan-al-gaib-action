@@ -39,7 +39,7 @@ src/
     bazel-module.ts    # Parse MODULE.bazel.lock for bazel_dep modules, handle overrides
     actions.ts         # Parse workflow YAML for uses: directives; resolve tag refs to commit SHAs to skip no-op ref changes; query GitHub API for publish dates
     multitool.ts       # Parse multitool.hub() lockfiles, diff HEAD vs base
-    kubernetes.ts      # Parse rendered k8s manifests for container images, query OCI registry
+    kubernetes.ts      # Parse rendered k8s manifests for container images; compare base-vs-HEAD by resolved identity (name@digest) to skip no-op relabels; query OCI registry
     image.ts           # Shared OCI image helpers: parseImageRef, makeName, makeVersion, getImagePublishDate
     docker.ts          # Parse Dockerfiles/Containerfiles for FROM/COPY/RUN base images, query OCI registry
 ```
