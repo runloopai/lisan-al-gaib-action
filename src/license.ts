@@ -1294,8 +1294,6 @@ export async function fetchImageLicense(
   return null;
 }
 
-
-
 /**
  * Fetch the license for a dependency based on its ecosystem.
  */
