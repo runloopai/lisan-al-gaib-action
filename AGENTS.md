@@ -34,12 +34,12 @@ src/
     types.ts           # Shared interfaces (ChangedDep, CheckResult, etc.)
     npm.ts             # Parse pnpm/npm/yarn/bun lockfiles via lockparse
     python.ts          # Parse uv.lock and pylock.toml via smol-toml
-    rust.ts            # Extract crate.spec() from MODULE.bazel, diff HEAD vs base
+    rust.ts            # Extract crate.spec() from MODULE.bazel, diff HEAD vs base; resolve ranges to concrete versions via MODULE.bazel.lock; skip if resolved version already on base
     java.ts            # Extract maven.install() from MODULE.bazel, diff lock JSON
     bazel-module.ts    # Parse MODULE.bazel.lock for bazel_dep modules, handle overrides
-    actions.ts         # Parse workflow YAML for uses: directives, query GitHub API
+    actions.ts         # Parse workflow YAML for uses: directives; resolve tag refs to commit SHAs to skip no-op ref changes; query GitHub API for publish dates
     multitool.ts       # Parse multitool.hub() lockfiles, diff HEAD vs base
-    kubernetes.ts      # Parse rendered k8s manifests for container images, query OCI registry
+    kubernetes.ts      # Parse rendered k8s manifests for container images; compare base-vs-HEAD by resolved identity (name@digest) to skip no-op relabels; query OCI registry
     image.ts           # Shared OCI image helpers: parseImageRef, makeName, makeVersion, getImagePublishDate
     docker.ts          # Parse Dockerfiles/Containerfiles for FROM/COPY/RUN base images, query OCI registry
 ```

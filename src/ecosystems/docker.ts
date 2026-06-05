@@ -9,6 +9,7 @@ import {
   parseImageRef,
   makeName,
   makeVersion,
+  imageIdentity,
   getImagePublishDate,
 } from "./image.js";
 
@@ -162,10 +163,12 @@ export async function getChangedDeps(
       ? parseDockerfileImages(baseContent)
       : [];
 
-    const baseRaws = new Set(baseCandidates.map((c) => c.raw));
+    // Compare by resolved identity (digest), not raw string: a no-op relabel of a
+    // digest-pinned image already on base must not be re-flagged.
+    const baseIdentities = new Set(baseCandidates.map((c) => imageIdentity(c.ref)));
 
     for (const candidate of headCandidates) {
-      if (baseRaws.has(candidate.raw)) continue; // unchanged
+      if (baseIdentities.has(imageIdentity(candidate.ref))) continue; // identity already on base
 
       const { raw, ref, source } = candidate;
 

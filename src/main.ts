@@ -283,7 +283,7 @@ async function run(): Promise<void> {
         break;
       }
       case "actions":
-        deps = await actions.getChangedDeps(baseRef, inputs.workflowFiles);
+        deps = await actions.getChangedDeps(baseRef, inputs.workflowFiles, inputs.githubToken);
         break;
       case "multitool":
         deps = await multitool.getChangedDeps(

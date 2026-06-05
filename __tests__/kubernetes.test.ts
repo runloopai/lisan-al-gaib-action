@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseImageRef } from "../src/ecosystems/image.js";
+import { parseImageRef, imageIdentity } from "../src/ecosystems/image.js";
 import { parseManifestImages } from "../src/ecosystems/kubernetes.js";
 
 describe("parseImageRef", () => {
@@ -283,5 +283,35 @@ spec:
     expect(awsRef.digest).toBe(
       "sha256:c6b9b4f15993749284f505e153c5b2af34dccb7b60b8b2174a63dba5926273a9",
     );
+  });
+});
+
+describe("imageIdentity", () => {
+  it("digest-pinned ref uses name@digest (tag is cosmetic)", () => {
+    const ref = parseImageRef("alpine:3.19@sha256:abcdef1234")!;
+    expect(imageIdentity(ref)).toBe("docker.io/library/alpine@sha256:abcdef1234");
+  });
+
+  it("tag-only ref uses name:tag", () => {
+    const ref = parseImageRef("nginx:1.25")!;
+    expect(imageIdentity(ref)).toBe("docker.io/library/nginx:1.25");
+  });
+
+  it("bare name (no tag, no digest) uses name:latest", () => {
+    const ref = parseImageRef("postgres")!;
+    expect(imageIdentity(ref)).toBe("docker.io/library/postgres:latest");
+  });
+
+  it("relabeled digest-pinned refs have the same identity regardless of tag change", () => {
+    const digest = "sha256:c6b9b4f15993749284f505e153c5b2af34dccb7b60b8b2174a63dba5926273a9";
+    const base = parseImageRef(`public.ecr.aws/aws-cli/aws-cli:2.34.56@${digest}`)!;
+    const head = parseImageRef(`public.ecr.aws/aws-cli/aws-cli:2.35.0@${digest}`)!;
+    expect(imageIdentity(base)).toBe(imageIdentity(head));
+  });
+
+  it("different digests have different identities even when tag is the same", () => {
+    const base = parseImageRef("alpine:3.18@sha256:aaa111")!;
+    const head = parseImageRef("alpine:3.18@sha256:bbb222")!;
+    expect(imageIdentity(base)).not.toBe(imageIdentity(head));
   });
 });

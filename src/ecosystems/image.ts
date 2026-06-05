@@ -124,6 +124,19 @@ export function makeVersion(ref: ParsedImageRef): string {
 }
 
 /**
+ * Resolved identity for base-vs-HEAD comparison: the concrete content a ref
+ * pins to, independent of cosmetic differences in the raw string.
+ * Digest-pinned images compare by `name@digest`, so a relabeled tag pointing at
+ * an already-vetted digest (or a registry-spelling change) is not re-flagged.
+ * Tag-only images compare by `name:tag` (the digest is unknown/mutable).
+ */
+export function imageIdentity(ref: ParsedImageRef): string {
+  return ref.digest
+    ? `${makeName(ref)}@${ref.digest}`
+    : `${makeName(ref)}:${ref.tag ?? "latest"}`;
+}
+
+/**
  * Get the publish date for an image reference.
  * Only digest-pinned (@sha256:...) refs are queried — tag-only refs are
  * mutable and cannot be reliably age-gated, so they return null (unknown).

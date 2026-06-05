@@ -88763,6 +88763,8 @@ async function python_getPublishDate(name, version, registries) {
 //# sourceMappingURL=python.js.map
 // EXTERNAL MODULE: external "node:fs/promises"
 var promises_ = __nccwpck_require__(1455);
+// EXTERNAL MODULE: ./node_modules/.pnpm/semver@7.7.4/node_modules/semver/index.js
+var semver = __nccwpck_require__(9419);
 // EXTERNAL MODULE: external "node:url"
 var external_node_url_ = __nccwpck_require__(3136);
 // EXTERNAL MODULE: ./node_modules/.pnpm/web-tree-sitter@0.24.7/node_modules/web-tree-sitter/tree-sitter.js
@@ -89078,8 +89080,90 @@ async function extractMultitoolHubs(content, workspaceRoot) {
 
 
 
+
 function specKey(s) {
     return `${s.package}@${s.version}`;
+}
+/**
+ * Build a map of crate name → resolved exact versions from MODULE.bazel.lock.
+ * Reads the crate_universe extension's generatedRepoSpecs and extracts the
+ * version from each crate's static.crates.io download URL.
+ */
+function parseCrateLockVersions(content) {
+    const result = new Map();
+    try {
+        const data = JSON.parse(content);
+        const moduleExtensions = data?.moduleExtensions;
+        if (!moduleExtensions || typeof moduleExtensions !== "object")
+            return result;
+        // Match the crate_universe extension key regardless of the +/~ canonical separator
+        // or the exact rules_rust module name (robust to forks and Bazel version changes).
+        const extKey = Object.keys(moduleExtensions).find((k) => /crate_universe[^%]*%crate$/.test(k));
+        if (!extKey)
+            return result;
+        const ext = moduleExtensions[extKey];
+        // Collect all eval results — crate_universe always uses "general" but handle
+        // future platform-split locks by iterating all sub-keys.
+        const evalResults = ext?.general
+            ? [ext.general]
+            : Object.values(ext ?? {});
+        for (const evalResult of evalResults) {
+            const repoSpecs = evalResult?.generatedRepoSpecs;
+            if (!repoSpecs || typeof repoSpecs !== "object")
+                continue;
+            for (const spec of Object.values(repoSpecs)) {
+                const urls = spec?.attributes;
+                const urlList = urls?.urls;
+                if (!Array.isArray(urlList) || urlList.length === 0)
+                    continue;
+                const url = urlList[0];
+                if (typeof url !== "string")
+                    continue;
+                // URL: https://static.crates.io/crates/<name>/<version>/download
+                // Using the URL (not the repo key) avoids the hyphen-in-name ambiguity.
+                const m = url.match(/\/crates\/([^/]+)\/([^/]+)\/download/);
+                if (!m)
+                    continue;
+                const [, name, version] = m;
+                const arr = result.get(name) ?? [];
+                arr.push(version);
+                result.set(name, arr);
+            }
+        }
+    }
+    catch (e) {
+        core.debug(`rust: failed to parse MODULE.bazel.lock for crate versions: ${e}`);
+    }
+    return result;
+}
+/**
+ * Convert a Cargo version requirement to a form npm's semver package understands.
+ * Key differences handled:
+ * - Cargo uses ',' as an AND separator; npm semver uses a space.
+ * - A bare version ("1.2.3" with no operator) means caret (^) in Cargo but exact in npm semver.
+ */
+function cargoReqToNpmRange(req) {
+    // Replace Cargo AND separator
+    let r = req.replace(/,/g, " ").trim();
+    // Bare single-term numeric req (no operator, no wildcard) → treat as caret (Cargo semantics)
+    if (/^\d[^\s]*$/.test(r) && !r.includes("*") && !r.includes("x")) {
+        r = "^" + r;
+    }
+    return r;
+}
+/**
+ * Resolve a crate.spec range to the concrete version pinned in MODULE.bazel.lock.
+ * Falls back to the raw range on any resolution failure so that the version is
+ * never incorrectly changed (worst-case: registry lookup returns null → "unknown",
+ * same as before this fix).
+ */
+function resolveCrateVersion(name, range, lockVersions) {
+    const versions = lockVersions.get(name);
+    if (!versions || versions.length === 0)
+        return range;
+    const npmRange = cargoReqToNpmRange(range);
+    const best = semver.maxSatisfying(versions, npmRange, { loose: true });
+    return best ?? range;
 }
 async function rust_getChangedDeps(baseRef, moduleBazelPath) {
     const moduleFiles = await resolveModuleFiles(moduleBazelPath);
@@ -89093,6 +89177,20 @@ async function rust_getChangedDeps(baseRef, moduleBazelPath) {
         core.info("rust: no MODULE.bazel files changed");
         return [];
     }
+    // Resolve crate.spec ranges to concrete versions using MODULE.bazel.lock at the workspace root.
+    const lockPath = moduleBazelPath + ".lock";
+    let lockVersions = new Map();
+    try {
+        const lockContent = await promises_.readFile(lockPath, "utf8");
+        lockVersions = parseCrateLockVersions(lockContent);
+    }
+    catch {
+        core.debug(`rust: could not read MODULE.bazel.lock at ${lockPath}; version ranges will not be resolved`);
+    }
+    // Parse the base lockfile to skip crates whose resolved version was already on the base branch.
+    // This prevents false positives when a no-op range edit (e.g. ^0.13.5 → ~0.13.5) resolves to
+    // the same concrete version as before — the version was already vetted and shouldn't be re-checked.
+    const baseLockVersions = parseCrateLockVersions((await gitShowFile(baseRef, lockPath)) ?? "");
     const allDeps = [];
     for (const file of relevantFiles) {
         // Parse HEAD version
@@ -89114,10 +89212,15 @@ async function rust_getChangedDeps(baseRef, moduleBazelPath) {
                 continue;
             if (baseKeys.has(specKey(spec)))
                 continue;
+            const resolved = resolveCrateVersion(spec.package, spec.version, lockVersions);
+            // Skip if this exact concrete version was already present in the base lockfile —
+            // the PR didn't introduce it, so re-checking its age would be a false positive.
+            if (baseLockVersions.get(spec.package)?.includes(resolved))
+                continue;
             allDeps.push({
                 ecosystem: "rust",
                 name: spec.package,
-                version: spec.version,
+                version: resolved,
                 file,
             });
         }
@@ -89312,8 +89415,45 @@ async function bazel_module_getChangedDeps(baseRef, moduleBazelPath) {
 
 const SHA_RE = /^[0-9a-f]{40}$/;
 const branchSkipLogged = new Set();
+// Cache ref → resolved commit SHA (null = resolution failed / branch). Shared across files in a run.
+const refShaCache = new Map();
+// Exported for test isolation only — clears module-level caches between test cases.
+function __resetCaches() {
+    refShaCache.clear();
+    branchSkipLogged.clear();
+}
 function isCommitSha(ref) {
     return SHA_RE.test(ref);
+}
+/**
+ * Resolve a ref (SHA, tag, or branch) to its underlying commit SHA via the GitHub API.
+ * Returns the SHA, or null if resolution fails (unauthenticated, private repo, branch, error).
+ * Caches results to avoid redundant API calls within a run.
+ */
+async function resolveRefToSha(owner, repo, ref, headers) {
+    const cacheKey = `${owner}/${repo}@${ref}`;
+    const cached = refShaCache.get(cacheKey);
+    if (cached !== undefined)
+        return cached;
+    if (isCommitSha(ref)) {
+        refShaCache.set(cacheKey, ref);
+        return ref;
+    }
+    try {
+        const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${ref}`, { headers });
+        if (!resp.ok) {
+            refShaCache.set(cacheKey, null);
+            return null;
+        }
+        const data = (await resp.json());
+        const sha = typeof data?.sha === "string" ? data.sha : null;
+        refShaCache.set(cacheKey, sha);
+        return sha;
+    }
+    catch {
+        refShaCache.set(cacheKey, null);
+        return null;
+    }
 }
 /**
  * Parse `uses:` directives from a workflow or composite action YAML file.
@@ -89357,7 +89497,7 @@ const DEFAULT_WORKFLOW_GLOBS = [
     "action.yml",
     "action.yaml",
 ];
-async function actions_getChangedDeps(baseRef, workflowFilesInput) {
+async function actions_getChangedDeps(baseRef, workflowFilesInput, token = "") {
     let files;
     if (workflowFilesInput) {
         const allFiles = new Set(await resolveFiles(workflowFilesInput));
@@ -89385,6 +89525,14 @@ async function actions_getChangedDeps(baseRef, workflowFilesInput) {
         core.info("actions: no changed workflow files");
         return [];
     }
+    const headers = {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "lisan-al-gaib-action",
+        "X-GitHub-Api-Version": "2022-11-28",
+    };
+    if (token) {
+        headers.Authorization = `Bearer ${token}`;
+    }
     const allDeps = [];
     for (const file of files) {
         const diff = await gitDiff(baseRef, file);
@@ -89401,16 +89549,41 @@ async function actions_getChangedDeps(baseRef, workflowFilesInput) {
         const baseContent = await gitShowFile(baseRef, file);
         const headRefs = parseActionRefs(headContent);
         const baseRefs = baseContent ? parseActionRefs(baseContent) : new Map();
+        // Group base refs by action name so we can compare commit SHAs when the ref string changes.
+        const baseByName = new Map();
+        for (const bRef of baseRefs.values()) {
+            const n = `${bRef.owner}/${bRef.repo}${bRef.path ? "/" + bRef.path : ""}`;
+            const arr = baseByName.get(n) ?? [];
+            arr.push(bRef);
+            baseByName.set(n, arr);
+        }
         for (const [key, ref] of headRefs) {
-            // Skip if unchanged from base
+            // Skip if the exact ref string is unchanged from base
             if (baseRefs.has(key))
                 continue;
-            // Skip branch-based refs (not a SHA and not likely a tag)
-            // We'll determine this more precisely during publish date lookup
-            // For now, include all non-branch refs; the registry query will skip branches
+            const name = `${ref.owner}/${ref.repo}${ref.path ? "/" + ref.path : ""}`;
+            const sameNameBase = baseByName.get(name);
+            if (sameNameBase) {
+                // Base had this action with a different ref string — resolve both sides to commit SHAs.
+                // If the underlying commit is unchanged, the PR didn't actually change the action's code,
+                // so skip it. If resolution fails for either side, flag conservatively (never skip on doubt).
+                const headSha = await resolveRefToSha(ref.owner, ref.repo, ref.ref, headers);
+                if (headSha !== null) {
+                    let sameCommit = false;
+                    for (const bRef of sameNameBase) {
+                        const baseSha = await resolveRefToSha(bRef.owner, bRef.repo, bRef.ref, headers);
+                        if (baseSha === headSha) {
+                            sameCommit = true;
+                            break;
+                        }
+                    }
+                    if (sameCommit)
+                        continue;
+                }
+            }
             allDeps.push({
                 ecosystem: "actions",
-                name: `${ref.owner}/${ref.repo}${ref.path ? "/" + ref.path : ""}`,
+                name,
                 version: ref.ref,
                 file,
             });
@@ -89618,6 +89791,18 @@ function makeVersion(ref) {
     return "latest";
 }
 /**
+ * Resolved identity for base-vs-HEAD comparison: the concrete content a ref
+ * pins to, independent of cosmetic differences in the raw string.
+ * Digest-pinned images compare by `name@digest`, so a relabeled tag pointing at
+ * an already-vetted digest (or a registry-spelling change) is not re-flagged.
+ * Tag-only images compare by `name:tag` (the digest is unknown/mutable).
+ */
+function imageIdentity(ref) {
+    return ref.digest
+        ? `${makeName(ref)}@${ref.digest}`
+        : `${makeName(ref)}:${ref.tag ?? "latest"}`;
+}
+/**
  * Get the publish date for an image reference.
  * Only digest-pinned (@sha256:...) refs are queried — tag-only refs are
  * mutable and cannot be reliably age-gated, so they return null (unknown).
@@ -89780,10 +89965,12 @@ async function docker_getChangedDeps(baseRef, dockerfilesInput, dockerhubMirror)
         const baseCandidates = baseContent
             ? parseDockerfileImages(baseContent)
             : [];
-        const baseRaws = new Set(baseCandidates.map((c) => c.raw));
+        // Compare by resolved identity (digest), not raw string: a no-op relabel of a
+        // digest-pinned image already on base must not be re-flagged.
+        const baseIdentities = new Set(baseCandidates.map((c) => imageIdentity(c.ref)));
         for (const candidate of headCandidates) {
-            if (baseRaws.has(candidate.raw))
-                continue; // unchanged
+            if (baseIdentities.has(imageIdentity(candidate.ref)))
+                continue; // identity already on base
             const { raw, ref, source } = candidate;
             // For COPY --from and RUN --mount=from, require positive confirmation that
             // the image exists before treating it as a real external image dependency.
@@ -90016,9 +90203,16 @@ async function kubernetes_getChangedDeps(baseRef, kubernetesFilesInput) {
         // No imageExists gate here: k8s manifest `image:` fields are unambiguous real
         // image references (unlike docker COPY --from which can be a build-context alias).
         // parseImageRef already drops invalid names (placeholders, uppercase, etc.).
-        for (const [rawImage, ref] of headRefs) {
-            if (baseRefs.has(rawImage))
-                continue; // unchanged
+        //
+        // Compare by resolved identity (digest), not the raw manifest string: a
+        // no-op relabel of an image whose digest is already on base must not be
+        // re-flagged, since that exact content was already vetted on the base branch.
+        const baseIdentities = new Set();
+        for (const bRef of baseRefs.values())
+            baseIdentities.add(imageIdentity(bRef));
+        for (const ref of headRefs.values()) {
+            if (baseIdentities.has(imageIdentity(ref)))
+                continue; // identity already on base
             const name = makeName(ref);
             const version = makeVersion(ref);
             imageRefs.set(`${name}@${version}`, ref);
@@ -90041,8 +90235,6 @@ async function kubernetes_getPublishDate(ref) {
     return getImagePublishDate(ref, "kubernetes");
 }
 //# sourceMappingURL=kubernetes.js.map
-// EXTERNAL MODULE: ./node_modules/.pnpm/semver@7.7.4/node_modules/semver/index.js
-var semver = __nccwpck_require__(9419);
 ;// CONCATENATED MODULE: ./out/report.js
 
 
@@ -95794,7 +95986,7 @@ async function run() {
                 break;
             }
             case "actions":
-                deps = await actions_getChangedDeps(baseRef, inputs.workflowFiles);
+                deps = await actions_getChangedDeps(baseRef, inputs.workflowFiles, inputs.githubToken);
                 break;
             case "multitool":
                 deps = await multitool_getChangedDeps(baseRef, inputs.moduleBazel);
