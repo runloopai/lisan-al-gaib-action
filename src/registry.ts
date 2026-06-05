@@ -247,3 +247,337 @@ export async function archiveDate(url: string): Promise<Date | null> {
     return null;
   }
 }
+
+// ─── OCI / Container Registry ────────────────────────────────────────────────
+
+const OCI_INDEX_MEDIA_TYPES = new Set([
+  "application/vnd.oci.image.index.v1+json",
+  "application/vnd.docker.distribution.manifest.list.v2+json",
+]);
+
+const MANIFEST_ACCEPT = [
+  "application/vnd.oci.image.index.v1+json",
+  "application/vnd.docker.distribution.manifest.list.v2+json",
+  "application/vnd.oci.image.manifest.v1+json",
+  "application/vnd.docker.distribution.manifest.v2+json",
+].join(", ");
+
+/**
+ * Obtain an anonymous OCI bearer token for the given registry and repository
+ * using the WWW-Authenticate challenge flow. Returns null if the registry
+ * allows unauthenticated access (HTTP 200 on /v2/) or if authentication
+ * fails (private registry).
+ */
+async function getOciToken(
+  host: string,
+  repository: string,
+): Promise<string | null> {
+  try {
+    const pingResp = await fetch(`https://${host}/v2/`, {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    if (pingResp.status === 200) return null; // no auth needed
+    if (pingResp.status !== 401) return null; // private or unreachable
+
+    const wwwAuth = pingResp.headers.get("www-authenticate") ?? "";
+    const realmMatch = wwwAuth.match(/realm="([^"]+)"/);
+    if (!realmMatch) return null;
+    const realm = realmMatch[1];
+
+    const serviceMatch = wwwAuth.match(/service="([^"]+)"/);
+    const service = serviceMatch ? serviceMatch[1] : "";
+
+    const tokenUrl =
+      `${realm}?service=${encodeURIComponent(service)}` +
+      `&scope=${encodeURIComponent(`repository:${repository}:pull`)}`;
+
+    const data = (await fetchJson(tokenUrl)) as
+      | { token?: string; access_token?: string }
+      | null;
+    return data?.token ?? data?.access_token ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchOciManifest(
+  host: string,
+  repository: string,
+  reference: string,
+  token: string | null,
+): Promise<{ contentType: string; body: unknown; lastModified: string | null } | null> {
+  const headers: Record<string, string> = { Accept: MANIFEST_ACCEPT };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  try {
+    const resp = await fetch(
+      `https://${host}/v2/${repository}/manifests/${reference}`,
+      { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
+    );
+    if (!resp.ok) return null;
+    const contentType = resp.headers.get("content-type") ?? "";
+    const lastModified = resp.headers.get("last-modified");
+    const body = (await resp.json()) as unknown;
+    return { contentType, body, lastModified };
+  } catch {
+    return null;
+  }
+}
+
+function parseLastModified(value: string | null | undefined): Date | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (isNaN(date.getTime()) || date.getFullYear() < 2000) return null;
+  return date;
+}
+
+/**
+ * Docker Hub Hub API: returns the tag_last_pushed timestamp for a tag — the
+ * actual time the image was pushed to Docker Hub, not the build time.
+ * repository is already normalized to "library/<name>" or "user/repo" form.
+ */
+async function dockerHubPushDate(
+  repository: string,
+  tag: string,
+): Promise<Date | null> {
+  const [namespace, ...rest] = repository.split("/");
+  const repoName = rest.join("/");
+  const url =
+    `https://hub.docker.com/v2/repositories/${namespace}/${repoName}/tags` +
+    `?name=${encodeURIComponent(tag)}&page_size=25`;
+  const data = (await fetchJson(url)) as {
+    results?: Array<{ name: string; tag_last_pushed?: string }>;
+  } | null;
+  const result = data?.results?.find((r) => r.name === tag);
+  return parseLastModified(result?.tag_last_pushed ?? null);
+}
+
+
+/**
+ * Fetch the push timestamp for a container image via registry-specific APIs
+ * and the OCI Distribution v2 protocol.
+ *
+ * For Docker Hub images with a known tag, queries the Hub API for
+ * `tag_last_pushed` (the actual push timestamp). For all other registries,
+ * or as a fallback, reads the `Last-Modified` HTTP header from the manifest
+ * GET response — the time the registry stored that content-addressed manifest,
+ * which is the push time (best-effort; not guaranteed by the OCI Distribution
+ * spec).
+ *
+ * Returns null for private registries (anonymous auth rejected), unreachable
+ * registries, or registries that do not expose a push timestamp.
+ */
+export async function fetchImagePublishDate(
+  registry: string,
+  repository: string,
+  digest: string,
+  tag: string | null = null,
+): Promise<Date | null> {
+  const host =
+    registry === "docker.io" || registry === "index.docker.io"
+      ? "registry-1.docker.io"
+      : registry;
+
+  try {
+    // Docker Hub exposes tag_last_pushed via the Hub web API — the real push time
+    if ((registry === "docker.io" || registry === "index.docker.io") && tag) {
+      const date = await dockerHubPushDate(repository, tag);
+      if (date) return date;
+    }
+
+    // Universal fallback: Last-Modified on the manifest response = push time
+    const token = await getOciToken(host, repository);
+
+    const manifest = await fetchOciManifest(host, repository, digest, token);
+    if (!manifest) return null;
+
+    const mediaType = manifest.contentType.split(";")[0].trim();
+
+    if (OCI_INDEX_MEDIA_TYPES.has(mediaType)) {
+      // Multi-arch index: drill into preferred child and use its Last-Modified
+      const index = manifest.body as {
+        manifests?: Array<{
+          digest: string;
+          platform?: { os?: string; architecture?: string };
+        }>;
+      };
+      if (!index.manifests?.length) return null;
+
+      const child =
+        index.manifests.find(
+          (m) =>
+            m.platform?.os === "linux" &&
+            m.platform?.architecture === "amd64",
+        ) ?? index.manifests[0];
+
+      const childManifest = await fetchOciManifest(
+        host,
+        repository,
+        child.digest,
+        token,
+      );
+      if (!childManifest) return null;
+      return parseLastModified(childManifest.lastModified);
+    }
+
+    return parseLastModified(manifest.lastModified);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchOciBlobJson(
+  host: string,
+  repository: string,
+  digest: string,
+  token: string | null,
+): Promise<unknown | null> {
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  try {
+    const resp = await fetch(
+      `https://${host}/v2/${repository}/blobs/${digest}`,
+      { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
+    );
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch metadata labels for a container image, merging OCI manifest annotations
+ * and config-blob Labels. Sources (lowest → highest precedence):
+ *   1. index-level annotations (when top manifest is a multi-arch image index)
+ *   2. chosen child-descriptor annotations (per-platform entry in the index)
+ *   3. resolved image manifest top-level annotations
+ *   4. config-blob config.Labels
+ * Returns the merged map if any key is present, or null on total failure.
+ * Works anonymously on public registries; private registries → null.
+ */
+export async function fetchImageLabels(
+  registry: string,
+  repository: string,
+  reference: string,
+): Promise<Record<string, string> | null> {
+  const host =
+    registry === "docker.io" || registry === "index.docker.io"
+      ? "registry-1.docker.io"
+      : registry;
+  try {
+    const token = await getOciToken(host, repository);
+    let manifest = await fetchOciManifest(host, repository, reference, token);
+    if (!manifest) return null;
+
+    const merged: Record<string, string> = {};
+
+    const mediaType = manifest.contentType.split(";")[0].trim();
+    if (OCI_INDEX_MEDIA_TYPES.has(mediaType)) {
+      const index = manifest.body as {
+        manifests?: Array<{
+          digest: string;
+          annotations?: Record<string, string>;
+          platform?: { os?: string; architecture?: string };
+        }>;
+        annotations?: Record<string, string>;
+      };
+      // 1. index-level annotations
+      Object.assign(merged, index.annotations ?? {});
+
+      if (!index.manifests?.length) return Object.keys(merged).length ? merged : null;
+
+      const child =
+        index.manifests.find(
+          (m) =>
+            m.platform?.os === "linux" &&
+            m.platform?.architecture === "amd64",
+        ) ?? index.manifests[0];
+
+      // 2. child-descriptor annotations
+      Object.assign(merged, child.annotations ?? {});
+
+      manifest = await fetchOciManifest(host, repository, child.digest, token);
+      if (!manifest) return Object.keys(merged).length ? merged : null;
+    }
+
+    // 3. image manifest annotations
+    const manifestBody = manifest.body as {
+      config?: { digest?: string };
+      annotations?: Record<string, string>;
+    };
+    Object.assign(merged, manifestBody.annotations ?? {});
+
+    // 4. config-blob Labels (highest precedence — overrides annotations on conflict)
+    const configDigest = manifestBody.config?.digest;
+    if (configDigest) {
+      const config = await fetchOciBlobJson(host, repository, configDigest, token);
+      const cfg = config as { config?: { Labels?: Record<string, string> } } | null;
+      Object.assign(merged, cfg?.config?.Labels ?? {});
+    }
+
+    return Object.keys(merged).length ? merged : null;
+  } catch {
+    return null;
+  }
+}
+
+async function imageExistsOnHost(
+  host: string,
+  repository: string,
+  reference: string,
+): Promise<"found" | "notfound" | "unknown"> {
+  try {
+    const token = await getOciToken(host, repository);
+    const headers: Record<string, string> = { Accept: MANIFEST_ACCEPT };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const resp = await fetch(
+      `https://${host}/v2/${repository}/manifests/${reference}`,
+      { method: "HEAD", headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
+    );
+    if (resp.status === 200) return "found";
+    if (resp.status === 404) return "notfound";
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Check whether a manifest reference exists in an OCI registry without
+ * downloading its content. Uses a HEAD request per the OCI Distribution v2
+ * spec.
+ *
+ * Returns:
+ *   "found"    — HTTP 200 (manifest exists and is publicly accessible)
+ *   "notfound" — HTTP 404 (reference does not exist in the registry)
+ *   "unknown"  — any other status (401 private, 429 rate-limit, network
+ *                error, or thrown exception) — caller should not treat the
+ *                reference as either present or absent
+ *
+ * When `dockerhubMirror` is set and the primary check against Docker Hub
+ * returns "unknown" (e.g. rate-limited), the mirror is tried as a fallback.
+ * This lets CI environments that configure a Docker Hub mirror (e.g.
+ * mirror.gcr.io) resolve ambiguous COPY --from / RUN --mount=from references
+ * even when the primary registry is throttling anonymous requests.
+ */
+export async function imageExists(
+  registry: string,
+  repository: string,
+  reference: string,
+  dockerhubMirror?: string,
+): Promise<"found" | "notfound" | "unknown"> {
+  const host =
+    registry === "docker.io" || registry === "index.docker.io"
+      ? "registry-1.docker.io"
+      : registry;
+  const result = await imageExistsOnHost(host, repository, reference);
+  if (
+    result === "unknown" &&
+    (registry === "docker.io" || registry === "index.docker.io") &&
+    dockerhubMirror
+  ) {
+    return imageExistsOnHost(dockerhubMirror, repository, reference);
+  }
+  return result;
+}

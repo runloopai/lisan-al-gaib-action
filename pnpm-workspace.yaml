@@ -1,1 +1,5 @@
-minimumReleaseAge: 20160  # 14 days
+allowBuilds:
+  esbuild: true
+  tree-sitter-python: true
+  tree-sitter-starlark: true
+minimumReleaseAge: 20160 # 14 days

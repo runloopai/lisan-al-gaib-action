@@ -14,7 +14,8 @@ import yaml from "js-yaml";
 import spdxLicenseTexts from "./spdx-license-texts.json" with { type: "json" };
 import tar from "tar-stream";
 import type { RegistryUrls, LicenseOverrides } from "./inputs.js";
-import type { CheckResult } from "./ecosystems/types.js";
+import type { CheckResult, ParsedImageRef } from "./ecosystems/types.js";
+import { fetchImageLabels } from "./registry.js";
 
 /** Quote a string for YAML if needed, using js-yaml's serializer. */
 function yamlQuote(s: string): string {
@@ -1261,6 +1262,39 @@ async function fetchMultitoolLicense(
 }
 
 /**
+ * Fetch the license for a container image via OCI config-blob labels.
+ * Reads org.opencontainers.image.licenses; falls back to org.opencontainers.image.source
+ * pointing at a GitHub repo. Returns null if neither is present or accessible.
+ */
+export async function fetchImageLicense(
+  ref: ParsedImageRef,
+  githubToken: string = "",
+  licenseHeuristics: boolean = true,
+): Promise<string | null> {
+  // Unlike the age-gate (which skips tag-only refs as mutable), licenses are
+  // content-descriptive and rarely change, so we query by tag when digest is absent.
+  const reference = ref.digest ?? ref.tag ?? "latest";
+  const labels = await fetchImageLabels(ref.registry, ref.repository, reference);
+  if (!labels) return null;
+
+  const declared = labels["org.opencontainers.image.licenses"];
+  if (declared?.trim()) return declared.trim();
+
+  const source = labels["org.opencontainers.image.source"];
+  if (source) {
+    const ghMatch = source.match(/github\.com\/([^/]+\/[^/]+)/);
+    if (ghMatch) {
+      return fetchGitHubRepoLicense(
+        ghMatch[1].replace(/\.git$/, ""),
+        githubToken,
+        licenseHeuristics,
+      );
+    }
+  }
+  return null;
+}
+
+/**
  * Fetch the license for a dependency based on its ecosystem.
  */
 export async function fetchLicense(
@@ -1270,6 +1304,8 @@ export async function fetchLicense(
   githubToken: string,
   bcrUrl: string,
   licenseHeuristics: boolean = true,
+  kubernetesImageRefs: Map<string, ParsedImageRef> = new Map(),
+  dockerImageRefs: Map<string, ParsedImageRef> = new Map(),
 ): Promise<string | null> {
   switch (dep.ecosystem) {
     case "npm":
@@ -1293,6 +1329,14 @@ export async function fetchLicense(
       return fetchBcrLicense(dep.name, dep.version, bcrUrl, githubToken, licenseHeuristics);
     case "multitool":
       return fetchMultitoolLicense(dep.version, githubToken, licenseHeuristics);
+    case "kubernetes": {
+      const ref = kubernetesImageRefs.get(`${dep.name}@${dep.version}`);
+      return ref ? fetchImageLicense(ref, githubToken, licenseHeuristics) : null;
+    }
+    case "docker": {
+      const ref = dockerImageRefs.get(`${dep.name}@${dep.version}`);
+      return ref ? fetchImageLicense(ref, githubToken, licenseHeuristics) : null;
+    }
     default:
       return null;
   }
@@ -1310,6 +1354,8 @@ export async function checkLicenses(
   bcrUrl: string,
   overrides?: LicenseOverrides,
   licenseHeuristics: boolean = true,
+  kubernetesImageRefs: Map<string, ParsedImageRef> = new Map(),
+  dockerImageRefs: Map<string, ParsedImageRef> = new Map(),
 ): Promise<LicenseResult[]> {
   // Cache: "ecosystem:name@version" → raw license string | null
   const licenseCache = new Map<string, string | null>();
@@ -1337,7 +1383,7 @@ export async function checkLicenses(
   for (let i = 0; i < toFetch.length; i += 10) {
     const batch = toFetch.slice(i, i + 10);
     const settled = await Promise.allSettled(
-      batch.map(({ dep }) => fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics)),
+      batch.map(({ dep }) => fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics, kubernetesImageRefs, dockerImageRefs)),
     );
     batch.forEach(({ cacheKey }, idx) => {
       const result = settled[idx];

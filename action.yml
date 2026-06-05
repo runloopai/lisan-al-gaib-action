@@ -2,11 +2,13 @@ name: Lisan al-Gaib
 description: >
   Supply-chain security gate that fails if newly added/updated packages were
   published less than a configurable number of days ago. Supports npm/pnpm/yarn/bun,
-  Python (uv), Rust (Bazel crate.spec), and Java (Bazel maven_install).
+  Python (uv), Rust (Bazel crate.spec), Java (Bazel maven_install), GitHub Actions,
+  Bazel modules, multitool binaries, container images in Kubernetes manifests, and
+  Dockerfile/Containerfile base images.
 
 inputs:
   ecosystems:
-    description: Comma-separated list of ecosystems to check (npm, python, rust, java, bazel, actions, multitool)
+    description: Comma-separated list of ecosystems to check (npm, python, rust, java, bazel, actions, multitool, kubernetes, docker)
     required: true
   min-age-days:
     description: Minimum number of days since publication to pass
@@ -49,6 +51,40 @@ inputs:
       Newline-separated glob patterns for GitHub Actions workflow files.
       If empty, auto-detects changed files from .github/workflows/*.yml,
       .github/workflows/*.yaml, action.yml, and action.yaml.
+    required: false
+    default: ""
+  kubernetes-files:
+    description: >
+      Newline-separated glob patterns for rendered Kubernetes manifest files
+      (used by the kubernetes ecosystem). The consuming repo is responsible for
+      rendering Helm charts or other templating tools to plain YAML manifests
+      before invoking this action. Only @sha256-digest-pinned images are
+      age-gated; tag-only images and images on private registries report
+      unknown. If empty, auto-detects changed .yaml/.yml files that contain
+      workload manifests (Deployment, StatefulSet, DaemonSet, Job, etc.).
+    required: false
+    default: ""
+  dockerfiles:
+    description: >
+      Newline-separated glob patterns for Dockerfiles/Containerfiles to scan
+      (e.g. '**/Dockerfile').
+      When empty, changed files whose basename is exactly "Dockerfile" or
+      "Containerfile" (case-insensitive) are auto-detected.
+      Only digest-pinned images (FROM ...@sha256:...) are age-gated;
+      tag-only images appear as unknown.
+    required: false
+    default: ""
+  dockerhub-mirror:
+    description: >
+      Docker Hub mirror hostname to use as a fallback when the primary Docker
+      Hub registry returns an ambiguous response (e.g. HTTP 429 rate-limit)
+      while checking whether a COPY --from or RUN --mount=from value is a real
+      image. When set, a "unknown" result from registry-1.docker.io is retried
+      against this mirror before deciding whether to emit the reference as a
+      dependency. Example: mirror.gcr.io. The mirror must serve images under
+      the same repository path as Docker Hub (including the library/ prefix for
+      official images); mirrors that rewrite paths may incorrectly report
+      official images as not found.
     required: false
     default: ""
   github-token:

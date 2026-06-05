@@ -55,3 +55,11 @@ export interface MultitoolBinary {
 export interface MultitoolEntry {
   binaries: MultitoolBinary[];
 }
+
+export interface ParsedImageRef {
+  raw: string;
+  registry: string;
+  repository: string;
+  tag: string | null;
+  digest: string | null;
+}

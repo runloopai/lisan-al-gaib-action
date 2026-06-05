@@ -42,6 +42,8 @@ vi.mock("../src/registry.js", () => ({
   cratesPublishDate: vi.fn(),
   npmPublishDate: vi.fn(),
   pypiPublishDate: vi.fn(),
+  fetchImagePublishDate: vi.fn(),
+  imageExists: vi.fn(),
 }));
 
 import * as fs from "node:fs/promises";
@@ -466,5 +468,364 @@ describe("actions.getPublishDate", () => {
     const actions = await import("../src/ecosystems/actions.js");
     const date = await actions.getPublishDate("actions/checkout", "v4", "");
     expect(date).toEqual(new Date("2024-03-01T00:00:00Z"));
+  });
+});
+
+// ─── kubernetes ecosystem ────────────────────────────────────────────────────
+
+describe("kubernetes.getChangedDeps", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("auto-detects changed YAML manifests and returns new images", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["k8s/deploy.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("some diff");
+    vi.mocked(fs.readFile).mockResolvedValue(`
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.25@sha256:abc123
+` as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps, imageRefs } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("docker.io/library/nginx");
+    expect(deps[0].version).toBe("1.25@sha256:abc123");
+    expect(imageRefs.size).toBe(1);
+    expect(imageRefs.has("docker.io/library/nginx@1.25@sha256:abc123")).toBe(true);
+  });
+
+  it("skips images present in both HEAD and base (unchanged)", async () => {
+    const manifest = `
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.25@sha256:abc123
+`;
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["k8s/deploy.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(manifest as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(manifest);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(0);
+  });
+
+  it("skips non-manifest YAML files (no containers)", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["config.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(`
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-config
+data:
+  key: value
+` as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(0);
+  });
+
+  it("returns empty when no YAML files changed", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["src/main.ts"]);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(0);
+  });
+
+  it("uses provided kubernetes-files input", async () => {
+    vi.mocked(diff.resolveFiles).mockResolvedValue(["rendered/manifests.yaml"]);
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["rendered/manifests.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(`
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: public.ecr.aws/aws-cli/aws-cli:2.34.56@sha256:c6b9b4f1
+` as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "rendered/manifests.yaml");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("public.ecr.aws/aws-cli/aws-cli");
+  });
+
+  it("includes tag-only images as deps with version equal to tag", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["k8s/deploy.yaml"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(`
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: db
+          image: postgres:16-alpine
+` as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const { deps } = await kubernetes.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].version).toBe("16-alpine");
+  });
+});
+
+describe("kubernetes.getPublishDate", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("returns null for tag-only ref without calling fetchImagePublishDate", async () => {
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const date = await kubernetes.getPublishDate({
+      raw: "nginx:1.25",
+      registry: "docker.io",
+      repository: "library/nginx",
+      tag: "1.25",
+      digest: null,
+    });
+    expect(date).toBeNull();
+    expect(vi.mocked(registry.fetchImagePublishDate)).not.toHaveBeenCalled();
+  });
+
+  it("delegates to fetchImagePublishDate for digest-pinned refs", async () => {
+    vi.mocked(registry.fetchImagePublishDate).mockResolvedValueOnce(
+      new Date("2024-03-01T00:00:00Z"),
+    );
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const date = await kubernetes.getPublishDate({
+      raw: "alpine/psql@sha256:5e2b",
+      registry: "docker.io",
+      repository: "alpine/psql",
+      tag: null,
+      digest: "sha256:5e2b",
+    });
+    expect(date).toEqual(new Date("2024-03-01T00:00:00Z"));
+    expect(vi.mocked(registry.fetchImagePublishDate)).toHaveBeenCalledWith(
+      "docker.io",
+      "alpine/psql",
+      "sha256:5e2b",
+      null,
+    );
+  });
+
+  it("passes tag to fetchImagePublishDate when both tag and digest present", async () => {
+    vi.mocked(registry.fetchImagePublishDate).mockResolvedValueOnce(
+      new Date("2024-05-01T00:00:00Z"),
+    );
+
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    await kubernetes.getPublishDate({
+      raw: "public.ecr.aws/aws-cli/aws-cli:2.34.56@sha256:c6b9b4f1",
+      registry: "public.ecr.aws",
+      repository: "aws-cli/aws-cli",
+      tag: "2.34.56",
+      digest: "sha256:c6b9b4f1",
+    });
+    expect(vi.mocked(registry.fetchImagePublishDate)).toHaveBeenCalledWith(
+      "public.ecr.aws",
+      "aws-cli/aws-cli",
+      "sha256:c6b9b4f1",
+      "2.34.56",
+    );
+  });
+
+  it("returns null for undefined ref", async () => {
+    const kubernetes = await import("../src/ecosystems/kubernetes.js");
+    const date = await kubernetes.getPublishDate(undefined);
+    expect(date).toBeNull();
+  });
+});
+
+// ─── docker ecosystem ────────────────────────────────────────────────────────
+
+describe("docker.getChangedDeps", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("auto-detects changed Dockerfiles and emits FROM refs", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("some diff");
+    vi.mocked(fs.readFile).mockResolvedValue("FROM nginx:1.25\n" as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps, imageRefs } = await docker.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("docker.io/library/nginx");
+    expect(imageRefs.size).toBe(1);
+  });
+
+  it("COPY --from ref found in registry is emitted as a dep", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(
+      "FROM alpine:3.18\nCOPY --from=myregistry.io/myimage:v1 /src /dst\n" as any,
+    );
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+    vi.mocked(registry.imageExists).mockResolvedValue("found");
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps } = await docker.getChangedDeps("HEAD~1", "");
+    const names = deps.map((d) => d.name);
+    expect(names).toContain("myregistry.io/myimage");
+  });
+
+  it("COPY --from ref not found in registry is omitted", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(
+      "FROM alpine:3.18\nCOPY --from=myregistry.io/myimage:v1 /src /dst\n" as any,
+    );
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+    vi.mocked(registry.imageExists).mockResolvedValue("notfound");
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps } = await docker.getChangedDeps("HEAD~1", "");
+    const names = deps.map((d) => d.name);
+    expect(names).not.toContain("myregistry.io/myimage");
+    // alpine:3.18 (FROM) is still present
+    expect(names).toContain("docker.io/library/alpine");
+  });
+
+  it("COPY --from ref returning 'unknown' (private registry, unconfirmed) is skipped", async () => {
+    // "unknown" means the registry didn't give a definitive answer (401/429/network
+    // error). COPY --from sources are ambiguous (build contexts, stage aliases,
+    // real images) so we require a confirmed "found" and drop unconfirmed refs.
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(
+      "FROM alpine:3.18\nCOPY --from=myregistry.io/myimage:v1 /src /dst\n" as any,
+    );
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+    vi.mocked(registry.imageExists).mockResolvedValue("unknown");
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps } = await docker.getChangedDeps("HEAD~1", "");
+    const names = deps.map((d) => d.name);
+    expect(names).not.toContain("myregistry.io/myimage");
+    // alpine:3.18 (FROM) is still present — FROM refs are not existence-checked
+    expect(names).toContain("docker.io/library/alpine");
+  });
+
+  it("FROM ref with digest pin has correct name, version, and imageRefs key", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(
+      "FROM nginx:1.25@sha256:abc123\n" as any,
+    );
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps, imageRefs } = await docker.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(1);
+    expect(deps[0].name).toBe("docker.io/library/nginx");
+    expect(deps[0].version).toBe("1.25@sha256:abc123");
+    expect(imageRefs.has("docker.io/library/nginx@1.25@sha256:abc123")).toBe(true);
+  });
+
+  it("unchanged images (present in both HEAD and base) are skipped", async () => {
+    const content = "FROM nginx:1.25\n";
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("diff");
+    vi.mocked(fs.readFile).mockResolvedValue(content as any);
+    vi.mocked(diff.gitShowFile).mockResolvedValue(content);
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps } = await docker.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(0);
+  });
+
+  it("returns empty when no Dockerfile files changed", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["src/main.ts"]);
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const { deps } = await docker.getChangedDeps("HEAD~1", "");
+    expect(deps).toHaveLength(0);
+  });
+
+  it("passes dockerhubMirror to imageExists for copy-from refs", async () => {
+    vi.mocked(diff.gitDiffNameOnly).mockResolvedValue(["Dockerfile"]);
+    vi.mocked(diff.gitDiff).mockResolvedValue("some diff");
+    vi.mocked(fs.readFile).mockResolvedValue(
+      "FROM alpine:3.18\nCOPY --from=myregistry.io/myimage:v1 /app /app\n" as any,
+    );
+    vi.mocked(diff.gitShowFile).mockResolvedValue(null);
+    vi.mocked(registry.imageExists).mockResolvedValue("found");
+
+    const docker = await import("../src/ecosystems/docker.js");
+    await docker.getChangedDeps("HEAD~1", "", "mirror.gcr.io");
+
+    expect(vi.mocked(registry.imageExists)).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      expect.any(String),
+      "mirror.gcr.io",
+    );
+  });
+});
+
+describe("docker.getPublishDate", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("returns null for tag-only ref without calling fetchImagePublishDate", async () => {
+    const docker = await import("../src/ecosystems/docker.js");
+    const date = await docker.getPublishDate({
+      raw: "nginx:1.25",
+      registry: "docker.io",
+      repository: "library/nginx",
+      tag: "1.25",
+      digest: null,
+    });
+    expect(date).toBeNull();
+    expect(vi.mocked(registry.fetchImagePublishDate)).not.toHaveBeenCalled();
+  });
+
+  it("delegates to fetchImagePublishDate for digest-pinned refs", async () => {
+    vi.mocked(registry.fetchImagePublishDate).mockResolvedValueOnce(
+      new Date("2024-03-01T00:00:00Z"),
+    );
+
+    const docker = await import("../src/ecosystems/docker.js");
+    const date = await docker.getPublishDate({
+      raw: "nginx:1.25@sha256:abc123",
+      registry: "docker.io",
+      repository: "library/nginx",
+      tag: "1.25",
+      digest: "sha256:abc123",
+    });
+    expect(date).toEqual(new Date("2024-03-01T00:00:00Z"));
+    expect(vi.mocked(registry.fetchImagePublishDate)).toHaveBeenCalledWith(
+      "docker.io",
+      "library/nginx",
+      "sha256:abc123",
+      "1.25",
+    );
+  });
+
+  it("returns null for undefined ref", async () => {
+    const docker = await import("../src/ecosystems/docker.js");
+    const date = await docker.getPublishDate(undefined);
+    expect(date).toBeNull();
+    expect(vi.mocked(registry.fetchImagePublishDate)).not.toHaveBeenCalled();
   });
 });

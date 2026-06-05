@@ -13,6 +13,8 @@ A GitHub Action that acts as a supply-chain security gate by failing if newly ad
 | **bazel** | `MODULE.bazel.lock` | Bazel Central Registry (BCR) |
 | **actions** | `.github/workflows/*.yml`, `action.yml` | GitHub API |
 | **multitool** | `multitool.hub()` lockfiles via `MODULE.bazel` | Archive `Last-Modified` headers |
+| **kubernetes** | Rendered Kubernetes manifests (`*.yaml`/`*.yml`) | OCI registry v2 API (anonymous; digest-pinned only) |
+| **docker** | `Dockerfile`, `Containerfile` (exact basename; use `dockerfiles:` input for other names) | OCI registry v2 API (anonymous; digest-pinned only) |
 
 ## Quick start
 
@@ -42,7 +44,7 @@ You can always override with the `base-ref` input.
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `ecosystems` | Yes | | Comma-separated list: `npm`, `python`, `rust`, `java`, `bazel`, `actions`, `multitool` |
+| `ecosystems` | Yes | | Comma-separated list: `npm`, `python`, `rust`, `java`, `bazel`, `actions`, `multitool`, `kubernetes`, `docker` |
 | `min-age-days` | No | `14` | Minimum days since publication to pass |
 | `warn-age-days` | No | `21` | Age threshold for warnings (between min and warn = warning, above = pass) |
 | `base-ref` | No | auto-detect | Git ref to diff against |
@@ -50,6 +52,9 @@ You can always override with the `base-ref` input.
 | `python-lockfiles` | No | auto-detect | Newline-separated glob patterns for Python lockfiles |
 | `module-bazel` | No | `MODULE.bazel` | Path to root MODULE.bazel (for rust/java/bazel/multitool ecosystems) |
 | `workflow-files` | No | auto-detect | Newline-separated glob patterns for workflow files (for actions ecosystem) |
+| `kubernetes-files` | No | auto-detect | Newline-separated glob patterns for rendered Kubernetes manifest files (for kubernetes ecosystem). See usage note below. |
+| `dockerfiles` | No | auto-detect | Newline-separated glob patterns for Dockerfile/Containerfile paths (for docker ecosystem). Auto-detect matches any changed file whose basename is exactly `Dockerfile` or `Containerfile` (case-insensitive). Use this input for non-standard names (`myapp.Dockerfile`, `Dockerfile.prod`, etc.). |
+| `dockerhub-mirror` | No | `""` | Docker Hub mirror hostname (e.g. `mirror.gcr.io`) to use as a fallback when the primary Docker Hub check is rate-limited (HTTP 429) while resolving `COPY --from` / `RUN --mount=from` references. |
 | `strict-third-party` | No | `false` | Fail (instead of warn) on archive overrides without `Last-Modified` and third-party branch-pinned actions |
 | `bypass-keyword` | No | `""` | If the PR body contains this string on a line by itself, failures are downgraded to warnings |
 | `check-all-on-new-workflow` | No | `true` | Check all packages (not just changed) when the workflow file is newly added |
@@ -162,6 +167,83 @@ Parses `MODULE.bazel.lock` for resolved module versions and queries the Bazel Ce
 - **`local_path_override`**: skipped
 - **`single_version_override`** / **`multiple_version_override`**: checked against BCR with the overridden version
 
+### Check container images in Kubernetes manifests
+
+The `kubernetes` ecosystem parses **rendered** Kubernetes manifests for container
+image references and age-gates images pinned with a `@sha256:` digest against the
+OCI registry API. Tag-only images (no digest) are reported as `unknown` — they are
+mutable and cannot be reliably age-gated.
+
+**The consuming repo must render charts to plain YAML before invoking the action.**
+For example, run `helm template` in an earlier CI step and either commit the output
+or pass it via `kubernetes-files`.
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+    with:
+      fetch-depth: 0
+
+  # Render charts to a committed manifests directory, or generate them in CI
+  - name: Render Helm charts
+    run: helm template my-chart ./charts/my-chart > rendered/manifests.yaml
+
+  - uses: runloopai/lisan-al-gaib-action@main
+    with:
+      ecosystems: kubernetes
+      kubernetes-files: rendered/manifests.yaml
+```
+
+Push timestamps are sourced from registry-specific APIs where available:
+- **Docker Hub** (`docker.io`): Hub API `tag_last_pushed` (accurate, per-tag push time)
+- **Other public registries** (`public.ecr.aws`, `ghcr.io`, `quay.io`, `registry.k8s.io`):
+  `Last-Modified` HTTP header on the manifest response — a best-effort signal not
+  guaranteed by the OCI Distribution spec; registries that don't emit this header
+  will report `unknown` even for publicly accessible images
+
+Images on private registries (AWS ECR private, GCP Artifact Registry, self-hosted)
+that reject anonymous pulls are always reported as `unknown`.
+
+**License checking** for container images reads the `org.opencontainers.image.licenses`
+OCI label from the image config blob, falling back to the `org.opencontainers.image.source`
+label (if it points to a GitHub repo) for images that omit the licenses label. Images
+with neither label report `unknown`. This is the primary application's declared license —
+not a full inventory of every OS package baked into the image.
+
+### Check Dockerfile base images
+
+The `docker` ecosystem parses `Dockerfile` and `Containerfile` files for base image
+references in `FROM`, `COPY --from=`, and `RUN --mount=...,from=` directives. The same
+OCI age-gate and license-check logic as the kubernetes ecosystem applies: only
+`@sha256:`-digest-pinned images are age-gated; tag-only references are reported as
+`unknown`.
+
+Build-stage aliases (from `FROM ... AS <name>`), numeric stage indices (e.g. `--from=0`),
+and unresolved ARG/ENV variables (`$VAR`) are filtered out automatically. `COPY --from`
+and `RUN --mount=from` values that don't resolve to a real registry image (named build
+contexts, typos) are info-logged and omitted from the report. Only `bind` and `cache`
+mount types are considered; `secret`, `ssh`, `tmpfs`, and other special mounts are
+ignored.
+
+```yaml
+- uses: runloopai/lisan-al-gaib-action@main
+  with:
+    ecosystems: docker
+```
+
+By default the action auto-detects any changed file whose basename (case-insensitive)
+is exactly `Dockerfile` or `Containerfile`. For non-standard names (`Dockerfile.prod`,
+`myapp.Dockerfile`, etc.), use the `dockerfiles` input explicitly:
+
+```yaml
+- uses: runloopai/lisan-al-gaib-action@main
+  with:
+    ecosystems: docker
+    dockerfiles: |
+      services/*/Dockerfile
+      infra/Containerfile
+```
+
 ### License compliance
 
 ```yaml
@@ -191,7 +273,7 @@ Parses `MODULE.bazel.lock` for resolved module versions and queries the Bazel Ce
     # target-licenses: ""
 ```
 
-For every analyzed dependency, the action fetches the license from the package registry (npm, PyPI, crates.io, Maven POM, GitHub API, BCR metadata) and checks **directional compatibility** — whether the dependency's license allows incorporation into a project under your target license. This uses a full SPDX compatibility matrix (permissive → copyleft flow, GPL version compatibility, weak copyleft rules, etc.). Incompatible licenses produce error annotations and fail the check.
+For every analyzed dependency, the action fetches the license from the package registry (npm, PyPI, crates.io, Maven POM, GitHub API, BCR metadata, OCI image labels) and checks **directional compatibility** — whether the dependency's license allows incorporation into a project under your target license. This uses a full SPDX compatibility matrix (permissive → copyleft flow, GPL version compatibility, weak copyleft rules, etc.). Incompatible licenses produce error annotations and fail the check.
 
 ### License and age overrides
 
