@@ -2,6 +2,21 @@ import * as exec from "@actions/exec";
 import * as glob from "@actions/glob";
 import * as path from "node:path";
 
+// DiffSource: an alternative diff backend for when local git history is unavailable.
+// The base commit is captured at construction time, so methods don't take baseRef.
+export interface DiffSource {
+  diff(file: string): Promise<string>;
+  diffNameOnly(): Promise<string[]>;
+  diffFiltered(filter: string): Promise<string[]>;
+  showFile(file: string): Promise<string | null>;
+}
+
+let activeSource: DiffSource | null = null;
+
+export function setDiffSource(s: DiffSource | null): void {
+  activeSource = s;
+}
+
 export async function resolveFiles(input: string): Promise<string[]> {
   const entries = input.split("\n").map((s) => s.trim()).filter(Boolean);
   const files = new Set<string>();
@@ -22,10 +37,7 @@ export async function resolveFiles(input: string): Promise<string[]> {
   return [...files];
 }
 
-export async function gitDiff(
-  baseRef: string,
-  file: string,
-): Promise<string> {
+async function gitDiffImpl(baseRef: string, file: string): Promise<string> {
   let output = "";
   await exec.exec("git", ["diff", baseRef, "--", file], {
     listeners: { stdout: (data) => (output += data.toString()) },
@@ -35,10 +47,7 @@ export async function gitDiff(
   return output;
 }
 
-export async function gitDiffFiltered(
-  baseRef: string,
-  filter: string,
-): Promise<string[]> {
+async function gitDiffFilteredImpl(baseRef: string, filter: string): Promise<string[]> {
   let output = "";
   await exec.exec("git", ["diff", "--name-only", `--diff-filter=${filter}`, baseRef], {
     listeners: { stdout: (data) => (output += data.toString()) },
@@ -48,7 +57,7 @@ export async function gitDiffFiltered(
   return output.split("\n").map((s) => s.trim()).filter(Boolean);
 }
 
-export async function gitDiffNameOnly(baseRef: string): Promise<string[]> {
+async function gitDiffNameOnlyImpl(baseRef: string): Promise<string[]> {
   let output = "";
   await exec.exec("git", ["diff", "--name-only", baseRef], {
     listeners: { stdout: (data) => (output += data.toString()) },
@@ -58,10 +67,7 @@ export async function gitDiffNameOnly(baseRef: string): Promise<string[]> {
   return output.split("\n").map((s) => s.trim()).filter(Boolean);
 }
 
-export async function gitShowFile(
-  ref: string,
-  file: string,
-): Promise<string | null> {
+async function gitShowFileImpl(ref: string, file: string): Promise<string | null> {
   let output = "";
   const exitCode = await exec.exec("git", ["show", `${ref}:${file}`], {
     listeners: { stdout: (data) => (output += data.toString()) },
@@ -69,4 +75,24 @@ export async function gitShowFile(
     ignoreReturnCode: true,
   });
   return exitCode === 0 ? output : null;
+}
+
+export async function gitDiff(baseRef: string, file: string): Promise<string> {
+  if (activeSource) return activeSource.diff(file);
+  return gitDiffImpl(baseRef, file);
+}
+
+export async function gitDiffFiltered(baseRef: string, filter: string): Promise<string[]> {
+  if (activeSource) return activeSource.diffFiltered(filter);
+  return gitDiffFilteredImpl(baseRef, filter);
+}
+
+export async function gitDiffNameOnly(baseRef: string): Promise<string[]> {
+  if (activeSource) return activeSource.diffNameOnly();
+  return gitDiffNameOnlyImpl(baseRef);
+}
+
+export async function gitShowFile(ref: string, file: string): Promise<string | null> {
+  if (activeSource) return activeSource.showFile(file);
+  return gitShowFileImpl(ref, file);
 }

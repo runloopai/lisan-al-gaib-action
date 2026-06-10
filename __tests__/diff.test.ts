@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 vi.mock("@actions/exec", () => ({
   exec: vi.fn(),
@@ -10,7 +10,7 @@ vi.mock("@actions/glob", () => ({
 
 import * as exec from "@actions/exec";
 import * as glob from "@actions/glob";
-import { gitDiff, gitDiffFiltered, gitDiffNameOnly, gitShowFile, resolveFiles } from "../src/diff.js";
+import { gitDiff, gitDiffFiltered, gitDiffNameOnly, gitShowFile, resolveFiles, setDiffSource, type DiffSource } from "../src/diff.js";
 
 describe("gitDiff", () => {
   beforeEach(() => vi.clearAllMocks());
@@ -117,5 +117,36 @@ describe("resolveFiles", () => {
     } as any);
     const files = await resolveFiles("src/*.xyz");
     expect(files).toEqual([]);
+  });
+});
+
+describe("diff source dispatch", () => {
+  const fakeSource: DiffSource = {
+    diff: vi.fn().mockResolvedValue("api-diff-output"),
+    diffNameOnly: vi.fn().mockResolvedValue(["api-changed.ts"]),
+    diffFiltered: vi.fn().mockResolvedValue(["api-added.ts"]),
+    showFile: vi.fn().mockResolvedValue("api-file-content"),
+  };
+
+  afterEach(() => setDiffSource(null));
+
+  it("delegates all four primitives to DiffSource when one is set", async () => {
+    setDiffSource(fakeSource);
+    expect(await gitDiff("base", "file.ts")).toBe("api-diff-output");
+    expect(await gitDiffNameOnly("base")).toEqual(["api-changed.ts"]);
+    expect(await gitDiffFiltered("base", "A")).toEqual(["api-added.ts"]);
+    expect(await gitShowFile("base", "file.ts")).toBe("api-file-content");
+    expect(exec.exec).not.toHaveBeenCalled();
+  });
+
+  it("falls back to git commands when DiffSource is cleared", async () => {
+    setDiffSource(fakeSource);
+    setDiffSource(null);
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("git-output"));
+      return 0;
+    });
+    expect(await gitDiff("base", "file.ts")).toBe("git-output");
+    expect(exec.exec).toHaveBeenCalled();
   });
 });

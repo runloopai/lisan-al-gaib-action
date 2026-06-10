@@ -2,8 +2,9 @@ import * as core from "@actions/core";
 import * as github from "@actions/github";
 import { checkBypass, isPrEvent } from "./bypass.js";
 import { getInputs } from "./inputs.js";
-import { resolveBaseRef, validateBaseRef, ensureBaseRefAvailable } from "./base-ref.js";
-import { gitDiffFiltered } from "./diff.js";
+import { resolveBaseRef, makeBaseRefDiffable, EMPTY_TREE } from "./base-ref.js";
+import { gitDiffFiltered, setDiffSource } from "./diff.js";
+import { createApiDiffSource } from "./api-diff.js";
 import * as npm from "./ecosystems/npm.js";
 import * as python from "./ecosystems/python.js";
 import * as rust from "./ecosystems/rust.js";
@@ -76,7 +77,7 @@ async function resolveEffectiveBaseRef(
   );
 
   // Empty tree SHA — forces diffing everything
-  return "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+  return EMPTY_TREE;
 }
 
 
@@ -171,12 +172,49 @@ async function lookupPublishDate(
 async function run(): Promise<void> {
   const inputs = getInputs();
   const rawBaseRef = resolveBaseRef(inputs.baseRef);
-  const validatedRef = await validateBaseRef(rawBaseRef);
-  const diffableRef = await ensureBaseRefAvailable(validatedRef);
+  const plan = await makeBaseRefDiffable(rawBaseRef, {
+    fetchRetries: inputs.fetchMissingHistoryRetries,
+  });
+
+  let diffableRef: string;
+  if (plan.mode === "api") {
+    if (!inputs.githubToken) {
+      core.warning(
+        "No github-token provided — cannot use GitHub compare API; falling back to checking all packages",
+      );
+      diffableRef = EMPTY_TREE;
+    } else {
+      try {
+        const { owner, repo: repoName } = github.context.repo;
+        const source = createApiDiffSource({
+          octokit: github.getOctokit(inputs.githubToken),
+          owner,
+          repo: repoName,
+          baseSha: plan.baseSha,
+          headSha: plan.headSha,
+        });
+        await source.diffNameOnly(); // warm call — surface API errors before ecosystems run
+        setDiffSource(source);
+        diffableRef = plan.baseSha;
+      } catch (err) {
+        core.warning(
+          `GitHub compare API unavailable (${err instanceof Error ? err.message : String(err)}) — falling back to checking all packages`,
+        );
+        diffableRef = EMPTY_TREE;
+      }
+    }
+  } else {
+    diffableRef = plan.baseRef;
+  }
+
   const baseRef = await resolveEffectiveBaseRef(
     diffableRef,
     inputs.checkAllOnNewWorkflow,
   );
+  // Empty tree is always locally diffable — ensure git mode is active
+  if (baseRef === EMPTY_TREE) {
+    setDiffSource(null);
+  }
 
   core.info(
     `Dependency age check — min: ${inputs.minAgeDays}d, warn: ${inputs.warnAgeDays}d, base: ${baseRef}`,
