@@ -19,7 +19,7 @@ vi.mock("@actions/exec", () => ({
 
 import * as github from "@actions/github";
 import * as exec from "@actions/exec";
-import { resolveBaseRef, validateBaseRef } from "../src/base-ref.js";
+import { resolveBaseRef, validateBaseRef, makeBaseRefDiffable } from "../src/base-ref.js";
 
 describe("resolveBaseRef", () => {
   beforeEach(() => {
@@ -139,5 +139,147 @@ describe("validateBaseRef", () => {
     expect(await validateBaseRef("bad-ref")).toBe(
       "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
     );
+  });
+});
+
+describe("makeBaseRefDiffable", () => {
+  const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Object.assign(github.context, { eventName: "schedule", payload: {}, sha: "headsha" });
+  });
+
+  it("passes the empty-tree sentinel through without any git calls", async () => {
+    const result = await makeBaseRefDiffable(EMPTY_TREE, { fetchRetries: 3 });
+    expect(result).toEqual({ mode: "git", baseRef: EMPTY_TREE });
+    expect(exec.exec).not.toHaveBeenCalled();
+  });
+
+  it("deepens shallow clone before resolving HEAD~1 to a concrete parent SHA", async () => {
+    // isShallowRepo → true
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("true\n"));
+      return 0;
+    });
+    // deepenLoop: countCommits before → 1
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("1\n"));
+      return 0;
+    });
+    // deepenLoop: git fetch --deepen
+    vi.mocked(exec.exec).mockResolvedValueOnce(0);
+    // deepenLoop: isShallowRepo after → false (shallow boundary reached, break)
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("false\n"));
+      return 0;
+    });
+    // revParse("HEAD~1^{commit}") → concrete SHA
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("abc123\n"));
+      return 0;
+    });
+    // canDiffCommits("abc123") → success
+    vi.mocked(exec.exec).mockResolvedValueOnce(0);
+
+    const result = await makeBaseRefDiffable("HEAD~1", { fetchRetries: 3 });
+    expect(result).toEqual({ mode: "git", baseRef: "abc123" });
+  });
+
+  it("stops deepening when no progress is made and falls back to empty tree when no parent exists", async () => {
+    // isShallowRepo → true (still shallow at start)
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("true\n"));
+      return 0;
+    });
+    // deepenLoop: countCommits before → 5
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("5\n"));
+      return 0;
+    });
+    // deepenLoop: git fetch --deepen
+    vi.mocked(exec.exec).mockResolvedValueOnce(0);
+    // deepenLoop: isShallowRepo → still true (don't break yet)
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("true\n"));
+      return 0;
+    });
+    // deepenLoop: countCommits after → 5 (same as before → no progress, break)
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("5\n"));
+      return 0;
+    });
+    // revParse("HEAD~1^{commit}") → not found (initial commit, no parent)
+    vi.mocked(exec.exec).mockResolvedValueOnce(1);
+
+    const result = await makeBaseRefDiffable("HEAD~1", { fetchRetries: 3 });
+    expect(result).toEqual({ mode: "git", baseRef: EMPTY_TREE });
+  });
+
+  it("treats a forced-push before-SHA as HEAD~1 and resolves the parent commit instead", async () => {
+    Object.assign(github.context, {
+      eventName: "push",
+      payload: { forced: true, before: "forcedsha" },
+    });
+    // isShallowRepo → false (non-shallow, skip deepenLoop)
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("false\n"));
+      return 0;
+    });
+    // revParse("HEAD~1^{commit}") → parentsha
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("parentsha\n"));
+      return 0;
+    });
+    // canDiffCommits("parentsha") → success
+    vi.mocked(exec.exec).mockResolvedValueOnce(0);
+
+    const result = await makeBaseRefDiffable("forcedsha", { fetchRetries: 3 });
+    expect(result).toEqual({ mode: "git", baseRef: "parentsha" });
+  });
+
+  it("fetches a missing SHA on a shallow clone and returns git mode when diff succeeds", async () => {
+    // refExists("deadbeef") → not found
+    vi.mocked(exec.exec).mockResolvedValueOnce(1);
+    // isShallowRepo → true
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("true\n"));
+      return 0;
+    });
+    // fetchBySha("deadbeef") → success
+    vi.mocked(exec.exec).mockResolvedValueOnce(0);
+    // deepenLoop: countCommits before → 1
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("1\n"));
+      return 0;
+    });
+    // deepenLoop: git fetch --deepen
+    vi.mocked(exec.exec).mockResolvedValueOnce(0);
+    // deepenLoop: isShallowRepo → false (boundary → break)
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("false\n"));
+      return 0;
+    });
+    // canDiffCommits("deadbeef") → success
+    vi.mocked(exec.exec).mockResolvedValueOnce(0);
+
+    const result = await makeBaseRefDiffable("deadbeef", { fetchRetries: 3 });
+    expect(result).toEqual({ mode: "git", baseRef: "deadbeef" });
+  });
+
+  it("returns api mode when a SHA is not locally diffable after all fetch attempts", async () => {
+    Object.assign(github.context, { sha: "headsha123" });
+    // refExists("deadbeef456") → not found
+    vi.mocked(exec.exec).mockResolvedValueOnce(1);
+    // isShallowRepo → false (not shallow, skip fetchBySha/deepenLoop)
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("false\n"));
+      return 0;
+    });
+    // canDiffCommits("deadbeef456") → fail
+    vi.mocked(exec.exec).mockResolvedValueOnce(1);
+
+    const result = await makeBaseRefDiffable("deadbeef456", { fetchRetries: 3 });
+    expect(result).toEqual({ mode: "api", baseSha: "deadbeef456", headSha: "headsha123" });
   });
 });
