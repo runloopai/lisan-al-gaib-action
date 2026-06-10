@@ -19,6 +19,7 @@
  */
 
 import { execSync } from "node:child_process";
+import { EMPTY_TREE } from "./base-ref.js";
 
 function getRemoteDefaultBranch(): string {
   try {
@@ -57,7 +58,7 @@ async function main() {
   let baseRef: string;
   if (args["all"]) {
     // Empty tree SHA — diffs everything
-    baseRef = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    baseRef = EMPTY_TREE;
   } else if (args["diff"]) {
     baseRef = "HEAD";
   } else if (args["base-ref"]) {
@@ -86,6 +87,7 @@ async function main() {
     "crates-registry-url": args["crates-registry-url"] ?? "https://crates.io",
     "maven-registry-url": args["maven-registry-url"] ?? "https://repo1.maven.org/maven2",
     "check-all-on-new-workflow": "false",
+    "fetch-missing-history-retries": args["fetch-missing-history-retries"] ?? "10",
     "strict-third-party": args["strict-third-party"] ?? "false",
     "bypass-keyword": "",
     "target-licenses": args["target-licenses"] ?? "",

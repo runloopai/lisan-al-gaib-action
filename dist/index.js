@@ -82204,11 +82204,11 @@ module.exports = /*#__PURE__*/JSON.parse('[["AFL-1.1","AFL-1.2","AFL-2.0","AFL-2
 var __webpack_exports__ = {};
 
 // EXTERNAL MODULE: ./node_modules/.pnpm/@actions+core@1.11.1/node_modules/@actions/core/lib/core.js
-var core = __nccwpck_require__(6966);
+var lib_core = __nccwpck_require__(6966);
 // EXTERNAL MODULE: ./node_modules/.pnpm/@actions+github@6.0.1/node_modules/@actions/github/lib/github.js
 var github = __nccwpck_require__(4903);
 // EXTERNAL MODULE: ./node_modules/.pnpm/@actions+exec@1.1.1/node_modules/@actions/exec/lib/exec.js
-var exec = __nccwpck_require__(2851);
+var lib_exec = __nccwpck_require__(2851);
 ;// CONCATENATED MODULE: ./out/bypass.js
 
 
@@ -82233,7 +82233,7 @@ async function checkBypass(keyword, token) {
     // Non-PR events: HEAD commit message first
     try {
         let msg = "";
-        await exec.exec("git", ["log", "-1", "--format=%B"], {
+        await lib_exec.exec("git", ["log", "-1", "--format=%B"], {
             listeners: { stdout: (data) => (msg += data.toString()) },
             silent: true,
         });
@@ -86128,26 +86128,28 @@ function trimSlash(url) {
     return url.replace(/\/$/, "");
 }
 function getInputs() {
-    const ecosystems = core.getInput("ecosystems", { required: true })
+    const ecosystems = lib_core.getInput("ecosystems", { required: true })
         .split(",")
         .map((e) => e.trim())
         .filter(Boolean);
-    const parsedMin = parseInt(core.getInput("min-age-days") || "14", 10);
+    const parsedMin = parseInt(lib_core.getInput("min-age-days") || "14", 10);
     const minAgeDays = isNaN(parsedMin) ? 14 : parsedMin;
-    const parsedWarn = parseInt(core.getInput("warn-age-days") || "21", 10);
+    const parsedWarn = parseInt(lib_core.getInput("warn-age-days") || "21", 10);
     const warnAgeDays = isNaN(parsedWarn) ? 21 : parsedWarn;
+    const parsedRetries = parseInt(lib_core.getInput("fetch-missing-history-retries") || "10", 10);
+    const fetchMissingHistoryRetries = isNaN(parsedRetries) || parsedRetries < 0 ? 10 : parsedRetries;
     if (warnAgeDays < minAgeDays) {
-        core.warning(`warn-age-days (${warnAgeDays}) is less than min-age-days (${minAgeDays}); no warnings will be produced`);
+        lib_core.warning(`warn-age-days (${warnAgeDays}) is less than min-age-days (${minAgeDays}); no warnings will be produced`);
     }
     // target-licenses supersedes allowed-licenses
-    const targetLicenses = core.getInput("target-licenses");
-    const allowedLicenses = core.getInput("allowed-licenses");
+    const targetLicenses = lib_core.getInput("target-licenses");
+    const allowedLicenses = lib_core.getInput("allowed-licenses");
     let effectiveLicenses;
     if (targetLicenses) {
         effectiveLicenses = targetLicenses;
     }
     else if (allowedLicenses) {
-        core.warning("allowed-licenses is deprecated; use target-licenses instead");
+        lib_core.warning("allowed-licenses is deprecated; use target-licenses instead");
         effectiveLicenses = allowedLicenses;
     }
     else {
@@ -86157,28 +86159,29 @@ function getInputs() {
         ecosystems,
         minAgeDays,
         warnAgeDays,
-        baseRef: core.getInput("base-ref"),
-        nodeLockfiles: core.getInput("node-lockfiles"),
-        pythonLockfiles: core.getInput("python-lockfiles"),
-        moduleBazel: core.getInput("module-bazel") || "MODULE.bazel",
-        checkAllOnNewWorkflow: core.getBooleanInput("check-all-on-new-workflow"),
-        strictThirdParty: core.getBooleanInput("strict-third-party"),
-        bypassKeyword: core.getInput("bypass-keyword"),
-        workflowFiles: core.getInput("workflow-files"),
-        kubernetesFiles: core.getInput("kubernetes-files"),
-        dockerfiles: core.getInput("dockerfiles"),
-        dockerhubMirror: core.getInput("dockerhub-mirror"),
-        githubToken: core.getInput("github-token"),
-        bcrUrl: trimSlash(core.getInput("bcr-url") || "https://bcr.bazel.build"),
+        baseRef: lib_core.getInput("base-ref"),
+        nodeLockfiles: lib_core.getInput("node-lockfiles"),
+        pythonLockfiles: lib_core.getInput("python-lockfiles"),
+        moduleBazel: lib_core.getInput("module-bazel") || "MODULE.bazel",
+        checkAllOnNewWorkflow: lib_core.getBooleanInput("check-all-on-new-workflow"),
+        strictThirdParty: lib_core.getBooleanInput("strict-third-party"),
+        bypassKeyword: lib_core.getInput("bypass-keyword"),
+        workflowFiles: lib_core.getInput("workflow-files"),
+        kubernetesFiles: lib_core.getInput("kubernetes-files"),
+        dockerfiles: lib_core.getInput("dockerfiles"),
+        dockerhubMirror: lib_core.getInput("dockerhub-mirror"),
+        githubToken: lib_core.getInput("github-token"),
+        bcrUrl: trimSlash(lib_core.getInput("bcr-url") || "https://bcr.bazel.build"),
         allowedLicenses: effectiveLicenses,
-        licenseOverrides: parseLicenseOverrides(core.getInput("license-overrides")),
-        ageOverrides: parseAgeOverrides(core.getInput("age-overrides")),
-        licenseHeuristics: core.getBooleanInput("license-heuristics"),
+        licenseOverrides: parseLicenseOverrides(lib_core.getInput("license-overrides")),
+        ageOverrides: parseAgeOverrides(lib_core.getInput("age-overrides")),
+        licenseHeuristics: lib_core.getBooleanInput("license-heuristics"),
+        fetchMissingHistoryRetries,
         registries: {
-            npm: trimSlash(core.getInput("npm-registry-url") || "https://registry.npmjs.org"),
-            pypi: trimSlash(core.getInput("pypi-registry-url") || "https://pypi.org"),
-            crates: trimSlash(core.getInput("crates-registry-url") || "https://crates.io"),
-            maven: trimSlash(core.getInput("maven-registry-url") || "https://repo1.maven.org/maven2"),
+            npm: trimSlash(lib_core.getInput("npm-registry-url") || "https://registry.npmjs.org"),
+            pypi: trimSlash(lib_core.getInput("pypi-registry-url") || "https://pypi.org"),
+            crates: trimSlash(lib_core.getInput("crates-registry-url") || "https://crates.io"),
+            maven: trimSlash(lib_core.getInput("maven-registry-url") || "https://repo1.maven.org/maven2"),
         },
     };
 }
@@ -86205,7 +86208,7 @@ function parseNestedYamlMap(input, inputName) {
         }
     }
     catch (e) {
-        core.warning(`Failed to parse ${inputName}: ${e}`);
+        lib_core.warning(`Failed to parse ${inputName}: ${e}`);
     }
     return result;
 }
@@ -86241,7 +86244,7 @@ function parseAgeOverrides(input) {
         }
     }
     catch (e) {
-        core.warning(`Failed to parse age-overrides: ${e}`);
+        lib_core.warning(`Failed to parse age-overrides: ${e}`);
     }
     return result;
 }
@@ -86250,6 +86253,7 @@ function parseAgeOverrides(input) {
 
 
 
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /**
  * Get the parent commit SHA of the current HEAD.
  * Used as a fallback when payload.before is unavailable or invalid.
@@ -86267,7 +86271,7 @@ async function getParentSha() {
  * Check if a ref exists in the local git repo.
  */
 async function refExists(ref) {
-    const exitCode = await exec.exec("git", ["rev-parse", "--verify", ref], {
+    const exitCode = await lib_exec.exec("git", ["rev-parse", "--verify", ref], {
         silent: true,
         ignoreReturnCode: true,
     });
@@ -86278,7 +86282,7 @@ function isZeroSha(sha) {
 }
 function resolveBaseRef(inputBaseRef) {
     if (inputBaseRef) {
-        core.info(`Using provided base-ref: ${inputBaseRef}`);
+        lib_core.info(`Using provided base-ref: ${inputBaseRef}`);
         return inputBaseRef;
     }
     const { eventName, payload } = github.context;
@@ -86286,7 +86290,7 @@ function resolveBaseRef(inputBaseRef) {
     if (eventName === "pull_request" || eventName === "pull_request_target") {
         const sha = payload.pull_request?.base?.sha;
         if (sha) {
-            core.info(`Auto-detected base ref from PR base: ${sha}`);
+            lib_core.info(`Auto-detected base ref from PR base: ${sha}`);
             return sha;
         }
     }
@@ -86294,7 +86298,7 @@ function resolveBaseRef(inputBaseRef) {
     if (eventName === "merge_group") {
         const sha = payload.merge_group?.base_sha;
         if (sha) {
-            core.info(`Auto-detected base ref from merge group: ${sha}`);
+            lib_core.info(`Auto-detected base ref from merge group: ${sha}`);
             return sha;
         }
     }
@@ -86302,7 +86306,7 @@ function resolveBaseRef(inputBaseRef) {
     if (eventName === "push") {
         const before = payload.before;
         if (before && !isZeroSha(before)) {
-            core.info(`Auto-detected base ref from push before: ${before}`);
+            lib_core.info(`Auto-detected base ref from push before: ${before}`);
             return before;
         }
     }
@@ -86310,14 +86314,14 @@ function resolveBaseRef(inputBaseRef) {
     if (eventName === "release") {
         const targetRef = payload.release?.target_commitish;
         if (targetRef) {
-            core.info(`Auto-detected base ref from release target: ${targetRef}`);
+            lib_core.info(`Auto-detected base ref from release target: ${targetRef}`);
             return targetRef;
         }
     }
     // schedule, workflow_dispatch, workflow_call, workflow_run, and others
     // These events don't have a natural "before" SHA.
     // Fall through to default resolution below.
-    core.info("Could not auto-detect base ref, falling back to HEAD~1");
+    lib_core.info("Could not auto-detect base ref, falling back to HEAD~1");
     return "HEAD~1";
 }
 /**
@@ -86339,11 +86343,11 @@ async function validateBaseRef(ref) {
     }
     // Initial commit — nothing to diff against
     core.info("No valid base ref found — using empty tree (initial commit)");
-    return "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    return EMPTY_TREE;
 }
 async function isShallowRepo() {
     let output = "";
-    const exitCode = await exec.exec("git", ["rev-parse", "--is-shallow-repository"], {
+    const exitCode = await lib_exec.exec("git", ["rev-parse", "--is-shallow-repository"], {
         listeners: { stdout: (data) => (output += data.toString()) },
         silent: true,
         ignoreReturnCode: true,
@@ -86351,34 +86355,107 @@ async function isShallowRepo() {
     return exitCode === 0 && output.trim() === "true";
 }
 async function canDiffCommits(ref) {
-    const exitCode = await exec.exec("git", ["diff", "--no-patch", ref, "HEAD"], { silent: true, ignoreReturnCode: true });
+    const exitCode = await lib_exec.exec("git", ["diff", "--no-patch", ref, "HEAD"], { silent: true, ignoreReturnCode: true });
     return exitCode === 0;
 }
-async function ensureBaseRefAvailable(ref) {
-    const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-    if (ref === EMPTY_TREE)
-        return ref;
-    if (ref.startsWith("HEAD"))
-        return ref;
-    if (ref.startsWith("origin/"))
-        return ref;
-    if (!(await isShallowRepo()))
-        return ref;
-    if (await canDiffCommits(ref))
-        return ref;
-    core.info(`Shallow clone: base ref ${ref} not diffable, fetching...`);
-    await exec.exec("git", ["fetch", "origin", ref, "--depth=1"], {
+async function revParse(ref) {
+    let output = "";
+    const exitCode = await lib_exec.exec("git", ["rev-parse", "--verify", `${ref}^{commit}`], {
+        listeners: { stdout: (data) => (output += data.toString()) },
         silent: true,
         ignoreReturnCode: true,
     });
-    if (await canDiffCommits(ref))
-        return ref;
-    core.info("Direct fetch didn't help, trying --deepen=2...");
-    await exec.exec("git", ["fetch", "--deepen=2", "origin"], { silent: true, ignoreReturnCode: true });
-    if (await canDiffCommits(ref))
-        return ref;
-    core.warning(`Cannot diff against ${ref} even after fetching — falling back to empty tree`);
-    return EMPTY_TREE;
+    return exitCode === 0 ? output.trim() : null;
+}
+async function fetchBySha(sha) {
+    await lib_exec.exec("git", ["fetch", "origin", sha, "--depth=1"], {
+        silent: true,
+        ignoreReturnCode: true,
+    });
+}
+async function countCommits() {
+    let output = "";
+    await lib_exec.exec("git", ["rev-list", "--count", "HEAD"], {
+        listeners: { stdout: (data) => (output += data.toString()) },
+        silent: true,
+        ignoreReturnCode: true,
+    });
+    return parseInt(output.trim(), 10) || 0;
+}
+async function deepenLoop(maxRetries) {
+    for (let i = 0; i < maxRetries; i++) {
+        const before = await countCommits();
+        await lib_exec.exec("git", ["fetch", "--deepen=100", "origin"], {
+            silent: true,
+            ignoreReturnCode: true,
+        });
+        if (!(await isShallowRepo()))
+            break; // shallow boundary reached
+        const after = await countCommits();
+        if (after <= before)
+            break; // no new commits fetched
+    }
+}
+function resolveHeadSha() {
+    const { eventName, payload, sha } = github.context;
+    if (eventName === "pull_request" || eventName === "pull_request_target") {
+        const prHead = payload.pull_request?.head?.sha;
+        if (prHead)
+            return prHead;
+    }
+    return sha || "";
+}
+async function makeBaseRefDiffable(rawRef, opts) {
+    if (rawRef === EMPTY_TREE)
+        return { mode: "git", baseRef: EMPTY_TREE };
+    // For push events, distrust the before-SHA if the push was forced
+    let ref = rawRef;
+    const { eventName, payload } = github.context;
+    if (eventName === "push" && payload.forced === true) {
+        lib_core.info("Forced push detected — resolving parent commit instead of before-SHA");
+        ref = "HEAD~1";
+    }
+    // Pre-compute head SHA for API mode. If absent (non-Actions CLI context), any API
+    // plan would produce a malformed compareCommits call, so degrade to EMPTY_TREE instead.
+    const headSha = resolveHeadSha();
+    const toApiPlan = (baseSha) => headSha
+        ? { mode: "api", baseSha, headSha }
+        : { mode: "git", baseRef: EMPTY_TREE };
+    // HEAD-prefixed refs (HEAD~1, HEAD^, etc.): deepen first, then resolve to a concrete SHA
+    if (ref.startsWith("HEAD")) {
+        if (await isShallowRepo()) {
+            await deepenLoop(opts.fetchRetries);
+        }
+        const sha = await revParse(ref);
+        if (!sha) {
+            lib_core.info("No parent commit found — using empty tree (initial commit)");
+            return { mode: "git", baseRef: EMPTY_TREE };
+        }
+        if (await canDiffCommits(sha)) {
+            return { mode: "git", baseRef: sha };
+        }
+        return toApiPlan(sha);
+    }
+    // origin/ refs are always locally accessible
+    if (ref.startsWith("origin/")) {
+        if (await canDiffCommits(ref))
+            return { mode: "git", baseRef: ref };
+        return toApiPlan(ref);
+    }
+    // Concrete SHA or branch ref: check if already locally available
+    if ((await refExists(ref)) && (await canDiffCommits(ref))) {
+        return { mode: "git", baseRef: ref };
+    }
+    // Not available locally; try to fetch it if repo is shallow
+    if (await isShallowRepo()) {
+        await fetchBySha(ref);
+        await deepenLoop(opts.fetchRetries);
+    }
+    if (await canDiffCommits(ref)) {
+        return { mode: "git", baseRef: ref };
+    }
+    // Cannot recover locally — use GitHub API to diff
+    return toApiPlan(ref);
 }
 //# sourceMappingURL=base-ref.js.map
 // EXTERNAL MODULE: ./node_modules/.pnpm/@actions+glob@0.5.1/node_modules/@actions/glob/lib/glob.js
@@ -86389,6 +86466,10 @@ const external_node_path_namespaceObject = __WEBPACK_EXTERNAL_createRequire(impo
 
 
 
+let activeSource = null;
+function setDiffSource(s) {
+    activeSource = s;
+}
 async function resolveFiles(input) {
     const entries = input.split("\n").map((s) => s.trim()).filter(Boolean);
     const files = new Set();
@@ -86408,43 +86489,143 @@ async function resolveFiles(input) {
     }
     return [...files];
 }
-async function gitDiff(baseRef, file) {
+async function gitDiffImpl(baseRef, file) {
     let output = "";
-    await exec.exec("git", ["diff", baseRef, "--", file], {
+    await lib_exec.exec("git", ["diff", baseRef, "--", file], {
         listeners: { stdout: (data) => (output += data.toString()) },
         silent: true,
         ignoreReturnCode: true,
     });
     return output;
 }
-async function gitDiffFiltered(baseRef, filter) {
+async function gitDiffFilteredImpl(baseRef, filter) {
     let output = "";
-    await exec.exec("git", ["diff", "--name-only", `--diff-filter=${filter}`, baseRef], {
+    await lib_exec.exec("git", ["diff", "--name-only", `--diff-filter=${filter}`, baseRef], {
         listeners: { stdout: (data) => (output += data.toString()) },
         silent: true,
         ignoreReturnCode: true,
     });
     return output.split("\n").map((s) => s.trim()).filter(Boolean);
 }
-async function gitDiffNameOnly(baseRef) {
+async function gitDiffNameOnlyImpl(baseRef) {
     let output = "";
-    await exec.exec("git", ["diff", "--name-only", baseRef], {
+    await lib_exec.exec("git", ["diff", "--name-only", baseRef], {
         listeners: { stdout: (data) => (output += data.toString()) },
         silent: true,
         ignoreReturnCode: true,
     });
     return output.split("\n").map((s) => s.trim()).filter(Boolean);
 }
-async function gitShowFile(ref, file) {
+async function gitShowFileImpl(ref, file) {
     let output = "";
-    const exitCode = await exec.exec("git", ["show", `${ref}:${file}`], {
+    const exitCode = await lib_exec.exec("git", ["show", `${ref}:${file}`], {
         listeners: { stdout: (data) => (output += data.toString()) },
         silent: true,
         ignoreReturnCode: true,
     });
     return exitCode === 0 ? output : null;
 }
+async function gitDiff(baseRef, file) {
+    if (activeSource)
+        return activeSource.diff(file);
+    return gitDiffImpl(baseRef, file);
+}
+async function gitDiffFiltered(baseRef, filter) {
+    if (activeSource)
+        return activeSource.diffFiltered(filter);
+    return gitDiffFilteredImpl(baseRef, filter);
+}
+async function gitDiffNameOnly(baseRef) {
+    if (activeSource)
+        return activeSource.diffNameOnly();
+    return gitDiffNameOnlyImpl(baseRef);
+}
+async function gitShowFile(ref, file) {
+    if (activeSource)
+        return activeSource.showFile(file);
+    return gitShowFileImpl(ref, file);
+}
 //# sourceMappingURL=diff.js.map
+;// CONCATENATED MODULE: ./out/api-diff.js
+function createApiDiffSource(opts) {
+    const { octokit, owner, repo, baseSha, headSha } = opts;
+    const PER_PAGE = 100;
+    let cachedFiles = null;
+    function getFiles() {
+        if (!cachedFiles) {
+            cachedFiles = (async () => {
+                const all = [];
+                let page = 1;
+                while (true) {
+                    const r = await octokit.rest.repos.compareCommits({
+                        owner, repo, base: baseSha, head: headSha, per_page: PER_PAGE, page,
+                    });
+                    const batch = r.data.files ?? [];
+                    all.push(...batch);
+                    if (batch.length < PER_PAGE)
+                        break;
+                    page++;
+                }
+                return all;
+            })();
+            // Don't cache rejected promises — allow retry on next call
+            // Clear cache on rejection so a subsequent caller can retry.
+            // Safe because callers are sequential (main.ts warm call runs before any ecosystem).
+            cachedFiles.catch(() => { cachedFiles = null; });
+        }
+        return cachedFiles;
+    }
+    return {
+        async diff(file) {
+            const files = await getFiles();
+            const found = files.some((f) => f.filename === file);
+            return found ? "changed" : "";
+        },
+        async diffNameOnly() {
+            const files = await getFiles();
+            return files.map((f) => f.filename);
+        },
+        async diffFiltered(filter) {
+            const files = await getFiles();
+            // For filter "A" (added), return only files with status "added".
+            // Intentionally exclude "renamed" to match git --diff-filter=A semantics
+            // (renames are not considered truly added).
+            if (filter === "A") {
+                return files.filter((f) => f.status === "added").map((f) => f.filename);
+            }
+            // Other filters are not currently used by the action; return all changed files
+            return files.map((f) => f.filename);
+        },
+        async showFile(file) {
+            try {
+                const response = await octokit.rest.repos.getContent({
+                    owner,
+                    repo,
+                    path: file,
+                    ref: baseSha,
+                });
+                const data = response.data;
+                if (data.type !== "file")
+                    return null;
+                if (data.content && data.encoding === "base64") {
+                    return Buffer.from(data.content.replace(/\n/g, ""), "base64").toString("utf8");
+                }
+                // content is empty for files > 1MB — fetch via download_url
+                if (data.download_url) {
+                    const res = await fetch(data.download_url);
+                    if (!res.ok)
+                        return null;
+                    return res.text();
+                }
+                return null;
+            }
+            catch {
+                return null;
+            }
+        },
+    };
+}
+//# sourceMappingURL=api-diff.js.map
 ;// CONCATENATED MODULE: ./node_modules/.pnpm/lockparse@0.5.0/node_modules/lockparse/lib/types.js
 const dependencyTypes = [
     'dependencies',
@@ -87073,7 +87254,7 @@ async function mavenPublishDate(group, artifact, version, repositories, registri
     if (ts) {
         return new Date(ts);
     }
-    core.debug(`Could not find publish date for ${group}:${artifact}:${version}`);
+    lib_core.debug(`Could not find publish date for ${group}:${artifact}:${version}`);
     return null;
 }
 /**
@@ -87129,7 +87310,7 @@ async function bcrPublishDate(name, version, token, bcrUrl) {
     catch {
         // fall through
     }
-    core.debug(`Could not find publish date for bazel module ${name}@${version}`);
+    lib_core.debug(`Could not find publish date for bazel module ${name}@${version}`);
     return null;
 }
 /**
@@ -87140,7 +87321,7 @@ async function gitCommitDate(remote, ref, token) {
     // Parse GitHub remote URL
     const ghMatch = remote.match(/github\.com[/:]([^/]+)\/([^/.]+)/);
     if (!ghMatch) {
-        core.debug(`gitCommitDate: cannot parse remote URL: ${remote}`);
+        lib_core.debug(`gitCommitDate: cannot parse remote URL: ${remote}`);
         return null;
     }
     const owner = ghMatch[1];
@@ -87445,10 +87626,10 @@ function npm_detectType(file) {
     if (base === "bun.lock")
         return "bun";
     if (base.endsWith(".yaml") || base.endsWith(".yml")) {
-        core.debug(`npm: treating ${file} as pnpm lockfile based on extension`);
+        lib_core.debug(`npm: treating ${file} as pnpm lockfile based on extension`);
         return "pnpm";
     }
-    core.debug(`npm: treating ${file} as npm lockfile (default fallback)`);
+    lib_core.debug(`npm: treating ${file} as npm lockfile (default fallback)`);
     return "npm";
 }
 /**
@@ -87490,7 +87671,7 @@ async function findChangedPackages(headContent, baseContent, file) {
         headPkgs = collectPackages(parsed.packages);
     }
     catch (e) {
-        core.warning(`Failed to parse ${file}: ${e}`);
+        lib_core.warning(`Failed to parse ${file}: ${e}`);
         return [];
     }
     let basePkgs = new Map();
@@ -87523,7 +87704,7 @@ async function getChangedDeps(baseRef, lockfileInput) {
         const changedFiles = new Set(await gitDiffNameOnly(baseRef));
         files = DEFAULT_LOCKFILES.filter((f) => changedFiles.has(f));
         if (files.length === 0) {
-            core.info("npm: no lockfiles found in changed files");
+            lib_core.info("npm: no lockfiles found in changed files");
             return [];
         }
     }
@@ -87532,7 +87713,7 @@ async function getChangedDeps(baseRef, lockfileInput) {
         // Check if file changed at all
         const diff = await gitDiff(baseRef, file);
         if (!diff) {
-            core.info(`npm: no changes in ${file}`);
+            lib_core.info(`npm: no changes in ${file}`);
             continue;
         }
         // Read full HEAD and base content for proper parsing
@@ -87542,7 +87723,7 @@ async function getChangedDeps(baseRef, lockfileInput) {
             headContent = await fs.readFile(file, "utf8");
         }
         catch {
-            core.info(`npm: could not read ${file}`);
+            lib_core.info(`npm: could not read ${file}`);
             continue;
         }
         const baseContent = await gitShowFile(baseRef, file);
@@ -88718,7 +88899,7 @@ function parseUvLock(content) {
         }
     }
     catch (e) {
-        core.debug(`Failed to parse uv.lock as TOML: ${e}`);
+        lib_core.debug(`Failed to parse uv.lock as TOML: ${e}`);
     }
     return result;
 }
@@ -88736,7 +88917,7 @@ function parsePylockToml(content) {
         }
     }
     catch (e) {
-        core.debug(`Failed to parse pylock.toml: ${e}`);
+        lib_core.debug(`Failed to parse pylock.toml: ${e}`);
     }
     return result;
 }
@@ -88788,7 +88969,7 @@ async function python_getChangedDeps(baseRef, lockfileInput) {
         lockfiles = changedFiles.filter((f) => isPythonLockfile(f));
     }
     if (lockfiles.length === 0) {
-        core.info("python: no changed lockfiles");
+        lib_core.info("python: no changed lockfiles");
         return [];
     }
     const allDeps = [];
@@ -88803,7 +88984,7 @@ async function python_getChangedDeps(baseRef, lockfileInput) {
             headContent = await fs.readFile(file, "utf8");
         }
         catch {
-            core.info(`python: could not read ${file}`);
+            lib_core.info(`python: could not read ${file}`);
             continue;
         }
         const baseContent = await gitShowFile(baseRef, file);
@@ -89186,7 +89367,7 @@ function parseCrateLockVersions(content) {
         }
     }
     catch (e) {
-        core.debug(`rust: failed to parse MODULE.bazel.lock for crate versions: ${e}`);
+        lib_core.debug(`rust: failed to parse MODULE.bazel.lock for crate versions: ${e}`);
     }
     return result;
 }
@@ -89222,13 +89403,13 @@ function resolveCrateVersion(name, range, lockVersions) {
 async function rust_getChangedDeps(baseRef, moduleBazelPath) {
     const moduleFiles = await resolveModuleFiles(moduleBazelPath);
     if (moduleFiles.length === 0) {
-        core.info("rust: no MODULE.bazel files found");
+        lib_core.info("rust: no MODULE.bazel files found");
         return [];
     }
     const changedFiles = new Set(await gitDiffNameOnly(baseRef));
     const relevantFiles = moduleFiles.filter((f) => changedFiles.has(f));
     if (relevantFiles.length === 0) {
-        core.info("rust: no MODULE.bazel files changed");
+        lib_core.info("rust: no MODULE.bazel files changed");
         return [];
     }
     // Resolve crate.spec ranges to concrete versions using MODULE.bazel.lock at the workspace root.
@@ -89239,7 +89420,7 @@ async function rust_getChangedDeps(baseRef, moduleBazelPath) {
         lockVersions = parseCrateLockVersions(lockContent);
     }
     catch {
-        core.debug(`rust: could not read MODULE.bazel.lock at ${lockPath}; version ranges will not be resolved`);
+        lib_core.debug(`rust: could not read MODULE.bazel.lock at ${lockPath}; version ranges will not be resolved`);
     }
     // Parse the base lockfile to skip crates whose resolved version was already on the base branch.
     // This prevents false positives when a no-op range edit (e.g. ^0.13.5 → ~0.13.5) resolves to
@@ -89324,7 +89505,7 @@ async function java_getChangedDeps(baseRef, moduleBazelPath) {
         allInstalls.push(...(await extractMavenInstalls(content, workspaceRoot)));
     }
     if (allInstalls.length === 0) {
-        core.info("java: no maven.install() blocks found");
+        lib_core.info("java: no maven.install() blocks found");
         return { deps: [], repositories: new Map() };
     }
     const allDeps = [];
@@ -89337,7 +89518,7 @@ async function java_getChangedDeps(baseRef, moduleBazelPath) {
             headJson = await promises_.readFile(lockFile, "utf8");
         }
         catch {
-            core.info(`java: lock file ${lockFile} not found, skipping`);
+            lib_core.info(`java: lock file ${lockFile} not found, skipping`);
             continue;
         }
         const headArtifacts = parseArtifacts(headJson);
@@ -89396,13 +89577,13 @@ function parseModuleLock(content) {
                     result.set(match[1], match[2]);
                 }
                 else if (url.endsWith("source.json")) {
-                    core.debug(`bazel: unexpected source.json URL format, skipping: ${url}`);
+                    lib_core.debug(`bazel: unexpected source.json URL format, skipping: ${url}`);
                 }
             }
         }
     }
     catch (e) {
-        core.debug(`Failed to parse MODULE.bazel.lock: ${e}`);
+        lib_core.debug(`Failed to parse MODULE.bazel.lock: ${e}`);
     }
     return result;
 }
@@ -89411,7 +89592,7 @@ async function bazel_module_getChangedDeps(baseRef, moduleBazelPath) {
     // Check if lockfile changed
     const diff = await gitDiff(baseRef, lockfilePath);
     if (!diff) {
-        core.info("bazel: MODULE.bazel.lock not changed");
+        lib_core.info("bazel: MODULE.bazel.lock not changed");
         return { deps: [], overrides: new Map() };
     }
     // Parse HEAD lockfile
@@ -89420,7 +89601,7 @@ async function bazel_module_getChangedDeps(baseRef, moduleBazelPath) {
         headContent = await promises_.readFile(lockfilePath, "utf8");
     }
     catch {
-        core.info(`bazel: could not read ${lockfilePath}`);
+        lib_core.info(`bazel: could not read ${lockfilePath}`);
         return { deps: [], overrides: new Map() };
     }
     const headModules = parseModuleLock(headContent);
@@ -89450,7 +89631,7 @@ async function bazel_module_getChangedDeps(baseRef, moduleBazelPath) {
         // Skip local_path_override modules
         const override = allOverrides.get(name);
         if (override?.type === "local_path") {
-            core.info(`bazel: skipping ${name} (local_path_override)`);
+            lib_core.info(`bazel: skipping ${name} (local_path_override)`);
             continue;
         }
         deps.push({
@@ -89576,7 +89757,7 @@ async function actions_getChangedDeps(baseRef, workflowFilesInput, token = "") {
         }
     }
     if (files.length === 0) {
-        core.info("actions: no changed workflow files");
+        lib_core.info("actions: no changed workflow files");
         return [];
     }
     const headers = {
@@ -89597,7 +89778,7 @@ async function actions_getChangedDeps(baseRef, workflowFilesInput, token = "") {
             headContent = await promises_.readFile(file, "utf8");
         }
         catch {
-            core.info(`actions: could not read ${file}`);
+            lib_core.info(`actions: could not read ${file}`);
             continue;
         }
         const baseContent = await gitShowFile(baseRef, file);
@@ -89677,7 +89858,7 @@ async function actions_getPublishDate(name, ref, token) {
     const key = `${name}@${ref}`;
     if (!branchSkipLogged.has(key)) {
         branchSkipLogged.add(key);
-        core.info(`actions: ${key} appears to be a branch, skipping`);
+        lib_core.info(`actions: ${key} appears to be a branch, skipping`);
     }
     return null;
 }
@@ -89872,7 +90053,7 @@ async function getImagePublishDate(ref, label) {
         const dedupKey = `${label}:${key}`;
         if (!mutableSkipLogged.has(dedupKey)) {
             mutableSkipLogged.add(dedupKey);
-            core.info(`${label}: ${key} has no digest (mutable tag), skipping age check`);
+            lib_core.info(`${label}: ${key} has no digest (mutable tag), skipping age check`);
         }
         return null;
     }
@@ -89995,7 +90176,7 @@ async function docker_getChangedDeps(baseRef, dockerfilesInput, dockerhubMirror)
         files = changedFiles.filter(isDockerfileName);
     }
     if (files.length === 0) {
-        core.info("docker: no changed Dockerfile/Containerfile files");
+        lib_core.info("docker: no changed Dockerfile/Containerfile files");
         return { deps: [], imageRefs: new Map() };
     }
     const allDeps = [];
@@ -90009,7 +90190,7 @@ async function docker_getChangedDeps(baseRef, dockerfilesInput, dockerhubMirror)
             headContent = await promises_.readFile(file, "utf8");
         }
         catch {
-            core.info(`docker: could not read ${file}`);
+            lib_core.info(`docker: could not read ${file}`);
             continue;
         }
         const headCandidates = parseDockerfileImages(headContent);
@@ -90035,7 +90216,7 @@ async function docker_getChangedDeps(baseRef, dockerfilesInput, dockerhubMirror)
                 const reference = ref.digest ?? ref.tag ?? "latest";
                 const exists = await imageExists(ref.registry, ref.repository, reference, dockerhubMirror);
                 if (exists !== "found") {
-                    core.info(`docker: ${raw} not confirmed in registry (${exists}; build context, alias, or typo), skipping`);
+                    lib_core.info(`docker: ${raw} not confirmed in registry (${exists}; build context, alias, or typo), skipping`);
                     continue;
                 }
             }
@@ -90087,7 +90268,7 @@ function parseMultitoolLock(content) {
         }
     }
     catch (e) {
-        core.debug(`Failed to parse multitool lockfile: ${e}`);
+        lib_core.debug(`Failed to parse multitool lockfile: ${e}`);
     }
     return result;
 }
@@ -90121,14 +90302,14 @@ async function multitool_getChangedDeps(baseRef, moduleBazelPath) {
         lockfiles.push(...hubs);
     }
     if (lockfiles.length === 0) {
-        core.info("multitool: no lockfiles found");
+        lib_core.info("multitool: no lockfiles found");
         return [];
     }
     const allDeps = [];
     for (const file of lockfiles) {
         const diff = await gitDiff(baseRef, file);
         if (!diff) {
-            core.info(`multitool: no changes in ${file}`);
+            lib_core.info(`multitool: no changes in ${file}`);
             continue;
         }
         let headContent;
@@ -90136,7 +90317,7 @@ async function multitool_getChangedDeps(baseRef, moduleBazelPath) {
             headContent = await promises_.readFile(file, "utf8");
         }
         catch {
-            core.info(`multitool: could not read ${file}`);
+            lib_core.info(`multitool: could not read ${file}`);
             continue;
         }
         const headTools = parseMultitoolLock(headContent);
@@ -90230,7 +90411,7 @@ async function kubernetes_getChangedDeps(baseRef, kubernetesFilesInput) {
         files = changedFiles.filter((f) => f.endsWith(".yaml") || f.endsWith(".yml"));
     }
     if (files.length === 0) {
-        core.info("kubernetes: no changed YAML files");
+        lib_core.info("kubernetes: no changed YAML files");
         return { deps: [], imageRefs: new Map() };
     }
     const allDeps = [];
@@ -90244,7 +90425,7 @@ async function kubernetes_getChangedDeps(baseRef, kubernetesFilesInput) {
             headContent = await promises_.readFile(file, "utf8");
         }
         catch {
-            core.info(`kubernetes: could not read ${file}`);
+            lib_core.info(`kubernetes: could not read ${file}`);
             continue;
         }
         const headRefs = parseManifestImages(headContent);
@@ -90333,10 +90514,10 @@ async function showGroupDiff(filePath, original, modified, groupName) {
     if (original === modified)
         return false;
     try {
-        core.startGroup(groupName);
+        lib_core.startGroup(groupName);
         await promises_.writeFile(filePath, modified, "utf8");
-        await exec.exec("git", ["diff", "-u", "--color", filePath], { silent: false });
-        core.endGroup();
+        await lib_exec.exec("git", ["diff", "-u", "--color", filePath], { silent: false });
+        lib_core.endGroup();
         return true;
     }
     finally {
@@ -90351,14 +90532,14 @@ async function showDiff(filePath, original, modified) {
         await promises_.writeFile(filePath, modified, "utf8");
         if (isNew) {
             // Intent-to-add so git diff can see the new file
-            await exec.exec("git", ["add", "-N", filePath], { silent: true });
+            await lib_exec.exec("git", ["add", "-N", filePath], { silent: true });
         }
-        await exec.exec("git", ["diff", "-u", "--color", filePath], { silent: false });
+        await lib_exec.exec("git", ["diff", "-u", "--color", filePath], { silent: false });
         return true;
     }
     finally {
         if (isNew) {
-            await exec.exec("git", ["reset", filePath], { silent: true });
+            await lib_exec.exec("git", ["reset", filePath], { silent: true });
             await promises_.unlink(filePath).catch(() => { });
         }
         else {
@@ -90372,7 +90553,7 @@ async function showDiff(filePath, original, modified) {
 async function getToolVersion(tool) {
     try {
         let stdout = "";
-        await exec.exec(tool, ["--version"], {
+        await lib_exec.exec(tool, ["--version"], {
             listeners: { stdout: (data) => (stdout += data.toString()) },
             silent: true,
         });
@@ -90510,7 +90691,7 @@ async function suggestUvExcludeNewer(dir, minAgeDays) {
 async function suggestPnpmAge(minAgeDays) {
     const ver = await getToolVersion("pnpm");
     if (ver && !versionAtLeast(ver, "10.16")) {
-        core.info(`pnpm ${ver} does not support minimumReleaseAge (requires >= 10.16)`);
+        lib_core.info(`pnpm ${ver} does not support minimumReleaseAge (requires >= 10.16)`);
         return false;
     }
     const file = "pnpm-workspace.yaml";
@@ -90554,7 +90735,7 @@ async function suggestPnpmAge(minAgeDays) {
 async function suggestYarnAge(minAgeDays) {
     const ver = await getToolVersion("yarn");
     if (ver && !versionAtLeast(ver, "4.10")) {
-        core.info(`yarn ${ver} does not support npmMinimalAgeGate (requires >= 4.10)`);
+        lib_core.info(`yarn ${ver} does not support npmMinimalAgeGate (requires >= 4.10)`);
         return false;
     }
     const file = ".yarnrc.yml";
@@ -90600,7 +90781,7 @@ async function suggestYarnAge(minAgeDays) {
 async function suggestBunAge(minAgeDays) {
     const ver = await getToolVersion("bun");
     if (ver && !versionAtLeast(ver, "1.3")) {
-        core.info(`bun ${ver} does not support minimumReleaseAge (requires >= 1.3)`);
+        lib_core.info(`bun ${ver} does not support minimumReleaseAge (requires >= 1.3)`);
         return false;
     }
     const file = "bunfig.toml";
@@ -90650,7 +90831,7 @@ async function suggestBunAge(minAgeDays) {
 async function suggestNpmAge(minAgeDays) {
     const ver = await getToolVersion("npm");
     if (ver && !versionAtLeast(ver, "11.10")) {
-        core.info(`npm ${ver} does not support min-release-age (requires >= 11.10)`);
+        lib_core.info(`npm ${ver} does not support min-release-age (requires >= 11.10)`);
         return false;
     }
     const file = ".npmrc";
@@ -90678,7 +90859,7 @@ async function suggestNpmAge(minAgeDays) {
         // File didn't exist — write it, diff, then remove
         try {
             await promises_.writeFile(file, modified, "utf8");
-            await exec.exec("git", ["diff", "-u", "--color", "--no-index", "/dev/null", file], { silent: false, ignoreReturnCode: true });
+            await lib_exec.exec("git", ["diff", "-u", "--color", "--no-index", "/dev/null", file], { silent: false, ignoreReturnCode: true });
             return true;
         }
         finally {
@@ -90950,7 +91131,7 @@ async function showAgeGateDiffs(results, ecosystems, minAgeDays) {
         : new Set();
     const hasNpmLockfiles = npmLockfiles.size > 0;
     if (hasPythonDirs || hasNpmLockfiles) {
-        core.startGroup("Suggested: add package manager age gate settings");
+        lib_core.startGroup("Suggested: add package manager age gate settings");
         if (hasPythonDirs) {
             for (const dir of pythonWorkspaceDirs) {
                 await suggestUvExcludeNewer(dir, minAgeDays);
@@ -90966,7 +91147,7 @@ async function showAgeGateDiffs(results, ecosystems, minAgeDays) {
             if (npmLockfiles.has("bun.lock") || npmLockfiles.has("bun.lockb"))
                 await suggestBunAge(minAgeDays);
         }
-        core.endGroup();
+        lib_core.endGroup();
     }
     // Section 2: Per-package exclusions (only for packages that FAIL, not warn)
     // Group failed packages by (ecosystem, workspace dir), deduplicated
@@ -90988,7 +91169,7 @@ async function showAgeGateDiffs(results, ecosystems, minAgeDays) {
     let shownExclusions = false;
     const startExclGroup = () => {
         if (!shownExclusions) {
-            core.startGroup("Suggested: add per-package age gate exclusions");
+            lib_core.startGroup("Suggested: add per-package age gate exclusions");
             shownExclusions = true;
         }
     };
@@ -91015,7 +91196,7 @@ async function showAgeGateDiffs(results, ecosystems, minAgeDays) {
         }
     }
     if (shownExclusions)
-        core.endGroup();
+        lib_core.endGroup();
 }
 function dedupeResults(results) {
     const seen = new Set();
@@ -91032,10 +91213,10 @@ function dedupeResults(results) {
 async function emitAnnotations(results, ecosystems, minAgeDays) {
     for (const { dep, ageDays, status } of results) {
         if (status === "fail") {
-            core.error(`${dep.name}@${dep.version} published ${ageDays}d ago, minimum is ${minAgeDays}d`, { file: dep.file });
+            lib_core.error(`${dep.name}@${dep.version} published ${ageDays}d ago, minimum is ${minAgeDays}d`, { file: dep.file });
         }
         else if (status === "warn") {
-            core.warning(`${dep.name}@${dep.version} published ${ageDays}d ago`, { file: dep.file });
+            lib_core.warning(`${dep.name}@${dep.version} published ${ageDays}d ago`, { file: dep.file });
         }
     }
     await showAgeGateDiffs(results, new Set(ecosystems), minAgeDays);
@@ -91122,11 +91303,11 @@ function sortedLicenseResults(results) {
 }
 async function writeSummary(results, minAgeDays, warnAgeDays, licenseResults = []) {
     if (results.length === 0 && licenseResults.length === 0) {
-        core.summary.addRaw("No dependency changes detected.");
+        lib_core.summary.addRaw("No dependency changes detected.");
         const branding = getBranding();
         if (branding)
-            core.summary.addRaw(branding);
-        await core.summary.write();
+            lib_core.summary.addRaw(branding);
+        await lib_core.summary.write();
         return;
     }
     const statusIcon = {
@@ -91135,9 +91316,9 @@ async function writeSummary(results, minAgeDays, warnAgeDays, licenseResults = [
         fail: "❌",
         unknown: "❓",
     };
-    core.summary.addHeading("Lisan al-Gaib", 2);
-    core.summary.addRaw(`Minimum age: *${minAgeDays}d* | Warning threshold: *${warnAgeDays}d*\n\n`);
-    core.summary.addTable([
+    lib_core.summary.addHeading("Lisan al-Gaib", 2);
+    lib_core.summary.addRaw(`Minimum age: *${minAgeDays}d* | Warning threshold: *${warnAgeDays}d*\n\n`);
+    lib_core.summary.addTable([
         [
             { data: "Ecosystem", header: true },
             { data: "Package", header: true },
@@ -91155,8 +91336,8 @@ async function writeSummary(results, minAgeDays, warnAgeDays, licenseResults = [
     ]);
     // License compliance table
     if (licenseResults.length > 0) {
-        core.summary.addHeading("License Compliance", 2);
-        core.summary.addTable([
+        lib_core.summary.addHeading("License Compliance", 2);
+        lib_core.summary.addTable([
             [
                 { data: "Ecosystem", header: true },
                 { data: "Package", header: true },
@@ -91179,8 +91360,8 @@ async function writeSummary(results, minAgeDays, warnAgeDays, licenseResults = [
     }
     const branding = getBranding();
     if (branding)
-        core.summary.addRaw(branding);
-    await core.summary.write();
+        lib_core.summary.addRaw(branding);
+    await lib_core.summary.write();
 }
 function reportTotals(results) {
     const checked = results.filter((r) => r.status !== "unknown").length;
@@ -94406,10 +94587,10 @@ async function showGroupedDiff(filePath, original, modified, groupName) {
     if (original === modified)
         return false;
     try {
-        core.startGroup(groupName);
+        lib_core.startGroup(groupName);
         await promises_.writeFile(filePath, modified, "utf8");
-        await exec.exec("git", ["diff", "-u", "--color", filePath], { silent: false });
-        core.endGroup();
+        await lib_exec.exec("git", ["diff", "-u", "--color", filePath], { silent: false });
+        lib_core.endGroup();
         return true;
     }
     finally {
@@ -94883,12 +95064,12 @@ async function getTargetLicenses(input) {
     if (input.toLowerCase() === "auto") {
         const detected = await detectProjectLicense();
         if (detected) {
-            core.info(`Auto-detected project license: ${detected}`);
+            lib_core.info(`Auto-detected project license: ${detected}`);
             const map = new Map();
             map.set("*", [detected]);
             return map;
         }
-        core.info("Could not auto-detect project license; defaulting to open-source-no-relinkable-copyleft.");
+        lib_core.info("Could not auto-detect project license; defaulting to open-source-no-relinkable-copyleft.");
         const map = new Map();
         map.set("*", ["open-source-no-relinkable-copyleft"]);
         return map;
@@ -95789,13 +95970,13 @@ async function emitLicenseAnnotations(licenseResults, checkResults, licenseHeuri
     for (const lr of licenseResults) {
         if (lr.compatible === false) {
             const cr = checkResults.find((r) => r.dep.name === lr.name && r.dep.version === lr.version);
-            core.error(`[${lr.ecosystem}] ${lr.name}@${lr.version} has incompatible license: ${lr.spdx ?? lr.license}`, cr ? { file: cr.dep.file } : undefined);
+            lib_core.error(`[${lr.ecosystem}] ${lr.name}@${lr.version} has incompatible license: ${lr.spdx ?? lr.license}`, cr ? { file: cr.dep.file } : undefined);
             violations++;
             violationResults.push(lr);
         }
         else if (lr.compatible === null && lr.license === null) {
             const cr = checkResults.find((r) => r.dep.name === lr.name && r.dep.version === lr.version);
-            core.warning(`[${lr.ecosystem}] ${lr.name}@${lr.version}: could not determine license`, cr ? { file: cr.dep.file } : undefined);
+            lib_core.warning(`[${lr.ecosystem}] ${lr.name}@${lr.version}: could not determine license`, cr ? { file: cr.dep.file } : undefined);
             unknownResults.push(lr);
         }
     }
@@ -95804,6 +95985,7 @@ async function emitLicenseAnnotations(licenseResults, checkResults, licenseHeuri
 }
 //# sourceMappingURL=license.js.map
 ;// CONCATENATED MODULE: ./out/main.js
+
 
 
 
@@ -95852,14 +96034,14 @@ async function resolveEffectiveBaseRef(baseRef, checkAllOnNewWorkflow) {
     const workflowPath = getWorkflowFilePath();
     if (!workflowPath)
         return baseRef;
-    core.info(`Workflow file: ${workflowPath}`);
+    lib_core.info(`Workflow file: ${workflowPath}`);
     // Use --diff-filter=A to only match truly added files, not renames
     const addedFiles = await gitDiffFiltered(baseRef, "A");
     if (!addedFiles.includes(workflowPath))
         return baseRef;
-    core.info(`Workflow file ${workflowPath} is newly added — checking ALL packages`);
+    lib_core.info(`Workflow file ${workflowPath} is newly added — checking ALL packages`);
     // Empty tree SHA — forces diffing everything
-    return "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    return EMPTY_TREE;
 }
 async function lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs, dockerImageRefs) {
     switch (dep.ecosystem) {
@@ -95884,10 +96066,10 @@ async function lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kuber
                 if (date === null) {
                     const msg = `${dep.name}: archive_override has no Last-Modified header (${override.urls[0]})`;
                     if (inputs.strictThirdParty) {
-                        core.error(msg, { file: dep.file });
+                        lib_core.error(msg, { file: dep.file });
                     }
                     else {
-                        core.warning(msg, { file: dep.file });
+                        lib_core.warning(msg, { file: dep.file });
                     }
                 }
                 return date;
@@ -95910,10 +96092,10 @@ async function lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kuber
                 if (actionOwner !== contextOwner) {
                     const msg = `${dep.name}@${dep.version} appears to be a branch ref from a third-party owner`;
                     if (inputs.strictThirdParty) {
-                        core.error(msg, { file: dep.file });
+                        lib_core.error(msg, { file: dep.file });
                     }
                     else {
-                        core.warning(msg, { file: dep.file });
+                        lib_core.warning(msg, { file: dep.file });
                     }
                 }
             }
@@ -95924,10 +96106,10 @@ async function lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kuber
             if (date === null) {
                 const msg = `${dep.name}: multitool binary has no Last-Modified header (${dep.version})`;
                 if (inputs.strictThirdParty) {
-                    core.error(msg, { file: dep.file });
+                    lib_core.error(msg, { file: dep.file });
                 }
                 else {
-                    core.warning(msg, { file: dep.file });
+                    lib_core.warning(msg, { file: dep.file });
                 }
             }
             return date;
@@ -95943,10 +96125,44 @@ async function lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kuber
 async function run() {
     const inputs = getInputs();
     const rawBaseRef = resolveBaseRef(inputs.baseRef);
-    const validatedRef = await validateBaseRef(rawBaseRef);
-    const diffableRef = await ensureBaseRefAvailable(validatedRef);
+    const plan = await makeBaseRefDiffable(rawBaseRef, {
+        fetchRetries: inputs.fetchMissingHistoryRetries,
+    });
+    let diffableRef;
+    if (plan.mode === "api") {
+        if (!inputs.githubToken) {
+            lib_core.warning("No github-token provided — cannot use GitHub compare API; falling back to checking all packages");
+            diffableRef = EMPTY_TREE;
+        }
+        else {
+            try {
+                const { owner, repo: repoName } = github.context.repo;
+                const source = createApiDiffSource({
+                    octokit: github.getOctokit(inputs.githubToken),
+                    owner,
+                    repo: repoName,
+                    baseSha: plan.baseSha,
+                    headSha: plan.headSha,
+                });
+                await source.diffNameOnly(); // warm call — surface API errors before ecosystems run
+                setDiffSource(source);
+                diffableRef = plan.baseSha;
+            }
+            catch (err) {
+                lib_core.warning(`GitHub compare API unavailable (${err instanceof Error ? err.message : String(err)}) — falling back to checking all packages`);
+                diffableRef = EMPTY_TREE;
+            }
+        }
+    }
+    else {
+        diffableRef = plan.baseRef;
+    }
     const baseRef = await resolveEffectiveBaseRef(diffableRef, inputs.checkAllOnNewWorkflow);
-    core.info(`Dependency age check — min: ${inputs.minAgeDays}d, warn: ${inputs.warnAgeDays}d, base: ${baseRef}`);
+    // Empty tree is always locally diffable — ensure git mode is active
+    if (baseRef === EMPTY_TREE) {
+        setDiffSource(null);
+    }
+    lib_core.info(`Dependency age check — min: ${inputs.minAgeDays}d, warn: ${inputs.warnAgeDays}d, base: ${baseRef}`);
     let allResults = [];
     // Cache for publish date lookups: "ecosystem:name@version" → Date | null
     const publishDateCache = new Map();
@@ -95956,7 +96172,7 @@ async function run() {
     let kubernetesImageRefs = new Map();
     let dockerImageRefs = new Map();
     for (const eco of inputs.ecosystems) {
-        core.startGroup(`=== ${eco} ===`);
+        lib_core.startGroup(`=== ${eco} ===`);
         let deps;
         switch (eco) {
             case "npm":
@@ -95999,19 +96215,19 @@ async function run() {
                 break;
             }
             default:
-                core.setFailed(`Unknown ecosystem: ${eco}`);
+                lib_core.setFailed(`Unknown ecosystem: ${eco}`);
                 return;
         }
         if (deps.length === 0) {
-            core.info(`No new/changed packages in ${eco}`);
-            core.endGroup();
+            lib_core.info(`No new/changed packages in ${eco}`);
+            lib_core.endGroup();
             continue;
         }
-        core.info(`Found ${deps.length} changed packages in ${eco}`);
+        lib_core.info(`Found ${deps.length} changed packages in ${eco}`);
         // Filter out age-overridden packages
         const filteredDeps = deps.filter((dep) => {
             if (inputs.ageOverrides.get(dep.ecosystem)?.has(dep.name)) {
-                core.info(`Skipping age check for ${dep.name} (age-override)`);
+                lib_core.info(`Skipping age check for ${dep.name} (age-override)`);
                 return false;
             }
             return true;
@@ -96035,7 +96251,7 @@ async function run() {
                     publishDateCache.set(key, r.value);
                 }
                 else {
-                    core.warning(`Registry lookup failed for ${key}: ${r.reason}`);
+                    lib_core.warning(`Registry lookup failed for ${key}: ${r.reason}`);
                     publishDateCache.set(key, null);
                 }
             });
@@ -96049,7 +96265,7 @@ async function run() {
             const status = determineStatus(ageDays, inputs.minAgeDays, inputs.warnAgeDays);
             allResults.push({ dep, publishDate, ageDays, status });
         }
-        core.endGroup();
+        lib_core.endGroup();
     }
     allResults = dedupeResults(allResults);
     // License compliance check
@@ -96057,9 +96273,9 @@ async function run() {
     let licenseViolations = 0;
     let licenseResults = [];
     if (targetLicenses && targetLicenses.size > 0) {
-        core.startGroup("=== license compliance ===");
+        lib_core.startGroup("=== license compliance ===");
         for (const [eco, licenses] of targetLicenses) {
-            core.info(`Target licenses [${eco}]: ${licenses.join(", ")}`);
+            lib_core.info(`Target licenses [${eco}]: ${licenses.join(", ")}`);
         }
         licenseResults = await checkLicenses(allResults, targetLicenses, inputs.registries, javaRepoMap, inputs.githubToken, inputs.bcrUrl, inputs.licenseOverrides, inputs.licenseHeuristics, kubernetesImageRefs, dockerImageRefs);
         // When heuristics is off, still try to infer licenses for suggestion purposes
@@ -96076,25 +96292,25 @@ async function run() {
             }
         }
         licenseViolations = await emitLicenseAnnotations(licenseResults, allResults, inputs.licenseHeuristics, inferredLicenses);
-        core.info(`License check: ${licenseResults.length} packages, ${licenseViolations} violation(s)`);
-        core.endGroup();
+        lib_core.info(`License check: ${licenseResults.length} packages, ${licenseViolations} violation(s)`);
+        lib_core.endGroup();
     }
     // Report
     await emitAnnotations(allResults, inputs.ecosystems, inputs.minAgeDays);
     await writeSummary(allResults, inputs.minAgeDays, inputs.warnAgeDays, licenseResults);
     const { checked, failures, warnings } = reportTotals(allResults);
-    core.setOutput("total-checked", checked);
-    core.setOutput("total-failures", failures);
-    core.setOutput("total-warnings", warnings);
-    core.setOutput("license-violations", licenseViolations);
-    core.info(`Checked ${checked} packages, ${failures} failed, ${warnings} warnings, ${licenseViolations} license violation(s)`);
+    lib_core.setOutput("total-checked", checked);
+    lib_core.setOutput("total-failures", failures);
+    lib_core.setOutput("total-warnings", warnings);
+    lib_core.setOutput("license-violations", licenseViolations);
+    lib_core.info(`Checked ${checked} packages, ${failures} failed, ${warnings} warnings, ${licenseViolations} license violation(s)`);
     const totalFailures = failures + licenseViolations;
     if (totalFailures > 0) {
         const bypassed = inputs.bypassKeyword
             ? await checkBypass(inputs.bypassKeyword, inputs.githubToken)
             : false;
         if (bypassed) {
-            core.warning(`Bypass keyword "${inputs.bypassKeyword}" detected — downgrading ${totalFailures} failure(s) to warnings`);
+            lib_core.warning(`Bypass keyword "${inputs.bypassKeyword}" detected — downgrading ${totalFailures} failure(s) to warnings`);
         }
         else {
             const parts = [];
@@ -96109,11 +96325,11 @@ async function run() {
                     ? `To bypass, add "${inputs.bypassKeyword}" as a PR label`
                     : `To bypass, add "${inputs.bypassKeyword}" on its own line in the HEAD commit message, or add it as a label on the associated PR`);
             }
-            core.setFailed(parts.join(". "));
+            lib_core.setFailed(parts.join(". "));
         }
     }
 }
 run().catch((err) => {
-    core.setFailed(err instanceof Error ? err.message : String(err));
+    lib_core.setFailed(err instanceof Error ? err.message : String(err));
 });
 //# sourceMappingURL=main.js.map
