@@ -123,7 +123,7 @@ describe("createApiDiffSource — showFile", () => {
 });
 
 describe("createApiDiffSource — result caching", () => {
-  it("calls compareCommits only once even when multiple primitives are invoked", async () => {
+  it("calls compareCommits only once (single page) even when multiple primitives are invoked", async () => {
     const octokit = makeOctokit();
     const source = createApiDiffSource({
       octokit: octokit as any,
@@ -135,6 +135,66 @@ describe("createApiDiffSource — result caching", () => {
     await source.diffNameOnly();
     await source.diffFiltered("A");
     await source.diff("package.json");
+    // 4 compare files < 100 per_page → single page
     expect(octokit.rest.repos.compareCommits).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("createApiDiffSource — pagination", () => {
+  it("fetches all pages when the first page is full (100 files)", async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({
+      filename: `file${i}.ts`,
+      status: "modified",
+    }));
+    const page2 = [{ filename: "final.ts", status: "added" }];
+    const mockCompare = vi.fn()
+      .mockResolvedValueOnce({ data: { files: page1 } })
+      .mockResolvedValueOnce({ data: { files: page2 } });
+
+    const source = createApiDiffSource({
+      octokit: { rest: { repos: { compareCommits: mockCompare, getContent: vi.fn() } } } as any,
+      owner: "o", repo: "r", baseSha: "b", headSha: "h",
+    });
+
+    const files = await source.diffNameOnly();
+    expect(files).toHaveLength(101);
+    expect(files).toContain("final.ts");
+    expect(mockCompare).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops fetching when a page returns fewer than per_page files", async () => {
+    const mockCompare = vi.fn().mockResolvedValue({ data: { files: compareFiles } });  // 4 files < 100
+
+    const source = createApiDiffSource({
+      octokit: { rest: { repos: { compareCommits: mockCompare, getContent: vi.fn() } } } as any,
+      owner: "o", repo: "r", baseSha: "b", headSha: "h",
+    });
+
+    await source.diffNameOnly();
+    expect(mockCompare).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("createApiDiffSource — compareCommits error handling", () => {
+  it("propagates compareCommits error so caller can detect and degrade", async () => {
+    const mockCompare = vi.fn().mockRejectedValue(
+      Object.assign(new Error("Not Found"), { status: 404 }),
+    );
+    const source = createApiDiffSource({
+      octokit: { rest: { repos: { compareCommits: mockCompare, getContent: vi.fn() } } } as any,
+      owner: "o", repo: "r", baseSha: "b", headSha: "h",
+    });
+    await expect(source.diffNameOnly()).rejects.toThrow("Not Found");
+  });
+});
+
+describe("createApiDiffSource — showFile error handling", () => {
+  it("returns null when getContent throws a non-404 error such as a rate limit", async () => {
+    const source = makeSource({
+      getContentImpl: async () => {
+        throw Object.assign(new Error("Forbidden"), { status: 403 });
+      },
+    });
+    expect(await source.showFile("locked.ts")).toBeNull();
   });
 });

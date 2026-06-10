@@ -19,7 +19,7 @@ vi.mock("@actions/exec", () => ({
 
 import * as github from "@actions/github";
 import * as exec from "@actions/exec";
-import { resolveBaseRef, validateBaseRef, makeBaseRefDiffable } from "../src/base-ref.js";
+import { resolveBaseRef, validateBaseRef, makeBaseRefDiffable, EMPTY_TREE } from "../src/base-ref.js";
 
 describe("resolveBaseRef", () => {
   beforeEach(() => {
@@ -136,15 +136,11 @@ describe("validateBaseRef", () => {
 
   it("falls back to empty tree when everything fails", async () => {
     vi.mocked(exec.exec).mockResolvedValue(1);
-    expect(await validateBaseRef("bad-ref")).toBe(
-      "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-    );
+    expect(await validateBaseRef("bad-ref")).toBe(EMPTY_TREE);
   });
 });
 
 describe("makeBaseRefDiffable", () => {
-  const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-
   beforeEach(() => {
     vi.clearAllMocks();
     Object.assign(github.context, { eventName: "schedule", payload: {}, sha: "headsha" });
@@ -281,5 +277,44 @@ describe("makeBaseRefDiffable", () => {
 
     const result = await makeBaseRefDiffable("deadbeef456", { fetchRetries: 3 });
     expect(result).toEqual({ mode: "api", baseSha: "deadbeef456", headSha: "headsha123" });
+  });
+
+  it("skips the deepen loop entirely when fetchRetries is 0", async () => {
+    // isShallowRepo → true (would deepen if retries > 0)
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("true\n"));
+      return 0;
+    });
+    // deepenLoop runs 0 iterations (fetchRetries: 0)
+    // revParse("HEAD~1^{commit}") → not found (no parent fetched)
+    vi.mocked(exec.exec).mockResolvedValueOnce(1);
+
+    const result = await makeBaseRefDiffable("HEAD~1", { fetchRetries: 0 });
+    expect(result).toEqual({ mode: "git", baseRef: EMPTY_TREE });
+    // Verify that git fetch --deepen was never called
+    const fetchCalls = vi.mocked(exec.exec).mock.calls.filter(
+      ([, args]) => args?.includes("--deepen=100"),
+    );
+    expect(fetchCalls).toHaveLength(0);
+  });
+
+  it("uses pull_request.head.sha as headSha for PR events to avoid the synthetic merge commit", async () => {
+    Object.assign(github.context, {
+      eventName: "pull_request",
+      payload: { pull_request: { head: { sha: "pr-head-sha" } } },
+      sha: "merge-commit-sha",  // synthetic merge commit — must NOT be used
+    });
+    // refExists("pr-base") → not found
+    vi.mocked(exec.exec).mockResolvedValueOnce(1);
+    // isShallowRepo → false
+    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+      opts?.listeners?.stdout?.(Buffer.from("false\n"));
+      return 0;
+    });
+    // canDiffCommits("pr-base") → fail
+    vi.mocked(exec.exec).mockResolvedValueOnce(1);
+
+    const result = await makeBaseRefDiffable("pr-base", { fetchRetries: 3 });
+    expect(result).toEqual({ mode: "api", baseSha: "pr-base", headSha: "pr-head-sha" });
   });
 });
