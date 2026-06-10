@@ -87,6 +87,7 @@ async function main() {
     "crates-registry-url": args["crates-registry-url"] ?? "https://crates.io",
     "maven-registry-url": args["maven-registry-url"] ?? "https://repo1.maven.org/maven2",
     "check-all-on-new-workflow": "false",
+    "fetch-missing-history-retries": args["fetch-missing-history-retries"] ?? "10",
     "strict-third-party": args["strict-third-party"] ?? "false",
     "bypass-keyword": "",
     "target-licenses": args["target-licenses"] ?? "",

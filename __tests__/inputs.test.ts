@@ -122,6 +122,31 @@ describe("getInputs", () => {
     const inputs = getInputs();
     expect(inputs.dockerhubMirror).toBe("");
   });
+
+  it("parses fetch-missing-history-retries to a number", () => {
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      if (name === "fetch-missing-history-retries") return "5";
+      return name === "ecosystems" ? "npm" : "";
+    });
+    vi.mocked(core.getBooleanInput).mockReturnValue(false);
+    const inputs = getInputs();
+    expect(inputs.fetchMissingHistoryRetries).toBe(5);
+  });
+
+  it("defaults fetch-missing-history-retries to 10 when not provided", () => {
+    const inputs = getInputs();
+    expect(inputs.fetchMissingHistoryRetries).toBe(10);
+  });
+
+  it("defaults fetch-missing-history-retries to 10 when provided value is invalid", () => {
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      if (name === "fetch-missing-history-retries") return "notanumber";
+      return name === "ecosystems" ? "npm" : "";
+    });
+    vi.mocked(core.getBooleanInput).mockReturnValue(false);
+    const inputs = getInputs();
+    expect(inputs.fetchMissingHistoryRetries).toBe(10);
+  });
 });
 
 describe("parseLicenseOverrides", () => {

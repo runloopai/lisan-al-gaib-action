@@ -136,6 +136,13 @@ inputs:
       changed ones. Set to "false" to disable.
     required: false
     default: "true"
+  fetch-missing-history-retries:
+    description: >
+      Maximum number of incremental `git fetch --deepen` iterations used to
+      recover missing history on shallow checkouts (e.g. fetch-depth: 1) before
+      falling back to the GitHub compare API. Set higher for very deep diffs.
+    required: false
+    default: "10"
   maven-registry-url:
     description: >
       Maven Central registry URL. Used as the default when querying

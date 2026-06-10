@@ -33,6 +33,7 @@ export interface ActionInputs {
   licenseOverrides: LicenseOverrides;
   ageOverrides: AgeOverrides;
   licenseHeuristics: boolean;
+  fetchMissingHistoryRetries: number;
 }
 
 function trimSlash(url: string): string {
@@ -50,6 +51,9 @@ export function getInputs(): ActionInputs {
   const minAgeDays = isNaN(parsedMin) ? 14 : parsedMin;
   const parsedWarn = parseInt(core.getInput("warn-age-days") || "21", 10);
   const warnAgeDays = isNaN(parsedWarn) ? 21 : parsedWarn;
+
+  const parsedRetries = parseInt(core.getInput("fetch-missing-history-retries") || "10", 10);
+  const fetchMissingHistoryRetries = isNaN(parsedRetries) || parsedRetries < 0 ? 10 : parsedRetries;
 
   if (warnAgeDays < minAgeDays) {
     core.warning(
@@ -97,6 +101,7 @@ export function getInputs(): ActionInputs {
       core.getInput("age-overrides"),
     ),
     licenseHeuristics: core.getBooleanInput("license-heuristics"),
+    fetchMissingHistoryRetries,
     registries: {
       npm: trimSlash(core.getInput("npm-registry-url") || "https://registry.npmjs.org"),
       pypi: trimSlash(core.getInput("pypi-registry-url") || "https://pypi.org"),
