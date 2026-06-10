@@ -82205,10 +82205,64 @@ var __webpack_exports__ = {};
 
 // EXTERNAL MODULE: ./node_modules/.pnpm/@actions+core@1.11.1/node_modules/@actions/core/lib/core.js
 var core = __nccwpck_require__(6966);
-// EXTERNAL MODULE: ./node_modules/.pnpm/@actions+exec@1.1.1/node_modules/@actions/exec/lib/exec.js
-var exec = __nccwpck_require__(2851);
 // EXTERNAL MODULE: ./node_modules/.pnpm/@actions+github@6.0.1/node_modules/@actions/github/lib/github.js
 var github = __nccwpck_require__(4903);
+// EXTERNAL MODULE: ./node_modules/.pnpm/@actions+exec@1.1.1/node_modules/@actions/exec/lib/exec.js
+var exec = __nccwpck_require__(2851);
+;// CONCATENATED MODULE: ./out/bypass.js
+
+
+const PR_EVENTS = new Set(["pull_request", "pull_request_target"]);
+function isPrEvent() {
+    return PR_EVENTS.has(github.context.eventName);
+}
+/**
+ * Check whether the bypass keyword is present via the appropriate source for the event type.
+ *
+ * On pull_request / pull_request_target: accepted ONLY as a PR label (contributor-editable
+ * sources like PR body and commit messages are rejected).
+ *
+ * On all other events: accepted from the HEAD commit message, or from a label on any PR
+ * associated with the HEAD commit (via the GitHub API when a token is available).
+ */
+async function checkBypass(keyword, token) {
+    if (isPrEvent()) {
+        const labels = github.context.payload.pull_request?.labels;
+        return labels?.some((l) => l.name === keyword) ?? false;
+    }
+    // Non-PR events: HEAD commit message first
+    try {
+        let msg = "";
+        await exec.exec("git", ["log", "-1", "--format=%B"], {
+            listeners: { stdout: (data) => (msg += data.toString()) },
+            silent: true,
+        });
+        if (msg.split("\n").map((l) => l.trim()).includes(keyword))
+            return true;
+    }
+    catch {
+        // git not available
+    }
+    // Then look for a label on an associated PR
+    if (token) {
+        try {
+            const octokit = github.getOctokit(token);
+            const { owner, repo } = github.context.repo;
+            const { data: prs } = await octokit.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner,
+                repo,
+                commit_sha: github.context.sha,
+            });
+            if (prs.some((pr) => pr.labels.some((l) => l.name === keyword)))
+                return true;
+        }
+        catch {
+            // API call failed
+        }
+    }
+    return false;
+}
+//# sourceMappingURL=bypass.js.map
 ;// CONCATENATED MODULE: ./node_modules/.pnpm/js-yaml@4.1.1/node_modules/js-yaml/dist/js-yaml.mjs
 
 /*! js-yaml 4.1.1 https://github.com/nodeca/js-yaml @license MIT */
@@ -95807,65 +95861,6 @@ async function resolveEffectiveBaseRef(baseRef, checkAllOnNewWorkflow) {
     // Empty tree SHA — forces diffing everything
     return "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 }
-/**
- * Check whether the bypass keyword appears in:
- * 1. The PR body (on a line by itself, leading/trailing whitespace allowed)
- * 2. A PR label matching the keyword
- * 3. The HEAD commit message (for push/workflow_dispatch/etc.)
- */
-async function checkBypass(keyword, token) {
-    // 1. PR body
-    const prBody = github.context.payload.pull_request?.body;
-    if (prBody) {
-        const lines = prBody.split("\n").map((l) => l.trim());
-        if (lines.includes(keyword))
-            return true;
-    }
-    // 2. PR labels
-    const labels = github.context.payload.pull_request?.labels;
-    if (labels?.some((l) => l.name === keyword))
-        return true;
-    // If not a PR, also try fetching labels via API (for push events on PRs)
-    if (!labels && token) {
-        try {
-            const octokit = github.getOctokit(token);
-            const { owner, repo } = github.context.repo;
-            // Find PRs associated with the HEAD commit
-            const { data: prs } = await octokit.rest.repos.listPullRequestsAssociatedWithCommit({
-                owner,
-                repo,
-                commit_sha: github.context.sha,
-            });
-            for (const pr of prs) {
-                if (pr.labels.some((l) => l.name === keyword))
-                    return true;
-                if (pr.body) {
-                    const lines = pr.body.split("\n").map((l) => l.trim());
-                    if (lines.includes(keyword))
-                        return true;
-                }
-            }
-        }
-        catch {
-            // API call failed, continue to commit message check
-        }
-    }
-    // 3. HEAD commit message
-    try {
-        let msg = "";
-        await exec.exec("git", ["log", "-1", "--format=%B"], {
-            listeners: { stdout: (data) => (msg += data.toString()) },
-            silent: true,
-        });
-        const lines = msg.split("\n").map((l) => l.trim());
-        if (lines.includes(keyword))
-            return true;
-    }
-    catch {
-        // git not available
-    }
-    return false;
-}
 async function lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs, dockerImageRefs) {
     switch (dep.ecosystem) {
         case "npm":
@@ -96110,7 +96105,9 @@ async function run() {
                 parts.push(`${licenseViolations} package(s) have incompatible licenses`);
             }
             if (inputs.bypassKeyword) {
-                parts.push(`To bypass, add "${inputs.bypassKeyword}" on its own line in your PR body or commit message, or add it as a PR label`);
+                parts.push(isPrEvent()
+                    ? `To bypass, add "${inputs.bypassKeyword}" as a PR label`
+                    : `To bypass, add "${inputs.bypassKeyword}" on its own line in the HEAD commit message, or add it as a label on the associated PR`);
             }
             core.setFailed(parts.join(". "));
         }

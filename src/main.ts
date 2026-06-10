@@ -1,6 +1,6 @@
 import * as core from "@actions/core";
-import * as exec from "@actions/exec";
 import * as github from "@actions/github";
+import { checkBypass, isPrEvent } from "./bypass.js";
 import { getInputs } from "./inputs.js";
 import { resolveBaseRef, validateBaseRef, ensureBaseRefAvailable } from "./base-ref.js";
 import { gitDiffFiltered } from "./diff.js";
@@ -79,65 +79,6 @@ async function resolveEffectiveBaseRef(
   return "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 }
 
-/**
- * Check whether the bypass keyword appears in:
- * 1. The PR body (on a line by itself, leading/trailing whitespace allowed)
- * 2. A PR label matching the keyword
- * 3. The HEAD commit message (for push/workflow_dispatch/etc.)
- */
-async function checkBypass(keyword: string, token: string): Promise<boolean> {
-  // 1. PR body
-  const prBody =
-    github.context.payload.pull_request?.body as string | undefined;
-  if (prBody) {
-    const lines = prBody.split("\n").map((l) => l.trim());
-    if (lines.includes(keyword)) return true;
-  }
-
-  // 2. PR labels
-  const labels = github.context.payload.pull_request?.labels as
-    | Array<{ name: string }>
-    | undefined;
-  if (labels?.some((l) => l.name === keyword)) return true;
-
-  // If not a PR, also try fetching labels via API (for push events on PRs)
-  if (!labels && token) {
-    try {
-      const octokit = github.getOctokit(token);
-      const { owner, repo } = github.context.repo;
-      // Find PRs associated with the HEAD commit
-      const { data: prs } = await octokit.rest.repos.listPullRequestsAssociatedWithCommit({
-        owner,
-        repo,
-        commit_sha: github.context.sha,
-      });
-      for (const pr of prs) {
-        if (pr.labels.some((l) => l.name === keyword)) return true;
-        if (pr.body) {
-          const lines = pr.body.split("\n").map((l: string) => l.trim());
-          if (lines.includes(keyword)) return true;
-        }
-      }
-    } catch {
-      // API call failed, continue to commit message check
-    }
-  }
-
-  // 3. HEAD commit message
-  try {
-    let msg = "";
-    await exec.exec("git", ["log", "-1", "--format=%B"], {
-      listeners: { stdout: (data) => (msg += data.toString()) },
-      silent: true,
-    });
-    const lines = msg.split("\n").map((l) => l.trim());
-    if (lines.includes(keyword)) return true;
-  } catch {
-    // git not available
-  }
-
-  return false;
-}
 
 async function lookupPublishDate(
   dep: ChangedDep,
@@ -458,7 +399,9 @@ async function run(): Promise<void> {
       }
       if (inputs.bypassKeyword) {
         parts.push(
-          `To bypass, add "${inputs.bypassKeyword}" on its own line in your PR body or commit message, or add it as a PR label`,
+          isPrEvent()
+            ? `To bypass, add "${inputs.bypassKeyword}" as a PR label`
+            : `To bypass, add "${inputs.bypassKeyword}" on its own line in the HEAD commit message, or add it as a label on the associated PR`,
         );
       }
       core.setFailed(parts.join(". "));

@@ -119,10 +119,14 @@ inputs:
   bypass-keyword:
     description: >
       If non-empty, failures are downgraded to warnings when this exact
-      string is found on its own line in the PR body, as a PR label, or
-      on its own line in the HEAD commit message. Useful for emergency
-      0-day vulnerability fixes. If using label-based bypass, add
-      labeled and unlabeled to pull_request event types.
+      string is used as a bypass. On pull_request / pull_request_target events,
+      only a matching PR label is accepted (contributor-editable sources such as
+      the PR body and commit messages are ignored). On all other events (push,
+      schedule, workflow_dispatch, etc.), the keyword is accepted from the HEAD
+      commit message, or from a label on any PR associated with that commit.
+      Useful for emergency 0-day vulnerability fixes. Add labeled and unlabeled
+      to your pull_request event types so the action re-runs when a label is
+      added or removed.
     required: false
     default: ""
   check-all-on-new-workflow:
