@@ -28,30 +28,11 @@ import {
   checkLicenses,
   emitLicenseAnnotations,
   fetchLicense,
+  getWorkflowFile,
 } from "./license.js";
 import type { ChangedDep, CheckResult } from "./ecosystems/types.js";
 
 const DAY_MS = 86_400_000;
-
-/**
- * Parse GITHUB_WORKFLOW_REF to extract the workflow file path.
- * Format: {owner}/{repo}/{path}@{ref}
- * We strip {owner}/{repo}/ prefix and @{ref} suffix.
- */
-function getWorkflowFilePath(): string | null {
-  const workflowRef = process.env.GITHUB_WORKFLOW_REF;
-  if (!workflowRef) return null;
-
-  const repo = github.context.repo;
-  const prefix = `${repo.owner}/${repo.repo}/`;
-  if (!workflowRef.startsWith(prefix)) return null;
-
-  const rest = workflowRef.slice(prefix.length);
-  const atIdx = rest.lastIndexOf("@");
-  if (atIdx === -1) return null;
-
-  return rest.slice(0, atIdx);
-}
 
 /**
  * Check if the workflow file that triggered this run was newly added.
@@ -63,7 +44,7 @@ async function resolveEffectiveBaseRef(
 ): Promise<string> {
   if (!checkAllOnNewWorkflow) return baseRef;
 
-  const workflowPath = getWorkflowFilePath();
+  const workflowPath = getWorkflowFile();
   if (!workflowPath) return baseRef;
 
   core.info(`Workflow file: ${workflowPath}`);
