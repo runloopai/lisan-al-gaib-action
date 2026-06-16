@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import { DockerfileParser, From, Copy, Run } from "dockerfile-ast";
 import type { Flag } from "dockerfile-ast";
 import { resolveFiles, gitDiff, gitDiffNameOnly, gitShowFile } from "../diff.js";
-import { imageExists } from "../registry.js";
 import type { ChangedDep, ParsedImageRef } from "./types.js";
 import {
   parseImageRef,
@@ -11,6 +10,7 @@ import {
   makeVersion,
   imageIdentity,
   getImagePublishDate,
+  confirmCopyMountFromExists,
 } from "./image.js";
 
 export interface DockerImageCandidate {
@@ -19,21 +19,56 @@ export interface DockerImageCandidate {
   source: "from" | "copy-from" | "mount-from";
 }
 
+export interface DockerImageRefWithPos {
+  raw: string;            // the raw image string in the source
+  ref: ParsedImageRef | null;
+  source: "from" | "copy-from" | "mount-from";
+  lineIndex: number;      // 0-based line number
+  lineOffset: number;     // character offset within line where image ref starts
+  lineLength: number;     // length of image ref on that line
+  instrLineIndex: number; // 0-based line number of the enclosing instruction's first token
+  // FROM-only: the AS <name> stage alias (null when absent).
+  buildStage: string | null;
+  // The instruction's end position (exclusive), spanning any multi-line continuations.
+  // For FROM: used to atomically consume the full instruction span in the rewrite.
+  // For copy-from/mount-from: same as the start position (single-line flag value).
+  instrEndLine: number;
+  instrEndChar: number;
+}
+
 /**
  * Parse a Dockerfile (or Containerfile) content and return all external image
  * references found in FROM, COPY --from=, and RUN --mount=...,from= directives.
  *
- * This is a pure, synchronous, network-free function.
+ * Delegates to parseDockerfileImagesWithPositions (single parse grammar for both
+ * the verify and update consumers). First occurrence per raw string wins.
  */
 export function parseDockerfileImages(content: string): DockerImageCandidate[] {
+  const seen = new Set<string>();
+  const results: DockerImageCandidate[] = [];
+  for (const { raw, ref, source } of parseDockerfileImagesWithPositions(content)) {
+    if (ref === null || seen.has(raw)) continue;
+    seen.add(raw);
+    results.push({ raw, ref, source });
+  }
+  return results;
+}
+
+/**
+ * Parse a Dockerfile/Containerfile and return all external image references
+ * with their source-level position info (line index and character offset).
+ *
+ * Uses the same filtering logic as parseDockerfileImages but additionally
+ * captures the exact position of the image ref string using dockerfile-ast's
+ * Range API, so callers can perform surgical in-place rewrites.
+ */
+export function parseDockerfileImagesWithPositions(
+  content: string,
+): DockerImageRefWithPos[] {
   const dockerfile = DockerfileParser.parse(content);
   const instructions = dockerfile.getInstructions();
 
-  // Two-pass: first collect all build-stage aliases (lowercased) so that
-  // --from references to earlier/later stage names can be filtered out.
-  // Forward-reference handling: a COPY --from=alias that appears before
-  // FROM ... AS alias is an error in Docker but we still collect all aliases
-  // upfront to avoid false positives.
+  // Collect all build-stage aliases (same logic as parseDockerfileImages)
   const stageAliases = new Set<string>();
   for (const instruction of instructions) {
     if (instruction instanceof From) {
@@ -44,49 +79,108 @@ export function parseDockerfileImages(content: string): DockerImageCandidate[] {
     }
   }
 
-  // Deduplicate candidates by raw string (first occurrence wins)
-  const seen = new Map<string, DockerImageCandidate>();
+  const allRefs: DockerImageRefWithPos[] = [];
 
-  function emit(raw: string, source: DockerImageCandidate["source"]): void {
-    if (seen.has(raw)) return;
+  function emit(
+    raw: string,
+    source: DockerImageRefWithPos["source"],
+    lineIndex: number,
+    lineOffset: number,
+    lineLength: number,
+    instrLineIndex: number,
+    buildStage: string | null,
+    instrEndLine: number,
+    instrEndChar: number,
+  ): void {
     const ref = parseImageRef(raw);
-    if (ref == null) return;
-    seen.set(raw, { raw, ref, source });
+    if (ref === null) return;
+    allRefs.push({ raw, ref, source, lineIndex, lineOffset, lineLength, instrLineIndex, buildStage, instrEndLine, instrEndChar });
   }
 
-  // Helper to process a --from flag value (shared between COPY and RUN --mount)
   function processFromValue(
     value: string | null | undefined,
-    source: DockerImageCandidate["source"],
+    source: DockerImageRefWithPos["source"],
+    lineIndex: number,
+    lineOffset: number,
+    lineLength: number,
+    instrLineIndex: number,
+    instrEndLine: number,
+    instrEndChar: number,
   ): void {
     if (value == null || value === "") return;
-    if (value.includes("$")) return; // unresolved ARG/ENV variable
-    if (stageAliases.has(value.toLowerCase())) return; // build-stage alias
-    // Numeric stage index (e.g. "0", "1", "2") — not an image ref
-    if (parseInt(value, 10).toString() === value) return;
-    emit(value, source);
+    if (value.includes("$")) return;
+    if (stageAliases.has(value.toLowerCase())) return;
+    if (/^\d+$/.test(value)) return;
+    emit(value, source, lineIndex, lineOffset, lineLength, instrLineIndex, null, instrEndLine, instrEndChar);
   }
 
-  // Second pass: process instructions and emit candidates
   for (const instruction of instructions) {
+    const instrLineIndex = instruction.getRange().start.line;
+    const instrEnd = instruction.getRange().end;
+
     if (instruction instanceof From) {
       const image = instruction.getImage();
       if (image == null) continue;
       if (image.trim().toLowerCase() === "scratch") continue;
-      if (image.includes("$")) continue; // unresolved ARG/ENV variable
-      if (stageAliases.has(image.trim().toLowerCase())) continue; // stage alias ref
-      emit(image, "from");
+      if (image.includes("$")) continue;
+      if (stageAliases.has(image.trim().toLowerCase())) continue;
+
+      const buildStage = instruction.getBuildStage() ?? null;
+
+      const imgRange = instruction.getImageRange();
+      if (imgRange == null) {
+        // Fallback: use instruction range start as best approximation
+        const instRange = instruction.getRange();
+        emit(image, "from", instRange.start.line, instRange.start.character, image.length, instrLineIndex, buildStage, instrEnd.line, instrEnd.character);
+      } else {
+        emit(
+          image,
+          "from",
+          imgRange.start.line,
+          imgRange.start.character,
+          imgRange.end.character - imgRange.start.character,
+          instrLineIndex,
+          buildStage,
+          instrEnd.line,
+          instrEnd.character,
+        );
+      }
       continue;
     }
 
     if (instruction instanceof Copy) {
-      // Use getFlags().find() rather than getFromFlag() to handle cases like
-      // COPY --chown=user --from=image (multiple flags on same instruction).
       const fromFlag: Flag | undefined = instruction
         .getFlags()
         .find((f: Flag) => f.getName() === "from");
       if (fromFlag == null) continue;
-      processFromValue(fromFlag.getValue(), "copy-from");
+
+      const value = fromFlag.getValue();
+      const valRange = fromFlag.getValueRange();
+      if (valRange != null) {
+        processFromValue(
+          value,
+          "copy-from",
+          valRange.start.line,
+          valRange.start.character,
+          valRange.end.character - valRange.start.character,
+          instrLineIndex,
+          instrEnd.line,
+          instrEnd.character,
+        );
+      } else {
+        // Fallback: use flag range
+        const flagRange = fromFlag.getRange();
+        processFromValue(
+          value,
+          "copy-from",
+          flagRange.start.line,
+          flagRange.start.character + "--from=".length,
+          value?.length ?? 0,
+          instrLineIndex,
+          instrEnd.line,
+          instrEnd.character,
+        );
+      }
       continue;
     }
 
@@ -96,18 +190,43 @@ export function parseDockerfileImages(content: string): DockerImageCandidate[] {
         .filter((f: Flag) => f.getName() === "mount");
 
       for (const mountFlag of mountFlags) {
-        // Only process bind and cache mounts — skip secret, ssh, tmpfs, etc.
         const mountType = mountFlag.getOption("type")?.getValue() ?? null;
         if (mountType != null && mountType !== "bind" && mountType !== "cache") {
           continue;
         }
-        const fromValue = mountFlag.getOption("from")?.getValue();
-        processFromValue(fromValue, "mount-from");
+        const fromOpt = mountFlag.getOption("from");
+        const fromValue = fromOpt?.getValue();
+        const valRange = fromOpt?.getValueRange ? fromOpt.getValueRange() : null;
+        if (valRange != null) {
+          processFromValue(
+            fromValue,
+            "mount-from",
+            valRange.start.line,
+            valRange.start.character,
+            valRange.end.character - valRange.start.character,
+            instrLineIndex,
+            instrEnd.line,
+            instrEnd.character,
+          );
+        } else if (fromValue != null) {
+          // Fallback: best-effort position from mount flag range
+          const mountRange = mountFlag.getRange();
+          processFromValue(
+            fromValue,
+            "mount-from",
+            mountRange.start.line,
+            mountRange.start.character,
+            fromValue.length,
+            instrLineIndex,
+            instrEnd.line,
+            instrEnd.character,
+          );
+        }
       }
     }
   }
 
-  return Array.from(seen.values());
+  return allRefs;
 }
 
 function isDockerfileName(filePath: string): boolean {
@@ -178,8 +297,7 @@ export async function getChangedDeps(
       // sources are ambiguous (build contexts, stage aliases, typos) and we
       // prefer false-negatives over false-positives.
       if (source === "copy-from" || source === "mount-from") {
-        const reference = ref.digest ?? ref.tag ?? "latest";
-        const exists = await imageExists(ref.registry, ref.repository, reference, dockerhubMirror);
+        const exists = await confirmCopyMountFromExists(ref, dockerhubMirror);
         if (exists !== "found") {
           core.info(
             `docker: ${raw} not confirmed in registry (${exists}; build context, alias, or typo), skipping`,

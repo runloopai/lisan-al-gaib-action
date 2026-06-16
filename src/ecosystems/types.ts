@@ -23,9 +23,9 @@ export interface CheckResult {
  * These match JavaScript's String.prototype.slice — do NOT convert to byte offsets.
  * `templatePrefix`/`templateSuffix` are the fragments added around the constant
  * value by the interpolation template (empty strings for bare-constant and
- * direct-literal references). The rewrite target's new text is:
- *   `templatePrefix + newVersion.removePrefix(templatePrefix).removeSuffix(templateSuffix) `
- * i.e., strip the prefix/suffix from candidate.latest to recover the new constant value.
+ * direct-literal references). The new constant value to write is:
+ *   `newVersion.slice(templatePrefix.length, newVersion.length - templateSuffix.length)`
+ * i.e., strip the prefix/suffix from candidate.latest to recover the constant-only fragment.
  */
 export interface VersionRef {
   value: string;
