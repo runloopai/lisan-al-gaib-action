@@ -3,8 +3,9 @@
  * CLI entry point for running lisan-al-gaib locally.
  *
  * Usage:
- *   npx lisan-al-gaib [options]
- *   pnpm local [-- options]
+ *   pnpm local [-- options]          # locally: runs tsc + node out/cli.js
+ *   node out/cli.js [options]        # after `pnpm build`
+ *   (verify runs as a GitHub Action via action.yml in CI)
  *
  * Modes:
  *   --base-ref <ref>    Compare HEAD against a specific ref (default: auto-detect remote default branch)
@@ -20,6 +21,7 @@
 
 import { execSync } from "node:child_process";
 import { EMPTY_TREE } from "./base-ref.js";
+import { installActionsCommandFilter } from "./actions-stdout.js";
 
 function getRemoteDefaultBranch(): string {
   try {
@@ -94,7 +96,9 @@ async function main() {
     "allowed-licenses": args["allowed-licenses"] ?? "auto",
     "age-overrides": args["age-overrides"] ?? "",
     "license-overrides": args["license-overrides"] ?? "",
-    "license-heuristics": args["license-heuristics"] ?? "true",
+    // Default false to match action.yml; avoids tarball-downloading path in local runs
+    // that differs from what CI exercises. Use --license-heuristics to opt in.
+    "license-heuristics": args["license-heuristics"] ?? "false",
   };
 
   for (const [key, value] of Object.entries(inputs)) {
@@ -127,44 +131,7 @@ async function main() {
 
   // When running outside GitHub Actions, intercept stdout ::commands
   // and render them as colored output on stderr instead.
-  if (!process.env.GITHUB_ACTIONS) {
-    const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
-    const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
-
-    const stderrWrite = process.stderr.write.bind(process.stderr) as
-      (chunk: string | Uint8Array, encoding?: BufferEncoding, cb?: (err?: Error | null) => void) => boolean;
-    const originalWrite = process.stdout.write.bind(process.stdout) as
-      (chunk: string | Uint8Array, encoding?: BufferEncoding, cb?: (err?: Error | null) => void) => boolean;
-
-    process.stdout.write = function (
-      chunk: string | Uint8Array,
-      encodingOrCb?: BufferEncoding | ((err?: Error | null) => void),
-      cb?: (err?: Error | null) => void,
-    ): boolean {
-      if (typeof chunk === "string") {
-        if (chunk.startsWith("::error")) {
-          const msg = chunk.replace(/^::error\s*[^:]*::/, "").trim();
-          return stderrWrite(red(`ERROR: ${msg}`) + "\n");
-        }
-        if (chunk.startsWith("::warning")) {
-          const msg = chunk.replace(/^::warning\s*[^:]*::/, "").trim();
-          return stderrWrite(yellow(`WARN:  ${msg}`) + "\n");
-        }
-        if (chunk.startsWith("::debug::")) return true;
-        if (chunk.startsWith("::group::")) {
-          return stderrWrite("\n" + chunk.replace("::group::", "").trim() + "\n");
-        }
-        if (chunk.startsWith("::endgroup::")) return true;
-        if (chunk.startsWith("::set-output")) return true;
-        // All other @actions/core output (info, etc.) → stderr
-        return stderrWrite(chunk, typeof encodingOrCb === "function" ? undefined : encodingOrCb);
-      }
-      if (typeof encodingOrCb === "function") {
-        return originalWrite(chunk, undefined, encodingOrCb);
-      }
-      return originalWrite(chunk, encodingOrCb, cb);
-    } as typeof process.stdout.write;
-  }
+  installActionsCommandFilter();
 
   // Import and run the main action
   await import("./main.js");

@@ -15,6 +15,7 @@ import { parseImageRef, ociTagOf, resolveImageDigestAndAge } from "../ecosystems
 import { computeAgeDays, meetsMinAge } from "../age.js";
 // Re-export so existing importers (and tests) can keep importing it from here.
 export { computeAgeDays };
+import { DEFAULT_REGISTRIES } from "../inputs.js";
 import type { RegistryUrls } from "../inputs.js";
 import type { AllowDowngrade, DepRef, LicensePolicy, UpdateMode, VersionInfo } from "./types.js";
 import type { ECOSYSTEM_REGISTRY } from "./ecosystem-registry.js";
@@ -644,7 +645,7 @@ export async function resolveLatest(
     }
 
     case "bazel": {
-      const bcrUrl = opts.bcrUrl ?? "https://bcr.bazel.build";
+      const bcrUrl = opts.bcrUrl ?? DEFAULT_REGISTRIES.bcrUrl;
       return resolveLazy(
         (name) => bcrVersions(name, token, bcrUrl),
         (name, version) => bcrPublishDate(name, version, token, bcrUrl),
