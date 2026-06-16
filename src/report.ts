@@ -8,6 +8,8 @@ import semver from "semver";
 import yaml from "js-yaml";
 import type { CheckResult, DepStatus } from "./ecosystems/types.js";
 import type { LicenseResult } from "./license.js";
+import { getWorkflowFile, findWorkflowInsertIdx } from "./license.js";
+import { meetsMinAge } from "./age.js";
 
 function getBranding(): string {
   try {
@@ -24,9 +26,9 @@ export function determineStatus(
   minAgeDays: number,
   warnAgeDays: number,
 ): DepStatus {
-  if (ageDays === null) return "unknown";
-  if (ageDays < minAgeDays) return "fail";
-  if (ageDays < warnAgeDays) return "warn";
+  if (!meetsMinAge(ageDays, minAgeDays)) return ageDays === null ? "unknown" : "fail";
+  // meetsMinAge returning true guarantees ageDays !== null; narrow explicitly.
+  if (ageDays !== null && ageDays < warnAgeDays) return "warn";
   return "pass";
 }
 
@@ -509,33 +511,6 @@ async function suggestBunPackageExclusions(failedPkgs: string[]): Promise<void> 
   await showDiff(file, content, lines.join("\n"));
 }
 
-/**
- * Find the insertion point in the workflow file for age-overrides/license-overrides.
- * Looks for `uses: ...lisan-al-gaib...` then finds the end of its `with:` block.
- */
-function findActionInsertIdx(allLines: string[]): number {
-  const actionPattern = /uses:.*lisan-al-gaib/;
-  const actionLineIdx = allLines.findIndex((l) => actionPattern.test(l));
-  if (actionLineIdx === -1) return -1;
-
-  let insertIdx = allLines.length;
-  let inWith = false;
-  for (let i = actionLineIdx + 1; i < allLines.length; i++) {
-    const line = allLines[i];
-    if (/^\s*with:/.test(line)) {
-      inWith = true;
-      continue;
-    }
-    if (inWith && line.trim() !== "") {
-      const lineIndent = line.match(/^(\s*)/)?.[1]?.length ?? 0;
-      if (lineIndent < 10) {
-        insertIdx = i;
-        break;
-      }
-    }
-  }
-  return insertIdx;
-}
 
 /**
  * Suggest adding age-overrides to the workflow file for failed/warned packages.
@@ -553,18 +528,7 @@ async function suggestAgeOverrides(results: CheckResult[]): Promise<void> {
   }
   if (overrides.size === 0) return;
 
-  const workflowRef = process.env.GITHUB_WORKFLOW_REF;
-  if (!workflowRef) return;
-  let workflowFile: string | null = null;
-  try {
-    const { owner, repo } = github.context.repo;
-    const prefix = `${owner}/${repo}/`;
-    if (workflowRef.startsWith(prefix)) {
-      const rest = workflowRef.slice(prefix.length);
-      const atIdx = rest.lastIndexOf("@");
-      if (atIdx !== -1) workflowFile = rest.slice(0, atIdx);
-    }
-  } catch { /* not in GH */ }
+  const workflowFile = getWorkflowFile();
   if (!workflowFile) return;
 
   let original: string;
@@ -615,7 +579,7 @@ async function suggestAgeOverrides(results: CheckResult[]): Promise<void> {
     modified.splice(endIdx, 0, ...newLines);
     await showGroupDiff(workflowFile, original, modified.join("\n"), "Suggested: add entries to age-overrides");
   } else {
-    const insertIdx = findActionInsertIdx(allLines);
+    const insertIdx = findWorkflowInsertIdx(allLines);
     if (insertIdx === -1) return;
 
     const blockLines: string[] = [`${indent.slice(2)}age-overrides: |`];
