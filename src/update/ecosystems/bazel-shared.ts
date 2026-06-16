@@ -321,6 +321,12 @@ export function resolveConflictingReplaces(
  *   offset group whose entries carry different template keys is dropped with a warning
  *   instead of trying to reconcile replace-strings that are in incompatible "value spaces"
  *   (e.g. bare full version vs. inner value stripped of its template prefix).
+ *
+ *   When `templateKeys` is NOT provided (e.g. called from the cross-ecosystem merge in
+ *   run.ts), the function is fail-closed: any offset group with more than one distinct
+ *   `replace` value is dropped with a warning rather than attempting a semver-minimum pick
+ *   across potentially incompatible template value-spaces. Only groups where all rewrites
+ *   agree on an identical `replace` string (exact-pin case) are allowed through.
  */
 /**
  * Precondition: every rewrite in `rewrites` must originate from `file`. The Rewrite
@@ -401,6 +407,17 @@ export function reconcileConstantRewrites(
     }
     if (replaces.size === 1) {
       reconciledOffsets.push({ offset, length, expected, replace: [...replaces][0] });
+    } else if (!templateKeys) {
+      // templateKeys unavailable — called from the cross-ecosystem merge in run.ts.
+      // We cannot distinguish template-mixing from a legitimate semver conflict without
+      // knowing the template key for each rewrite. Fail-closed: drop any conflicting
+      // group to avoid template-space corruption rather than attempting a semver-minimum
+      // pick across potentially incompatible value-spaces.
+      core.warning(
+        `[lisan] apply: (${file}) templateKeys unavailable — dropping conflicting constant ` +
+        `group at ${offset}:${length} to avoid template-space corruption ` +
+        `(${[...replaces].map((r) => JSON.stringify(r)).join(", ")})`,
+      );
     } else {
       const replace = resolveConflictingReplaces([...replaces], offset, file);
       if (replace !== null) reconciledOffsets.push({ offset, length, expected, replace });

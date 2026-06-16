@@ -32,6 +32,7 @@ export interface ResolveLatestOpts {
   registries: RegistryUrls;
   javaRepositories?: string[];  // for java ecosystem
   bcrUrl?: string;              // for bazel ecosystem, default "https://bcr.bazel.build"
+  dockerhubMirror?: string;     // Docker Hub mirror tried as fallback on rate-limit during digest resolution
 }
 
 // Tokens that indicate a stable (non-prerelease) release qualifier.

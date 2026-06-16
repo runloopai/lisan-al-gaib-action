@@ -1710,14 +1710,31 @@ describe("reconcileConstantRewrites", () => {
     expect((result[0] as { replace: string }).replace).toBe('"1.2.3"');
   });
 
-  it("identical offset+length with different semver replaces: picks minimum", () => {
+  it("identical offset+length with different semver replaces and no templateKeys: drops group (fail-closed)", () => {
+    // Without templateKeys (cross-ecosystem merge path), we cannot distinguish template-mixing
+    // from a legitimate semver conflict. Fail-closed: drop the group rather than risk corruption.
     const rewrites = [
       { offset: 10, length: 5, replace: '"2.0.0"', expected: '"old"' },
       { offset: 10, length: 5, replace: '"1.2.3"', expected: '"old"' },
     ];
+    const warnSpy = vi.spyOn(core, "warning").mockImplementation(() => {});
     const { rewrites: result } = reconcileConstantRewrites(rewrites, "/repo/MODULE.bazel");
+    expect(result).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("templateKeys unavailable"));
+    warnSpy.mockRestore();
+  });
+
+  it("identical offset+length with different semver replaces and matching templateKeys: picks minimum", () => {
+    // With templateKeys present and matching (same template key for both rewrites),
+    // the semver-minimum pick is safe and should proceed normally.
+    const rw1 = { offset: 10, length: 5, replace: '"2.0.0"', expected: '"old"' };
+    const rw2 = { offset: 10, length: 5, replace: '"1.2.3"', expected: '"old"' };
+    const tplKeys = new Map<object, string>([[rw1, ":"], [rw2, ":"]]);
+    const warnSpy = vi.spyOn(core, "warning").mockImplementation(() => {});
+    const { rewrites: result } = reconcileConstantRewrites([rw1, rw2], "/repo/MODULE.bazel", tplKeys);
     expect(result).toHaveLength(1);
     expect((result[0] as { replace: string }).replace).toBe('"1.2.3"');
+    warnSpy.mockRestore();
   });
 
   it("identical offset+length with Cargo specifier prefix: drops group when all-exact-pin versions differ (L1)", () => {
@@ -1731,15 +1748,29 @@ describe("reconcileConstantRewrites", () => {
     expect(result).toHaveLength(0);
   });
 
-  it("identical offset+length with 2-segment versions: picks minimum via semver.coerce", () => {
-    // Before M2 fix: semver.valid("33.0") returned null, causing the group to be dropped.
-    // After fix: semver.coerce("33.0") → 33.0.0, so the minimum is selected correctly.
+  it("identical offset+length with 2-segment versions and no templateKeys: drops group (fail-closed)", () => {
+    // Without templateKeys, any conflict → fail-closed drop. The 2-segment semver
+    // coerce fix (M2) applies only when templateKeys are present (single-ecosystem path).
     const rewrites = [
       { offset: 10, length: 6, replace: '"33.0"', expected: '"old1"' },
       { offset: 10, length: 6, replace: '"34.1"', expected: '"old1"' },
     ];
     const warnSpy = vi.spyOn(core, "warning").mockImplementation(() => {});
     const { rewrites: result } = reconcileConstantRewrites(rewrites, "/repo/MODULE.bazel");
+    expect(result).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("templateKeys unavailable"));
+    warnSpy.mockRestore();
+  });
+
+  it("identical offset+length with 2-segment versions and matching templateKeys: picks minimum via semver.coerce", () => {
+    // Before M2 fix: semver.valid("33.0") returned null, causing the group to be dropped.
+    // After fix: semver.coerce("33.0") → 33.0.0, so the minimum is selected correctly.
+    // This path is only reached when templateKeys are provided (single-ecosystem path).
+    const rw1 = { offset: 10, length: 6, replace: '"33.0"', expected: '"old1"' };
+    const rw2 = { offset: 10, length: 6, replace: '"34.1"', expected: '"old1"' };
+    const tplKeys = new Map<object, string>([[rw1, ":"], [rw2, ":"]]);
+    const warnSpy = vi.spyOn(core, "warning").mockImplementation(() => {});
+    const { rewrites: result } = reconcileConstantRewrites([rw1, rw2], "/repo/MODULE.bazel", tplKeys);
     expect(result).toHaveLength(1);
     expect((result[0] as { replace: string }).replace).toBe('"33.0"');
     warnSpy.mockRestore();
@@ -1785,13 +1816,13 @@ describe("reconcileConstantRewrites", () => {
     const rwBare = { offset: 20, length: 7, replace: '"34.5"', expected: '"1.2.3"' };
     const rwTpl  = { offset: 20, length: 7, replace: '"4.5"',  expected: '"1.2.3"' };
 
-    // Without templateKeys: replaces conflict → resolveConflictingReplaces picks semver-min.
+    // Without templateKeys: fail-closed — conflicting group is dropped to avoid
+    // template-space corruption (cannot distinguish template-mixing from semver conflict).
     {
       const warnSpy = vi.spyOn(core, "warning").mockImplementation(() => {});
       const { rewrites: result } = reconcileConstantRewrites([rwBare, rwTpl], "/repo/MODULE.bazel");
-      // "4.5" < "34.5" semver → pickSemverMin selects "4.5"
-      expect(result).toHaveLength(1);
-      expect((result[0] as { replace: string }).replace).toBe('"4.5"');
+      expect(result).toHaveLength(0);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("templateKeys unavailable"));
       warnSpy.mockRestore();
     }
 

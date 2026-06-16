@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { fetchWithRetry, fetchJson, fetchTextWithRetry, fetchHeadWithRetry, parseRetryAfter } from "../src/http.js";
+import { runBatched } from "../src/concurrency.js";
 
 function fakeResponse(opts: {
   status: number;
@@ -439,5 +440,31 @@ describe("fetchHeadWithRetry", () => {
     // Number("9".repeat(400)) → Infinity. An explicit Number.isFinite guard rejects
     // this rather than silently relying on the Math.min clamp below to absorb it.
     expect(parseRetryAfter("9".repeat(400))).toBeUndefined();
+  });
+});
+
+// ─── runBatched ───────────────────────────────────────────────────────────────
+
+describe("runBatched", () => {
+  it("runs all tasks with a normal batch size", async () => {
+    const ran: number[] = [];
+    await runBatched([1, 2, 3, 4, 5].map((n) => async () => { ran.push(n); }), 2);
+    expect(ran.sort()).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("batchSize=0 still runs every task (L1 regression: was infinite-loop then silent drop)", async () => {
+    const ran: number[] = [];
+    await runBatched([1, 2, 3].map((n) => async () => { ran.push(n); }), 0);
+    expect(ran.sort()).toEqual([1, 2, 3]);
+  });
+
+  it("batchSize=-1 still runs every task", async () => {
+    const ran: number[] = [];
+    await runBatched([1, 2].map((n) => async () => { ran.push(n); }), -1);
+    expect(ran.sort()).toEqual([1, 2]);
+  });
+
+  it("empty task list completes immediately", async () => {
+    await expect(runBatched([], 5)).resolves.toBeUndefined();
   });
 });

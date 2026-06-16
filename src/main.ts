@@ -15,6 +15,7 @@ import * as docker from "./ecosystems/docker.js";
 import * as multitool from "./ecosystems/multitool.js";
 import * as kubernetes from "./ecosystems/kubernetes.js";
 import { bcrPublishDate, gitCommitDate, archiveDate } from "./registry.js";
+import { computeAgeDays } from "./age.js";
 import type { BazelOverride, ParsedImageRef } from "./ecosystems/types.js";
 import {
   determineStatus,
@@ -31,8 +32,10 @@ import {
   getWorkflowFile,
 } from "./license.js";
 import type { ChangedDep, CheckResult } from "./ecosystems/types.js";
+import { SUPPORTED_ECOSYSTEMS as UPDATE_CLI_ECOSYSTEMS } from "./update/ecosystems.js";
+import { resolveCacheKey } from "./update/cache-key.js";
+import { dedupeAndResolve, RESOLVE_CONCURRENCY } from "./update/run.js";
 
-const DAY_MS = 86_400_000;
 
 /**
  * Check if the workflow file that triggered this run was newly added.
@@ -292,40 +295,28 @@ async function run(): Promise<void> {
       return true;
     });
 
-    // Deduplicate by cache key, then fetch in parallel
-    const uniqueDeps = new Map<string, ChangedDep>();
-    for (const dep of filteredDeps) {
-      const cacheKey = `${dep.ecosystem}:${dep.name}@${dep.version}`;
-      if (!publishDateCache.has(cacheKey) && !uniqueDeps.has(cacheKey)) {
-        uniqueDeps.set(cacheKey, dep);
-      }
-    }
-    const entries = [...uniqueDeps.entries()];
-    // Fetch in batches of 10 to avoid rate limiting
-    for (let i = 0; i < entries.length; i += 10) {
-      const batch = entries.slice(i, i + 10);
-      const results = await Promise.allSettled(
-        batch.map(([, dep]) => lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs, dockerImageRefs)),
-      );
-      batch.forEach(([key], idx) => {
-        const r = results[idx];
-        if (r.status === "fulfilled") {
-          publishDateCache.set(key, r.value);
-        } else {
-          core.warning(`Registry lookup failed for ${key}: ${r.reason}`);
-          publishDateCache.set(key, null);
-        }
-      });
+    // Deduplicate by cache key and resolve publish dates with bounded concurrency.
+    // Skip deps already in the cache (from a previous ecosystem iteration).
+    // dedupeAndResolve returns null for failed resolutions — stored as null in cache
+    // to record "lookup was attempted but failed" (avoids re-fetching on future iterations).
+    const depsForLookup = filteredDeps.filter(
+      (dep) => !publishDateCache.has(resolveCacheKey(dep.ecosystem, dep.name, dep.version)),
+    );
+    const lookupResults = await dedupeAndResolve(
+      depsForLookup,
+      (dep) => resolveCacheKey(dep.ecosystem, dep.name, dep.version),
+      (dep) => lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs, dockerImageRefs),
+      RESOLVE_CONCURRENCY,
+    );
+    for (const [key, value] of lookupResults) {
+      publishDateCache.set(key, value);
     }
 
     for (const dep of filteredDeps) {
-      const cacheKey = `${dep.ecosystem}:${dep.name}@${dep.version}`;
+      const cacheKey = resolveCacheKey(dep.ecosystem, dep.name, dep.version);
       const publishDate = publishDateCache.get(cacheKey) ?? null;
 
-      const ageDays =
-        publishDate !== null
-          ? Math.floor((Date.now() - publishDate.getTime()) / DAY_MS)
-          : null;
+      const ageDays = computeAgeDays(publishDate);
 
       const status = determineStatus(
         ageDays,
