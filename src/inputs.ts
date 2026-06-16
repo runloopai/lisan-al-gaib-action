@@ -1,6 +1,8 @@
 import * as core from "@actions/core";
 import yaml from "js-yaml";
 
+export const DEFAULT_MIN_AGE_DAYS = 14;
+
 export type LicenseOverrides = Map<string, Map<string, string>>;
 export type AgeOverrides = Map<string, Set<string>>;
 
@@ -40,6 +42,15 @@ function trimSlash(url: string): string {
   return url.replace(/\/$/, "");
 }
 
+export const DEFAULT_REGISTRIES = {
+  npm: "https://registry.npmjs.org",
+  pypi: "https://pypi.org",
+  crates: "https://crates.io",
+  maven: "https://repo1.maven.org/maven2",
+  /** Default Bazel Central Registry URL — shared by CLI and latest.ts. */
+  bcrUrl: "https://bcr.bazel.build",
+} as const;
+
 export function getInputs(): ActionInputs {
   const ecosystems = core
     .getInput("ecosystems", { required: true })
@@ -47,10 +58,24 @@ export function getInputs(): ActionInputs {
     .map((e) => e.trim())
     .filter(Boolean);
 
-  const parsedMin = parseInt(core.getInput("min-age-days") || "14", 10);
-  const minAgeDays = isNaN(parsedMin) ? 14 : parsedMin;
+  const parsedMin = parseInt(core.getInput("min-age-days") || String(DEFAULT_MIN_AGE_DAYS), 10);
+  const minAgeDaysRaw = isNaN(parsedMin) ? DEFAULT_MIN_AGE_DAYS : parsedMin;
+  if (minAgeDaysRaw < 0) {
+    core.warning(
+      `min-age-days (${minAgeDaysRaw}) is negative — clamping to 0. ` +
+      "Set to 0 explicitly to disable the age gate.",
+    );
+  }
+  const minAgeDays = Math.max(0, minAgeDaysRaw);
+
   const parsedWarn = parseInt(core.getInput("warn-age-days") || "21", 10);
-  const warnAgeDays = isNaN(parsedWarn) ? 21 : parsedWarn;
+  const warnAgeDaysRaw = isNaN(parsedWarn) ? 21 : parsedWarn;
+  if (warnAgeDaysRaw < 0) {
+    core.warning(
+      `warn-age-days (${warnAgeDaysRaw}) is negative — clamping to 0.`,
+    );
+  }
+  const warnAgeDays = Math.max(0, warnAgeDaysRaw);
 
   const parsedRetries = parseInt(core.getInput("fetch-missing-history-retries") || "10", 10);
   const fetchMissingHistoryRetries = isNaN(parsedRetries) || parsedRetries < 0 ? 10 : parsedRetries;

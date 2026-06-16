@@ -58,6 +58,34 @@ describe("getInputs", () => {
     expect(inputs.warnAgeDays).toBe(21);
   });
 
+  it("clamps negative min-age-days to 0 and emits a warning (S9 — gate-disable guard)", () => {
+    // A negative min-age-days would disable the age gate entirely, allowing brand-new
+    // packages through. The fix clamps to 0 and warns so the operator notices.
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      if (name === "ecosystems") return "npm";
+      if (name === "min-age-days") return "-5";
+      if (name === "warn-age-days") return "21";
+      return "";
+    });
+    vi.mocked(core.getBooleanInput).mockReturnValue(false);
+    const inputs = getInputs();
+    expect(inputs.minAgeDays).toBe(0);
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining("negative"));
+  });
+
+  it("clamps negative warn-age-days to 0 and emits a warning", () => {
+    vi.mocked(core.getInput).mockImplementation((name: string) => {
+      if (name === "ecosystems") return "npm";
+      if (name === "min-age-days") return "14";
+      if (name === "warn-age-days") return "-3";
+      return "";
+    });
+    vi.mocked(core.getBooleanInput).mockReturnValue(false);
+    const inputs = getInputs();
+    expect(inputs.warnAgeDays).toBe(0);
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining("negative"));
+  });
+
   it("warns when warnAgeDays < minAgeDays", () => {
     vi.mocked(core.getInput).mockImplementation((name: string) => {
       if (name === "ecosystems") return "npm";
