@@ -938,7 +938,9 @@ export async function fetchCrateLicense(
   }
 }
 
-const xmlParser = new XMLParser();
+// parseTagValue/parseAttributeValue disabled so numeric-looking license/version
+// text is preserved verbatim as strings rather than coerced to numbers.
+const xmlParser = new XMLParser({ parseTagValue: false, parseAttributeValue: false, processEntities: false });
 
 interface PomXml {
   project?: {
