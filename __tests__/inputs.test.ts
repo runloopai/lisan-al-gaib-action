@@ -58,9 +58,11 @@ describe("getInputs", () => {
     expect(inputs.warnAgeDays).toBe(21);
   });
 
-  it("clamps negative min-age-days to 0 and emits a warning (S9 — gate-disable guard)", () => {
+  it("throws on negative min-age-days instead of silently clamping (S9 — gate-disable guard)", () => {
     // A negative min-age-days would disable the age gate entirely, allowing brand-new
-    // packages through. The fix clamps to 0 and warns so the operator notices.
+    // packages through. min-age-days is the core security control this action exists to
+    // enforce, so it must fail closed (throw) rather than silently clamp to 0 — an operator
+    // who wants the gate off can pass 0 explicitly.
     vi.mocked(core.getInput).mockImplementation((name: string) => {
       if (name === "ecosystems") return "npm";
       if (name === "min-age-days") return "-5";
@@ -68,9 +70,7 @@ describe("getInputs", () => {
       return "";
     });
     vi.mocked(core.getBooleanInput).mockReturnValue(false);
-    const inputs = getInputs();
-    expect(inputs.minAgeDays).toBe(0);
-    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining("negative"));
+    expect(() => getInputs()).toThrow(/min-age-days.*negative/);
   });
 
   it("clamps negative warn-age-days to 0 and emits a warning", () => {

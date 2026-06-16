@@ -38,7 +38,7 @@ export interface ActionInputs {
   fetchMissingHistoryRetries: number;
 }
 
-function trimSlash(url: string): string {
+export function trimSlash(url: string): string {
   return url.replace(/\/$/, "");
 }
 
@@ -60,13 +60,16 @@ export function getInputs(): ActionInputs {
 
   const parsedMin = parseInt(core.getInput("min-age-days") || String(DEFAULT_MIN_AGE_DAYS), 10);
   const minAgeDaysRaw = isNaN(parsedMin) ? DEFAULT_MIN_AGE_DAYS : parsedMin;
+  // Fail closed rather than silently clamp: min-age-days is the core security control this
+  // action exists to enforce, so a negative value (typo, or an attacker-controlled workflow
+  // input) must not be quietly downgraded to "gate disabled" — the run should stop and force
+  // the value to be fixed explicitly (use 0 to disable the age gate on purpose).
   if (minAgeDaysRaw < 0) {
-    core.warning(
-      `min-age-days (${minAgeDaysRaw}) is negative — clamping to 0. ` +
-      "Set to 0 explicitly to disable the age gate.",
+    throw new Error(
+      `min-age-days (${minAgeDaysRaw}) is negative. Set it to 0 explicitly to disable the age gate.`,
     );
   }
-  const minAgeDays = Math.max(0, minAgeDaysRaw);
+  const minAgeDays = minAgeDaysRaw;
 
   const parsedWarn = parseInt(core.getInput("warn-age-days") || "21", 10);
   const warnAgeDaysRaw = isNaN(parsedWarn) ? 21 : parsedWarn;
@@ -128,10 +131,10 @@ export function getInputs(): ActionInputs {
     licenseHeuristics: core.getBooleanInput("license-heuristics"),
     fetchMissingHistoryRetries,
     registries: {
-      npm: trimSlash(core.getInput("npm-registry-url") || "https://registry.npmjs.org"),
-      pypi: trimSlash(core.getInput("pypi-registry-url") || "https://pypi.org"),
-      crates: trimSlash(core.getInput("crates-registry-url") || "https://crates.io"),
-      maven: trimSlash(core.getInput("maven-registry-url") || "https://repo1.maven.org/maven2"),
+      npm: trimSlash(core.getInput("npm-registry-url") || DEFAULT_REGISTRIES.npm),
+      pypi: trimSlash(core.getInput("pypi-registry-url") || DEFAULT_REGISTRIES.pypi),
+      crates: trimSlash(core.getInput("crates-registry-url") || DEFAULT_REGISTRIES.crates),
+      maven: trimSlash(core.getInput("maven-registry-url") || DEFAULT_REGISTRIES.maven),
     },
   };
 }

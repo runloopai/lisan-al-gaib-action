@@ -82213,6 +82213,12 @@ var lib_exec = __nccwpck_require__(2851);
 
 
 const PR_EVENTS = new Set(["pull_request", "pull_request_target"]);
+/**
+ * Events where a human authored the push interactively and is present at run time.
+ * Exported so callers (e.g. the bypass hint in main.ts) can match the same set
+ * rather than duplicating it and risking drift.
+ */
+const INTERACTIVE_PUSH_EVENTS = new Set(["push"]);
 function isPrEvent() {
     return PR_EVENTS.has(github.context.eventName);
 }
@@ -82222,28 +82228,35 @@ function isPrEvent() {
  * On pull_request / pull_request_target: accepted ONLY as a PR label (contributor-editable
  * sources like PR body and commit messages are rejected).
  *
- * On all other events: accepted from the HEAD commit message, or from a label on any PR
+ * On push events: accepted from the HEAD commit message, or from a label on any PR
  * associated with the HEAD commit (via the GitHub API when a token is available).
+ *
+ * On unattended events (schedule, workflow_dispatch, workflow_run, etc.): commit-message
+ * bypass is DISABLED because no human is present at run time — a pre-planted keyword would
+ * silently skip every future unattended run. Only the PR-label path is accepted.
  */
 async function checkBypass(keyword, token) {
     if (isPrEvent()) {
         const labels = github.context.payload.pull_request?.labels;
         return labels?.some((l) => l.name === keyword) ?? false;
     }
-    // Non-PR events: HEAD commit message first
-    try {
-        let msg = "";
-        await lib_exec.exec("git", ["log", "-1", "--format=%B"], {
-            listeners: { stdout: (data) => (msg += data.toString()) },
-            silent: true,
-        });
-        if (msg.split("\n").map((l) => l.trim()).includes(keyword))
-            return true;
+    // Interactive push events: HEAD commit message is authored by the pusher at push time —
+    // it is not a pre-planted keyword that persists across future runs of the same workflow.
+    if (INTERACTIVE_PUSH_EVENTS.has(github.context.eventName)) {
+        try {
+            let msg = "";
+            await lib_exec.exec("git", ["log", "-1", "--format=%B"], {
+                listeners: { stdout: (data) => (msg += data.toString()) },
+                silent: true,
+            });
+            if (msg.split("\n").map((l) => l.trim()).includes(keyword))
+                return true;
+        }
+        catch {
+            // git not available
+        }
     }
-    catch {
-        // git not available
-    }
-    // Then look for a label on an associated PR
+    // All events: look for a label on an associated PR (requires a human to have applied it).
     if (token) {
         try {
             const octokit = github.getOctokit(token);
@@ -86124,18 +86137,36 @@ var jsYaml = {
 ;// CONCATENATED MODULE: ./out/inputs.js
 
 
+const DEFAULT_MIN_AGE_DAYS = 14;
 function trimSlash(url) {
     return url.replace(/\/$/, "");
 }
+const DEFAULT_REGISTRIES = {
+    npm: "https://registry.npmjs.org",
+    pypi: "https://pypi.org",
+    crates: "https://crates.io",
+    maven: "https://repo1.maven.org/maven2",
+    /** Default Bazel Central Registry URL — shared by CLI and latest.ts. */
+    bcrUrl: "https://bcr.bazel.build",
+};
 function getInputs() {
     const ecosystems = lib_core.getInput("ecosystems", { required: true })
         .split(",")
         .map((e) => e.trim())
         .filter(Boolean);
-    const parsedMin = parseInt(lib_core.getInput("min-age-days") || "14", 10);
-    const minAgeDays = isNaN(parsedMin) ? 14 : parsedMin;
+    const parsedMin = parseInt(lib_core.getInput("min-age-days") || String(DEFAULT_MIN_AGE_DAYS), 10);
+    const minAgeDaysRaw = isNaN(parsedMin) ? DEFAULT_MIN_AGE_DAYS : parsedMin;
+    if (minAgeDaysRaw < 0) {
+        lib_core.warning(`min-age-days (${minAgeDaysRaw}) is negative — clamping to 0. ` +
+            "Set to 0 explicitly to disable the age gate.");
+    }
+    const minAgeDays = Math.max(0, minAgeDaysRaw);
     const parsedWarn = parseInt(lib_core.getInput("warn-age-days") || "21", 10);
-    const warnAgeDays = isNaN(parsedWarn) ? 21 : parsedWarn;
+    const warnAgeDaysRaw = isNaN(parsedWarn) ? 21 : parsedWarn;
+    if (warnAgeDaysRaw < 0) {
+        lib_core.warning(`warn-age-days (${warnAgeDaysRaw}) is negative — clamping to 0.`);
+    }
+    const warnAgeDays = Math.max(0, warnAgeDaysRaw);
     const parsedRetries = parseInt(lib_core.getInput("fetch-missing-history-retries") || "10", 10);
     const fetchMissingHistoryRetries = isNaN(parsedRetries) || parsedRetries < 0 ? 10 : parsedRetries;
     if (warnAgeDays < minAgeDays) {
@@ -86178,10 +86209,10 @@ function getInputs() {
         licenseHeuristics: lib_core.getBooleanInput("license-heuristics"),
         fetchMissingHistoryRetries,
         registries: {
-            npm: trimSlash(lib_core.getInput("npm-registry-url") || "https://registry.npmjs.org"),
-            pypi: trimSlash(lib_core.getInput("pypi-registry-url") || "https://pypi.org"),
-            crates: trimSlash(lib_core.getInput("crates-registry-url") || "https://crates.io"),
-            maven: trimSlash(lib_core.getInput("maven-registry-url") || "https://repo1.maven.org/maven2"),
+            npm: trimSlash(lib_core.getInput("npm-registry-url") || DEFAULT_REGISTRIES.npm),
+            pypi: trimSlash(lib_core.getInput("pypi-registry-url") || DEFAULT_REGISTRIES.pypi),
+            crates: trimSlash(lib_core.getInput("crates-registry-url") || DEFAULT_REGISTRIES.crates),
+            maven: trimSlash(lib_core.getInput("maven-registry-url") || DEFAULT_REGISTRIES.maven),
         },
     };
 }
@@ -86278,7 +86309,8 @@ async function refExists(ref) {
     return exitCode === 0;
 }
 function isZeroSha(sha) {
-    return /^0{40}$/.test(sha);
+    // Match the SHA-1 all-zeros sentinel (40 zeros) and the SHA-256 all-zeros sentinel (64 zeros).
+    return /^0{40}$/.test(sha) || /^0{64}$/.test(sha);
 }
 function resolveBaseRef(inputBaseRef) {
     if (inputBaseRef) {
@@ -86310,12 +86342,30 @@ function resolveBaseRef(inputBaseRef) {
             return before;
         }
     }
-    // release — use the target commitish (branch/tag the release targets)
+    // release — use the target commitish (branch/tag the release targets).
+    // target_commitish may be a branch name (e.g. "main") or a commit SHA.
+    // Branch names are resolved by validateBaseRef via git rev-parse; if the
+    // branch doesn't exist locally the normal fallback chain takes over.
+    //
+    // Validated against a safe-ref charset: an attacker-controlled target_commitish
+    // that resolves to an unrelated commit could produce a misleading diff —
+    // we fail through to HEAD~1 rather than diff the wrong base.
     if (eventName === "release") {
         const targetRef = payload.release?.target_commitish;
-        if (targetRef) {
-            lib_core.info(`Auto-detected base ref from release target: ${targetRef}`);
-            return targetRef;
+        if (targetRef && typeof targetRef === "string") {
+            const trimmed = targetRef.trim();
+            // Accept: 7-64 hex chars (commit SHA), or a branch/tag name composed of
+            // alphanumeric, dot, underscore, hyphen, and slash. Reject a leading `-`
+            // (option injection) and any other characters outside this charset.
+            const SAFE_REF_RE = /^(?:[0-9a-f]{7,64}|[a-zA-Z0-9][a-zA-Z0-9_./-]*)$/;
+            if (trimmed && !trimmed.startsWith("-") && SAFE_REF_RE.test(trimmed)) {
+                lib_core.info(`Auto-detected base ref from release target: ${trimmed}`);
+                return trimmed;
+            }
+            if (trimmed) {
+                lib_core.warning(`release.target_commitish ${JSON.stringify(trimmed)} contains unsafe characters — ` +
+                    `falling back to HEAD~1 to avoid diffing an attacker-controlled base ref`);
+            }
         }
     }
     // schedule, workflow_dispatch, workflow_call, workflow_run, and others
@@ -86408,12 +86458,15 @@ function resolveHeadSha() {
 async function makeBaseRefDiffable(rawRef, opts) {
     if (rawRef === EMPTY_TREE)
         return { mode: "git", baseRef: EMPTY_TREE };
-    // For push events, distrust the before-SHA if the push was forced
-    let ref = rawRef;
+    // For push events, distrust the before-SHA if the push was forced.
+    // A force-push rewrites history, so `before` is no longer an ancestor of HEAD —
+    // diffing against it would produce a misleading (possibly enormous) changed-file set.
+    // Degrade to check-all (EMPTY_TREE) so we fail-closed rather than under-checking.
     const { eventName, payload } = github.context;
     if (eventName === "push" && payload.forced === true) {
-        lib_core.info("Forced push detected — resolving parent commit instead of before-SHA");
-        ref = "HEAD~1";
+        lib_core.warning("Forced push detected — before-SHA is no longer an ancestor of HEAD. " +
+            "Falling back to check-all (empty tree) to avoid missing changed packages.");
+        return { mode: "git", baseRef: EMPTY_TREE };
     }
     // Pre-compute head SHA for API mode. If absent (non-Actions CLI context), any API
     // plan would produce a malformed compareCommits call, so degrade to EMPTY_TREE instead.
@@ -86422,11 +86475,11 @@ async function makeBaseRefDiffable(rawRef, opts) {
         ? { mode: "api", baseSha, headSha }
         : { mode: "git", baseRef: EMPTY_TREE };
     // HEAD-prefixed refs (HEAD~1, HEAD^, etc.): deepen first, then resolve to a concrete SHA
-    if (ref.startsWith("HEAD")) {
+    if (rawRef.startsWith("HEAD")) {
         if (await isShallowRepo()) {
             await deepenLoop(opts.fetchRetries);
         }
-        const sha = await revParse(ref);
+        const sha = await revParse(rawRef);
         if (!sha) {
             lib_core.info("No parent commit found — using empty tree (initial commit)");
             return { mode: "git", baseRef: EMPTY_TREE };
@@ -86437,25 +86490,25 @@ async function makeBaseRefDiffable(rawRef, opts) {
         return toApiPlan(sha);
     }
     // origin/ refs are always locally accessible
-    if (ref.startsWith("origin/")) {
-        if (await canDiffCommits(ref))
-            return { mode: "git", baseRef: ref };
-        return toApiPlan(ref);
+    if (rawRef.startsWith("origin/")) {
+        if (await canDiffCommits(rawRef))
+            return { mode: "git", baseRef: rawRef };
+        return toApiPlan(rawRef);
     }
     // Concrete SHA or branch ref: check if already locally available
-    if ((await refExists(ref)) && (await canDiffCommits(ref))) {
-        return { mode: "git", baseRef: ref };
+    if ((await refExists(rawRef)) && (await canDiffCommits(rawRef))) {
+        return { mode: "git", baseRef: rawRef };
     }
     // Not available locally; try to fetch it if repo is shallow
     if (await isShallowRepo()) {
-        await fetchBySha(ref);
+        await fetchBySha(rawRef);
         await deepenLoop(opts.fetchRetries);
     }
-    if (await canDiffCommits(ref)) {
-        return { mode: "git", baseRef: ref };
+    if (await canDiffCommits(rawRef)) {
+        return { mode: "git", baseRef: rawRef };
     }
     // Cannot recover locally — use GitHub API to diff
-    return toApiPlan(ref);
+    return toApiPlan(rawRef);
 }
 //# sourceMappingURL=base-ref.js.map
 // EXTERNAL MODULE: ./node_modules/.pnpm/@actions+glob@0.5.1/node_modules/@actions/glob/lib/glob.js
@@ -86547,30 +86600,49 @@ async function gitShowFile(ref, file) {
 }
 //# sourceMappingURL=diff.js.map
 ;// CONCATENATED MODULE: ./out/api-diff.js
+/**
+ * GitHub's compareCommits API silently caps the `files` array at ~300 entries
+ * when the diff is large (pull requests with many changed files, lock-file
+ * regenerations, etc.). We throw whenever the accumulated file count reaches
+ * GITHUB_FILE_CAP (300), since we cannot distinguish a fully-returned 300-file
+ * diff from a truncated one. The caller falls back to check-all mode so no
+ * changed lockfiles are silently missed. Fail-closed: a false positive (a real
+ * 300-file PR) degrades to over-checking, never under-checking.
+ */
+const PER_PAGE = 100;
+const GITHUB_FILE_CAP = 300;
 function createApiDiffSource(opts) {
     const { octokit, owner, repo, baseSha, headSha } = opts;
-    const PER_PAGE = 100;
     let cachedFiles = null;
     function getFiles() {
         if (!cachedFiles) {
             cachedFiles = (async () => {
                 const all = [];
                 let page = 1;
+                let totalCommits = 0;
                 while (true) {
                     const r = await octokit.rest.repos.compareCommits({
                         owner, repo, base: baseSha, head: headSha, per_page: PER_PAGE, page,
                     });
                     const batch = r.data.files ?? [];
+                    // Capture total_commits for the informational error message below.
+                    if (page === 1)
+                        totalCommits = r.data.total_commits ?? 0;
                     all.push(...batch);
                     if (batch.length < PER_PAGE)
                         break;
                     page++;
+                    // GitHub caps the files list at GITHUB_FILE_CAP entries across all pages.
+                    // When we've accumulated that many, any further items would be silently dropped.
+                    // Detect and throw so the caller can fall back to check-all mode.
+                    if (all.length >= GITHUB_FILE_CAP) {
+                        throw new Error(`compareCommits file list is truncated (${all.length}+ files, ` +
+                            `${totalCommits} commits): falling back to check-all mode to avoid missing changed lockfiles`);
+                    }
                 }
                 return all;
             })();
-            // Don't cache rejected promises — allow retry on next call
-            // Clear cache on rejection so a subsequent caller can retry.
-            // Safe because callers are sequential (main.ts warm call runs before any ecosystem).
+            // Clear the cache on rejection so a subsequent caller can retry.
             cachedFiles.catch(() => { cachedFiles = null; });
         }
         return cachedFiles;
@@ -86597,31 +86669,41 @@ function createApiDiffSource(opts) {
             return files.map((f) => f.filename);
         },
         async showFile(file) {
+            // 404 = file legitimately absent at baseSha (newly added file) → null is correct.
+            // 5xx / network errors are transient and should propagate so callers can fail-closed.
+            let response;
             try {
-                const response = await octokit.rest.repos.getContent({
+                response = await octokit.rest.repos.getContent({
                     owner,
                     repo,
                     path: file,
                     ref: baseSha,
                 });
-                const data = response.data;
-                if (data.type !== "file")
+            }
+            catch (err) {
+                // Octokit throws `RequestError` for HTTP errors; check the status field.
+                const status = err?.status;
+                if (status === 404)
+                    return null; // file didn't exist at base — legitimately absent
+                // 5xx / network — propagate to the per-ecosystem try/catch in main.ts which marks
+                // that ecosystem as setFailed+continue (fail-closed, never a silent pass).
+                // Note: this is a different recovery path than the truncation guard's check-all.
+                throw err;
+            }
+            const data = response.data;
+            if (data.type !== "file")
+                return null;
+            if (data.content && data.encoding === "base64") {
+                return Buffer.from(data.content.replace(/\n/g, ""), "base64").toString("utf8");
+            }
+            // content is empty for files > 1MB — fetch via download_url
+            if (data.download_url) {
+                const res = await fetch(data.download_url);
+                if (!res.ok)
                     return null;
-                if (data.content && data.encoding === "base64") {
-                    return Buffer.from(data.content.replace(/\n/g, ""), "base64").toString("utf8");
-                }
-                // content is empty for files > 1MB — fetch via download_url
-                if (data.download_url) {
-                    const res = await fetch(data.download_url);
-                    if (!res.ok)
-                        return null;
-                    return res.text();
-                }
-                return null;
+                return res.text();
             }
-            catch {
-                return null;
-            }
+            return null;
         },
     };
 }
@@ -87181,4207 +87263,6 @@ function parse(input, typeOrFileName, packageJson) {
     }
 }
 
-;// CONCATENATED MODULE: ./out/registry.js
-
-const MAVEN_CENTRAL_PREFIXES = [
-    "https://repo1.maven.org/maven2",
-    "https://repo.maven.apache.org/maven2",
-    "http://repo1.maven.org/maven2",
-    "http://central.maven.org/maven2",
-];
-const FETCH_TIMEOUT_MS = 30_000;
-async function fetchJson(url, headers) {
-    try {
-        const resp = await fetch(url, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-        if (!resp.ok)
-            return null;
-        return await resp.json();
-    }
-    catch {
-        return null;
-    }
-}
-/**
- * Replace Maven Central URLs with the configured registry URL.
- * Non-Central URLs (private repos, etc.) are left untouched.
- */
-function resolveMavenRepo(repoUrl, registries) {
-    const normalized = repoUrl.replace(/\/$/, "");
-    for (const prefix of MAVEN_CENTRAL_PREFIXES) {
-        if (normalized === prefix || normalized.startsWith(prefix + "/")) {
-            return registries.maven;
-        }
-    }
-    return normalized;
-}
-async function npmPublishDate(name, version, registries) {
-    const data = (await fetchJson(`${registries.npm}/${name}`));
-    const time = data?.time?.[version];
-    return time ? new Date(time) : null;
-}
-async function pypiPublishDate(name, version, registries) {
-    const data = (await fetchJson(`${registries.pypi}/pypi/${name}/${version}/json`));
-    const time = data?.urls?.[0]?.upload_time_iso_8601;
-    return time ? new Date(time) : null;
-}
-async function cratesPublishDate(name, version, registries) {
-    const data = (await fetchJson(`${registries.crates}/api/v1/crates/${name}`, { "User-Agent": "lisan-al-gaib-action" }));
-    const entry = data?.versions?.find((v) => v.num === version);
-    return entry?.created_at ? new Date(entry.created_at) : null;
-}
-async function mavenPublishDate(group, artifact, version, repositories, registries) {
-    const groupPath = group.replace(/\./g, "/");
-    // Try each configured repository via HEAD on POM
-    for (const repo of repositories) {
-        const base = resolveMavenRepo(repo, registries);
-        const pomUrl = `${base}/${groupPath}/${artifact}/${version}/${artifact}-${version}.pom`;
-        try {
-            const resp = await fetch(pomUrl, { method: "HEAD", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-            if (resp.ok) {
-                const lastModified = resp.headers.get("Last-Modified");
-                if (lastModified) {
-                    return new Date(lastModified);
-                }
-            }
-        }
-        catch {
-            // continue to next repo
-        }
-    }
-    // Fall back to Maven Central search API
-    const data = (await fetchJson(`https://search.maven.org/solrsearch/select?q=g:${encodeURIComponent(group)}+AND+a:${encodeURIComponent(artifact)}+AND+v:${encodeURIComponent(version)}&rows=1&wt=json`));
-    const ts = data?.response?.docs?.[0]?.timestamp;
-    if (ts) {
-        return new Date(ts);
-    }
-    lib_core.debug(`Could not find publish date for ${group}:${artifact}:${version}`);
-    return null;
-}
-/**
- * Get publish date from the Bazel Central Registry.
- * Strategy: query the BCR GitHub repo for the commit that added the module version.
- */
-async function bcrPublishDate(name, version, token, bcrUrl) {
-    const headers = {
-        Accept: "application/vnd.github+json",
-        "User-Agent": "lisan-al-gaib-action",
-        "X-GitHub-Api-Version": "2022-11-28",
-    };
-    if (token) {
-        headers.Authorization = `Bearer ${token}`;
-    }
-    // Derive BCR GitHub owner/repo from the registry URL
-    // Default BCR: https://bcr.bazel.build/ → bazelbuild/bazel-central-registry
-    let bcrOwner = "bazelbuild";
-    let bcrRepo = "bazel-central-registry";
-    // Try to extract from a GitHub-based registry URL
-    const ghMatch = bcrUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
-    if (ghMatch) {
-        bcrOwner = ghMatch[1];
-        bcrRepo = ghMatch[2];
-    }
-    // Query the BCR repo for the commit that added this module version
-    try {
-        const resp = await fetch(`https://api.github.com/repos/${bcrOwner}/${bcrRepo}/commits?path=modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/MODULE.bazel&per_page=1`, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-        if (resp.ok) {
-            const data = (await resp.json());
-            const date = data?.[0]?.commit?.committer?.date;
-            if (date)
-                return new Date(date);
-        }
-    }
-    catch {
-        // fall through
-    }
-    // Fallback: try fetching source.json and HEAD the archive URL for Last-Modified
-    try {
-        const sourceUrl = `${bcrUrl.replace(/\/$/, "")}/modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/source.json`;
-        const sourceResp = await fetch(sourceUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-        if (sourceResp.ok) {
-            const sourceData = (await sourceResp.json());
-            if (sourceData.url) {
-                const archiveResp = await fetch(sourceData.url, { method: "HEAD", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-                const lastModified = archiveResp.headers.get("Last-Modified");
-                if (lastModified)
-                    return new Date(lastModified);
-            }
-        }
-    }
-    catch {
-        // fall through
-    }
-    lib_core.debug(`Could not find publish date for bazel module ${name}@${version}`);
-    return null;
-}
-/**
- * Get the date of a git commit from a remote repository.
- * Parses the remote URL to extract GitHub owner/repo and queries the API.
- */
-async function gitCommitDate(remote, ref, token) {
-    // Parse GitHub remote URL
-    const ghMatch = remote.match(/github\.com[/:]([^/]+)\/([^/.]+)/);
-    if (!ghMatch) {
-        lib_core.debug(`gitCommitDate: cannot parse remote URL: ${remote}`);
-        return null;
-    }
-    const owner = ghMatch[1];
-    const repo = ghMatch[2];
-    const headers = {
-        Accept: "application/vnd.github+json",
-        "User-Agent": "lisan-al-gaib-action",
-        "X-GitHub-Api-Version": "2022-11-28",
-    };
-    if (token) {
-        headers.Authorization = `Bearer ${token}`;
-    }
-    try {
-        const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${ref}`, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-        if (!resp.ok)
-            return null;
-        const data = (await resp.json());
-        const date = data?.commit?.committer?.date;
-        return date ? new Date(date) : null;
-    }
-    catch {
-        return null;
-    }
-}
-/**
- * Get Last-Modified date from an archive URL via HEAD request.
- */
-async function archiveDate(url) {
-    try {
-        const resp = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-        const lastModified = resp.headers.get("Last-Modified");
-        return lastModified ? new Date(lastModified) : null;
-    }
-    catch {
-        return null;
-    }
-}
-// ─── OCI / Container Registry ────────────────────────────────────────────────
-const OCI_INDEX_MEDIA_TYPES = new Set([
-    "application/vnd.oci.image.index.v1+json",
-    "application/vnd.docker.distribution.manifest.list.v2+json",
-]);
-const MANIFEST_ACCEPT = [
-    "application/vnd.oci.image.index.v1+json",
-    "application/vnd.docker.distribution.manifest.list.v2+json",
-    "application/vnd.oci.image.manifest.v1+json",
-    "application/vnd.docker.distribution.manifest.v2+json",
-].join(", ");
-/**
- * Obtain an anonymous OCI bearer token for the given registry and repository
- * using the WWW-Authenticate challenge flow. Returns null if the registry
- * allows unauthenticated access (HTTP 200 on /v2/) or if authentication
- * fails (private registry).
- */
-async function getOciToken(host, repository) {
-    try {
-        const pingResp = await fetch(`https://${host}/v2/`, {
-            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        });
-        if (pingResp.status === 200)
-            return null; // no auth needed
-        if (pingResp.status !== 401)
-            return null; // private or unreachable
-        const wwwAuth = pingResp.headers.get("www-authenticate") ?? "";
-        const realmMatch = wwwAuth.match(/realm="([^"]+)"/);
-        if (!realmMatch)
-            return null;
-        const realm = realmMatch[1];
-        const serviceMatch = wwwAuth.match(/service="([^"]+)"/);
-        const service = serviceMatch ? serviceMatch[1] : "";
-        const tokenUrl = `${realm}?service=${encodeURIComponent(service)}` +
-            `&scope=${encodeURIComponent(`repository:${repository}:pull`)}`;
-        const data = (await fetchJson(tokenUrl));
-        return data?.token ?? data?.access_token ?? null;
-    }
-    catch {
-        return null;
-    }
-}
-async function fetchOciManifest(host, repository, reference, token) {
-    const headers = { Accept: MANIFEST_ACCEPT };
-    if (token)
-        headers.Authorization = `Bearer ${token}`;
-    try {
-        const resp = await fetch(`https://${host}/v2/${repository}/manifests/${reference}`, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-        if (!resp.ok)
-            return null;
-        const contentType = resp.headers.get("content-type") ?? "";
-        const lastModified = resp.headers.get("last-modified");
-        const body = (await resp.json());
-        return { contentType, body, lastModified };
-    }
-    catch {
-        return null;
-    }
-}
-function parseLastModified(value) {
-    if (!value)
-        return null;
-    const date = new Date(value);
-    if (isNaN(date.getTime()) || date.getFullYear() < 2000)
-        return null;
-    return date;
-}
-/**
- * Docker Hub Hub API: returns the tag_last_pushed timestamp for a tag — the
- * actual time the image was pushed to Docker Hub, not the build time.
- * repository is already normalized to "library/<name>" or "user/repo" form.
- */
-async function dockerHubPushDate(repository, tag) {
-    const [namespace, ...rest] = repository.split("/");
-    const repoName = rest.join("/");
-    const url = `https://hub.docker.com/v2/repositories/${namespace}/${repoName}/tags` +
-        `?name=${encodeURIComponent(tag)}&page_size=25`;
-    const data = (await fetchJson(url));
-    const result = data?.results?.find((r) => r.name === tag);
-    return parseLastModified(result?.tag_last_pushed ?? null);
-}
-/**
- * Fetch the push timestamp for a container image via registry-specific APIs
- * and the OCI Distribution v2 protocol.
- *
- * For Docker Hub images with a known tag, queries the Hub API for
- * `tag_last_pushed` (the actual push timestamp). For all other registries,
- * or as a fallback, reads the `Last-Modified` HTTP header from the manifest
- * GET response — the time the registry stored that content-addressed manifest,
- * which is the push time (best-effort; not guaranteed by the OCI Distribution
- * spec).
- *
- * Returns null for private registries (anonymous auth rejected), unreachable
- * registries, or registries that do not expose a push timestamp.
- */
-async function fetchImagePublishDate(registry, repository, digest, tag = null) {
-    const host = registry === "docker.io" || registry === "index.docker.io"
-        ? "registry-1.docker.io"
-        : registry;
-    try {
-        // Docker Hub exposes tag_last_pushed via the Hub web API — the real push time
-        if ((registry === "docker.io" || registry === "index.docker.io") && tag) {
-            const date = await dockerHubPushDate(repository, tag);
-            if (date)
-                return date;
-        }
-        // Universal fallback: Last-Modified on the manifest response = push time
-        const token = await getOciToken(host, repository);
-        const manifest = await fetchOciManifest(host, repository, digest, token);
-        if (!manifest)
-            return null;
-        const mediaType = manifest.contentType.split(";")[0].trim();
-        if (OCI_INDEX_MEDIA_TYPES.has(mediaType)) {
-            // Multi-arch index: drill into preferred child and use its Last-Modified
-            const index = manifest.body;
-            if (!index.manifests?.length)
-                return null;
-            const child = index.manifests.find((m) => m.platform?.os === "linux" &&
-                m.platform?.architecture === "amd64") ?? index.manifests[0];
-            const childManifest = await fetchOciManifest(host, repository, child.digest, token);
-            if (!childManifest)
-                return null;
-            return parseLastModified(childManifest.lastModified);
-        }
-        return parseLastModified(manifest.lastModified);
-    }
-    catch {
-        return null;
-    }
-}
-async function fetchOciBlobJson(host, repository, digest, token) {
-    const headers = {};
-    if (token)
-        headers.Authorization = `Bearer ${token}`;
-    try {
-        const resp = await fetch(`https://${host}/v2/${repository}/blobs/${digest}`, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-        if (!resp.ok)
-            return null;
-        return await resp.json();
-    }
-    catch {
-        return null;
-    }
-}
-/**
- * Fetch metadata labels for a container image, merging OCI manifest annotations
- * and config-blob Labels. Sources (lowest → highest precedence):
- *   1. index-level annotations (when top manifest is a multi-arch image index)
- *   2. chosen child-descriptor annotations (per-platform entry in the index)
- *   3. resolved image manifest top-level annotations
- *   4. config-blob config.Labels
- * Returns the merged map if any key is present, or null on total failure.
- * Works anonymously on public registries; private registries → null.
- */
-async function fetchImageLabels(registry, repository, reference) {
-    const host = registry === "docker.io" || registry === "index.docker.io"
-        ? "registry-1.docker.io"
-        : registry;
-    try {
-        const token = await getOciToken(host, repository);
-        let manifest = await fetchOciManifest(host, repository, reference, token);
-        if (!manifest)
-            return null;
-        const merged = {};
-        const mediaType = manifest.contentType.split(";")[0].trim();
-        if (OCI_INDEX_MEDIA_TYPES.has(mediaType)) {
-            const index = manifest.body;
-            // 1. index-level annotations
-            Object.assign(merged, index.annotations ?? {});
-            if (!index.manifests?.length)
-                return Object.keys(merged).length ? merged : null;
-            const child = index.manifests.find((m) => m.platform?.os === "linux" &&
-                m.platform?.architecture === "amd64") ?? index.manifests[0];
-            // 2. child-descriptor annotations
-            Object.assign(merged, child.annotations ?? {});
-            manifest = await fetchOciManifest(host, repository, child.digest, token);
-            if (!manifest)
-                return Object.keys(merged).length ? merged : null;
-        }
-        // 3. image manifest annotations
-        const manifestBody = manifest.body;
-        Object.assign(merged, manifestBody.annotations ?? {});
-        // 4. config-blob Labels (highest precedence — overrides annotations on conflict)
-        const configDigest = manifestBody.config?.digest;
-        if (configDigest) {
-            const config = await fetchOciBlobJson(host, repository, configDigest, token);
-            const cfg = config;
-            Object.assign(merged, cfg?.config?.Labels ?? {});
-        }
-        return Object.keys(merged).length ? merged : null;
-    }
-    catch {
-        return null;
-    }
-}
-async function imageExistsOnHost(host, repository, reference) {
-    try {
-        const token = await getOciToken(host, repository);
-        const headers = { Accept: MANIFEST_ACCEPT };
-        if (token)
-            headers.Authorization = `Bearer ${token}`;
-        const resp = await fetch(`https://${host}/v2/${repository}/manifests/${reference}`, { method: "HEAD", headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-        if (resp.status === 200)
-            return "found";
-        if (resp.status === 404)
-            return "notfound";
-        return "unknown";
-    }
-    catch {
-        return "unknown";
-    }
-}
-/**
- * Check whether a manifest reference exists in an OCI registry without
- * downloading its content. Uses a HEAD request per the OCI Distribution v2
- * spec.
- *
- * Returns:
- *   "found"    — HTTP 200 (manifest exists and is publicly accessible)
- *   "notfound" — HTTP 404 (reference does not exist in the registry)
- *   "unknown"  — any other status (401 private, 429 rate-limit, network
- *                error, or thrown exception) — caller should not treat the
- *                reference as either present or absent
- *
- * When `dockerhubMirror` is set and the primary check against Docker Hub
- * returns "unknown" (e.g. rate-limited), the mirror is tried as a fallback.
- * This lets CI environments that configure a Docker Hub mirror (e.g.
- * mirror.gcr.io) resolve ambiguous COPY --from / RUN --mount=from references
- * even when the primary registry is throttling anonymous requests.
- */
-async function imageExists(registry, repository, reference, dockerhubMirror) {
-    const host = registry === "docker.io" || registry === "index.docker.io"
-        ? "registry-1.docker.io"
-        : registry;
-    const result = await imageExistsOnHost(host, repository, reference);
-    if (result === "unknown" &&
-        (registry === "docker.io" || registry === "index.docker.io") &&
-        dockerhubMirror) {
-        return imageExistsOnHost(dockerhubMirror, repository, reference);
-    }
-    return result;
-}
-//# sourceMappingURL=registry.js.map
-;// CONCATENATED MODULE: ./out/ecosystems/npm.js
-
-
-
-
-
-/** Default lockfile names to auto-detect when no explicit input is provided. */
-const DEFAULT_LOCKFILES = [
-    "pnpm-lock.yaml",
-    "package-lock.json",
-    "yarn.lock",
-    "bun.lock",
-];
-function npm_detectType(file) {
-    const base = external_node_path_namespaceObject.basename(file);
-    if (base === "pnpm-lock.yaml")
-        return "pnpm";
-    if (base === "package-lock.json")
-        return "npm";
-    if (base === "yarn.lock")
-        return "yarn";
-    if (base === "bun.lock")
-        return "bun";
-    if (base.endsWith(".yaml") || base.endsWith(".yml")) {
-        lib_core.debug(`npm: treating ${file} as pnpm lockfile based on extension`);
-        return "pnpm";
-    }
-    lib_core.debug(`npm: treating ${file} as npm lockfile (default fallback)`);
-    return "npm";
-}
-/**
- * Resolve npm aliases. In pnpm lockfiles, aliased packages like
- * `string-width-cjs: string-width@4.2.3` produce version = "string-width@4.2.3".
- * Returns [resolvedName, resolvedVersion].
- */
-function resolveAlias(name, version) {
-    // Pattern: version contains "@" with a real package name prefix
-    // e.g. "string-width@4.2.3" or "@scope/pkg@1.0.0"
-    const atIdx = version.startsWith("@")
-        ? version.indexOf("@", 1) // scoped: find second @
-        : version.indexOf("@");
-    if (atIdx > 0) {
-        const realName = version.slice(0, atIdx);
-        const realVersion = version.slice(atIdx + 1);
-        // Sanity check: realVersion should look like a version (starts with digit)
-        if (/^\d/.test(realVersion)) {
-            return [realName, realVersion];
-        }
-    }
-    return [name, version];
-}
-/** Flatten a parsed lockfile into resolved package entries. */
-function collectPackages(deps) {
-    const result = new Map();
-    for (const dep of deps) {
-        const [name, version] = resolveAlias(dep.name, dep.version);
-        result.set(dep.name, { key: dep.name, name, version });
-    }
-    return result;
-}
-/** Compare HEAD and base lockfile contents to find new/changed packages. */
-async function findChangedPackages(headContent, baseContent, file) {
-    const type = npm_detectType(file);
-    let headPkgs;
-    try {
-        const parsed = await parse(headContent, type);
-        headPkgs = collectPackages(parsed.packages);
-    }
-    catch (e) {
-        lib_core.warning(`Failed to parse ${file}: ${e}`);
-        return [];
-    }
-    let basePkgs = new Map();
-    if (baseContent) {
-        try {
-            const parsed = await parse(baseContent, type);
-            basePkgs = collectPackages(parsed.packages);
-        }
-        catch {
-            // Base couldn't be parsed (new file, etc.) — treat all HEAD packages as new
-        }
-    }
-    const deps = [];
-    for (const [key, pkg] of headPkgs) {
-        const basePkg = basePkgs.get(key);
-        if (basePkg && basePkg.version === pkg.version)
-            continue;
-        // Use resolved name for registry lookups
-        deps.push({ ecosystem: "npm", name: pkg.name, version: pkg.version, file });
-    }
-    return deps;
-}
-async function getChangedDeps(baseRef, lockfileInput) {
-    let files;
-    if (lockfileInput) {
-        files = await resolveFiles(lockfileInput);
-    }
-    else {
-        // Auto-detect: find which default lockfiles were changed
-        const changedFiles = new Set(await gitDiffNameOnly(baseRef));
-        files = DEFAULT_LOCKFILES.filter((f) => changedFiles.has(f));
-        if (files.length === 0) {
-            lib_core.info("npm: no lockfiles found in changed files");
-            return [];
-        }
-    }
-    const allDeps = [];
-    for (const file of files) {
-        // Check if file changed at all
-        const diff = await gitDiff(baseRef, file);
-        if (!diff) {
-            lib_core.info(`npm: no changes in ${file}`);
-            continue;
-        }
-        // Read full HEAD and base content for proper parsing
-        let headContent;
-        try {
-            const fs = await Promise.resolve(/* import() */).then(__nccwpck_require__.t.bind(__nccwpck_require__, 1455, 19));
-            headContent = await fs.readFile(file, "utf8");
-        }
-        catch {
-            lib_core.info(`npm: could not read ${file}`);
-            continue;
-        }
-        const baseContent = await gitShowFile(baseRef, file);
-        allDeps.push(...(await findChangedPackages(headContent, baseContent, file)));
-    }
-    return allDeps;
-}
-async function getPublishDate(name, version, registries) {
-    return npmPublishDate(name, version, registries);
-}
-//# sourceMappingURL=npm.js.map
-;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/error.js
-/*!
- * Copyright (c) Squirrel Chat et al., All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holder nor the names of its contributors
- *    may be used to endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-function getLineColFromPtr(string, ptr) {
-    let lines = string.slice(0, ptr).split(/\r\n|\n|\r/g);
-    return [lines.length, lines.pop().length + 1];
-}
-function makeCodeBlock(string, line, column) {
-    let lines = string.split(/\r\n|\n|\r/g);
-    let codeblock = '';
-    let numberLen = (Math.log10(line + 1) | 0) + 1;
-    for (let i = line - 1; i <= line + 1; i++) {
-        let l = lines[i - 1];
-        if (!l)
-            continue;
-        codeblock += i.toString().padEnd(numberLen, ' ');
-        codeblock += ':  ';
-        codeblock += l;
-        codeblock += '\n';
-        if (i === line) {
-            codeblock += ' '.repeat(numberLen + column + 2);
-            codeblock += '^\n';
-        }
-    }
-    return codeblock;
-}
-class TomlError extends Error {
-    line;
-    column;
-    codeblock;
-    constructor(message, options) {
-        const [line, column] = getLineColFromPtr(options.toml, options.ptr);
-        const codeblock = makeCodeBlock(options.toml, line, column);
-        super(`Invalid TOML document: ${message}\n\n${codeblock}`, options);
-        this.line = line;
-        this.column = column;
-        this.codeblock = codeblock;
-    }
-}
-
-;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/util.js
-/*!
- * Copyright (c) Squirrel Chat et al., All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holder nor the names of its contributors
- *    may be used to endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-function isEscaped(str, ptr) {
-    let i = 0;
-    while (str[ptr - ++i] === '\\')
-        ;
-    return --i && (i % 2);
-}
-function indexOfNewline(str, start = 0, end = str.length) {
-    let idx = str.indexOf('\n', start);
-    if (str[idx - 1] === '\r')
-        idx--;
-    return idx <= end ? idx : -1;
-}
-function skipComment(str, ptr) {
-    for (let i = ptr; i < str.length; i++) {
-        let c = str[i];
-        if (c === '\n')
-            return i;
-        if (c === '\r' && str[i + 1] === '\n')
-            return i + 1;
-        if ((c < '\x20' && c !== '\t') || c === '\x7f') {
-            throw new TomlError('control characters are not allowed in comments', {
-                toml: str,
-                ptr: ptr,
-            });
-        }
-    }
-    return str.length;
-}
-function skipVoid(str, ptr, banNewLines, banComments) {
-    let c;
-    while (1) {
-        while ((c = str[ptr]) === ' ' || c === '\t' || (!banNewLines && (c === '\n' || c === '\r' && str[ptr + 1] === '\n')))
-            ptr++;
-        // Tucking the return statement here would save 5 characters >:)
-        // But TypeScript fails to detect there is no way to exit the loop so it complains about the lack of final return
-        if (banComments || c !== '#')
-            break;
-        ptr = skipComment(str, ptr);
-    }
-    return ptr;
-}
-function skipUntil(str, ptr, sep, end, banNewLines = false) {
-    if (!end) {
-        ptr = indexOfNewline(str, ptr);
-        return ptr < 0 ? str.length : ptr;
-    }
-    for (let i = ptr; i < str.length; i++) {
-        let c = str[i];
-        if (c === '#') {
-            i = indexOfNewline(str, i);
-        }
-        else if (c === sep) {
-            return i + 1;
-        }
-        else if (c === end || (banNewLines && (c === '\n' || (c === '\r' && str[i + 1] === '\n')))) {
-            return i;
-        }
-    }
-    throw new TomlError('cannot find end of structure', {
-        toml: str,
-        ptr: ptr
-    });
-}
-function getStringEnd(str, seek) {
-    let first = str[seek];
-    let target = first === str[seek + 1] && str[seek + 1] === str[seek + 2]
-        ? str.slice(seek, seek + 3)
-        : first;
-    seek += target.length - 1;
-    do
-        seek = str.indexOf(target, ++seek);
-    while (seek > -1 && first !== "'" && isEscaped(str, seek));
-    if (seek > -1) {
-        seek += target.length;
-        if (target.length > 1) {
-            if (str[seek] === first)
-                seek++;
-            if (str[seek] === first)
-                seek++;
-        }
-    }
-    return seek;
-}
-
-;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/date.js
-/*!
- * Copyright (c) Squirrel Chat et al., All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holder nor the names of its contributors
- *    may be used to endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-let DATE_TIME_RE = /^(\d{4}-\d{2}-\d{2})?[T ]?(?:(\d{2}):\d{2}(?::\d{2}(?:\.\d+)?)?)?(Z|[-+]\d{2}:\d{2})?$/i;
-class TomlDate extends Date {
-    #hasDate = false;
-    #hasTime = false;
-    #offset = null;
-    constructor(date) {
-        let hasDate = true;
-        let hasTime = true;
-        let offset = 'Z';
-        if (typeof date === 'string') {
-            let match = date.match(DATE_TIME_RE);
-            if (match) {
-                if (!match[1]) {
-                    hasDate = false;
-                    date = `0000-01-01T${date}`;
-                }
-                hasTime = !!match[2];
-                // Make sure to use T instead of a space. Breaks in case of extreme values otherwise.
-                hasTime && date[10] === ' ' && (date = date.replace(' ', 'T'));
-                // Do not allow rollover hours.
-                if (match[2] && +match[2] > 23) {
-                    date = '';
-                }
-                else {
-                    offset = match[3] || null;
-                    date = date.toUpperCase();
-                    if (!offset && hasTime)
-                        date += 'Z';
-                }
-            }
-            else {
-                date = '';
-            }
-        }
-        super(date);
-        if (!isNaN(this.getTime())) {
-            this.#hasDate = hasDate;
-            this.#hasTime = hasTime;
-            this.#offset = offset;
-        }
-    }
-    isDateTime() {
-        return this.#hasDate && this.#hasTime;
-    }
-    isLocal() {
-        return !this.#hasDate || !this.#hasTime || !this.#offset;
-    }
-    isDate() {
-        return this.#hasDate && !this.#hasTime;
-    }
-    isTime() {
-        return this.#hasTime && !this.#hasDate;
-    }
-    isValid() {
-        return this.#hasDate || this.#hasTime;
-    }
-    toISOString() {
-        let iso = super.toISOString();
-        // Local Date
-        if (this.isDate())
-            return iso.slice(0, 10);
-        // Local Time
-        if (this.isTime())
-            return iso.slice(11, 23);
-        // Local DateTime
-        if (this.#offset === null)
-            return iso.slice(0, -1);
-        // Offset DateTime
-        if (this.#offset === 'Z')
-            return iso;
-        // This part is quite annoying: JS strips the original timezone from the ISO string representation
-        // Instead of using a "modified" date and "Z", we restore the representation "as authored"
-        let offset = (+(this.#offset.slice(1, 3)) * 60) + +(this.#offset.slice(4, 6));
-        offset = this.#offset[0] === '-' ? offset : -offset;
-        let offsetDate = new Date(this.getTime() - (offset * 60e3));
-        return offsetDate.toISOString().slice(0, -1) + this.#offset;
-    }
-    static wrapAsOffsetDateTime(jsDate, offset = 'Z') {
-        let date = new TomlDate(jsDate);
-        date.#offset = offset;
-        return date;
-    }
-    static wrapAsLocalDateTime(jsDate) {
-        let date = new TomlDate(jsDate);
-        date.#offset = null;
-        return date;
-    }
-    static wrapAsLocalDate(jsDate) {
-        let date = new TomlDate(jsDate);
-        date.#hasTime = false;
-        date.#offset = null;
-        return date;
-    }
-    static wrapAsLocalTime(jsDate) {
-        let date = new TomlDate(jsDate);
-        date.#hasDate = false;
-        date.#offset = null;
-        return date;
-    }
-}
-
-;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/primitive.js
-/*!
- * Copyright (c) Squirrel Chat et al., All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holder nor the names of its contributors
- *    may be used to endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-
-
-let INT_REGEX = /^((0x[0-9a-fA-F](_?[0-9a-fA-F])*)|(([+-]|0[ob])?\d(_?\d)*))$/;
-let FLOAT_REGEX = /^[+-]?\d(_?\d)*(\.\d(_?\d)*)?([eE][+-]?\d(_?\d)*)?$/;
-let LEADING_ZERO = /^[+-]?0[0-9_]/;
-let ESCAPE_REGEX = /^[0-9a-f]{2,8}$/i;
-let ESC_MAP = {
-    b: '\b',
-    t: '\t',
-    n: '\n',
-    f: '\f',
-    r: '\r',
-    e: '\x1b',
-    '"': '"',
-    '\\': '\\',
-};
-function parseString(str, ptr = 0, endPtr = str.length) {
-    let isLiteral = str[ptr] === '\'';
-    let isMultiline = str[ptr++] === str[ptr] && str[ptr] === str[ptr + 1];
-    if (isMultiline) {
-        endPtr -= 2;
-        if (str[ptr += 2] === '\r')
-            ptr++;
-        if (str[ptr] === '\n')
-            ptr++;
-    }
-    let tmp = 0;
-    let isEscape;
-    let parsed = '';
-    let sliceStart = ptr;
-    while (ptr < endPtr - 1) {
-        let c = str[ptr++];
-        if (c === '\n' || (c === '\r' && str[ptr] === '\n')) {
-            if (!isMultiline) {
-                throw new TomlError('newlines are not allowed in strings', {
-                    toml: str,
-                    ptr: ptr - 1,
-                });
-            }
-        }
-        else if ((c < '\x20' && c !== '\t') || c === '\x7f') {
-            throw new TomlError('control characters are not allowed in strings', {
-                toml: str,
-                ptr: ptr - 1,
-            });
-        }
-        if (isEscape) {
-            isEscape = false;
-            if (c === 'x' || c === 'u' || c === 'U') {
-                // Unicode escape
-                let code = str.slice(ptr, (ptr += (c === 'x' ? 2 : c === 'u' ? 4 : 8)));
-                if (!ESCAPE_REGEX.test(code)) {
-                    throw new TomlError('invalid unicode escape', {
-                        toml: str,
-                        ptr: tmp,
-                    });
-                }
-                try {
-                    parsed += String.fromCodePoint(parseInt(code, 16));
-                }
-                catch {
-                    throw new TomlError('invalid unicode escape', {
-                        toml: str,
-                        ptr: tmp,
-                    });
-                }
-            }
-            else if (isMultiline && (c === '\n' || c === ' ' || c === '\t' || c === '\r')) {
-                // Multiline escape
-                ptr = skipVoid(str, ptr - 1, true);
-                if (str[ptr] !== '\n' && str[ptr] !== '\r') {
-                    throw new TomlError('invalid escape: only line-ending whitespace may be escaped', {
-                        toml: str,
-                        ptr: tmp,
-                    });
-                }
-                ptr = skipVoid(str, ptr);
-            }
-            else if (c in ESC_MAP) {
-                // Classic escape
-                parsed += ESC_MAP[c];
-            }
-            else {
-                throw new TomlError('unrecognized escape sequence', {
-                    toml: str,
-                    ptr: tmp,
-                });
-            }
-            sliceStart = ptr;
-        }
-        else if (!isLiteral && c === '\\') {
-            tmp = ptr - 1;
-            isEscape = true;
-            parsed += str.slice(sliceStart, tmp);
-        }
-    }
-    return parsed + str.slice(sliceStart, endPtr - 1);
-}
-function parseValue(value, toml, ptr, integersAsBigInt) {
-    // Constant values
-    if (value === 'true')
-        return true;
-    if (value === 'false')
-        return false;
-    if (value === '-inf')
-        return -Infinity;
-    if (value === 'inf' || value === '+inf')
-        return Infinity;
-    if (value === 'nan' || value === '+nan' || value === '-nan')
-        return NaN;
-    // Avoid FP representation of -0
-    if (value === '-0')
-        return integersAsBigInt ? 0n : 0;
-    // Numbers
-    let isInt = INT_REGEX.test(value);
-    if (isInt || FLOAT_REGEX.test(value)) {
-        if (LEADING_ZERO.test(value)) {
-            throw new TomlError('leading zeroes are not allowed', {
-                toml: toml,
-                ptr: ptr,
-            });
-        }
-        value = value.replace(/_/g, '');
-        let numeric = +value;
-        if (isNaN(numeric)) {
-            throw new TomlError('invalid number', {
-                toml: toml,
-                ptr: ptr,
-            });
-        }
-        if (isInt) {
-            if ((isInt = !Number.isSafeInteger(numeric)) && !integersAsBigInt) {
-                throw new TomlError('integer value cannot be represented losslessly', {
-                    toml: toml,
-                    ptr: ptr,
-                });
-            }
-            if (isInt || integersAsBigInt === true)
-                numeric = BigInt(value);
-        }
-        return numeric;
-    }
-    const date = new TomlDate(value);
-    if (!date.isValid()) {
-        throw new TomlError('invalid value', {
-            toml: toml,
-            ptr: ptr,
-        });
-    }
-    return date;
-}
-
-;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/extract.js
-/*!
- * Copyright (c) Squirrel Chat et al., All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holder nor the names of its contributors
- *    may be used to endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-
-
-
-function sliceAndTrimEndOf(str, startPtr, endPtr) {
-    let value = str.slice(startPtr, endPtr);
-    let commentIdx = value.indexOf('#');
-    if (commentIdx > -1) {
-        // The call to skipComment allows to "validate" the comment
-        // (absence of control characters)
-        skipComment(str, commentIdx);
-        value = value.slice(0, commentIdx);
-    }
-    return [value.trimEnd(), commentIdx];
-}
-function extractValue(str, ptr, end, depth, integersAsBigInt) {
-    if (depth === 0) {
-        throw new TomlError('document contains excessively nested structures. aborting.', {
-            toml: str,
-            ptr: ptr
-        });
-    }
-    let c = str[ptr];
-    if (c === '[' || c === '{') {
-        let [value, endPtr] = c === '['
-            ? parseArray(str, ptr, depth, integersAsBigInt)
-            : parseInlineTable(str, ptr, depth, integersAsBigInt);
-        if (end) {
-            endPtr = skipVoid(str, endPtr);
-            if (str[endPtr] === ',')
-                endPtr++;
-            else if (str[endPtr] !== end) {
-                throw new TomlError('expected comma or end of structure', {
-                    toml: str,
-                    ptr: endPtr,
-                });
-            }
-        }
-        return [value, endPtr];
-    }
-    let endPtr;
-    if (c === '"' || c === "'") {
-        endPtr = getStringEnd(str, ptr);
-        let parsed = parseString(str, ptr, endPtr);
-        if (end) {
-            endPtr = skipVoid(str, endPtr);
-            if (str[endPtr] && str[endPtr] !== ',' && str[endPtr] !== end && str[endPtr] !== '\n' && str[endPtr] !== '\r') {
-                throw new TomlError('unexpected character encountered', {
-                    toml: str,
-                    ptr: endPtr,
-                });
-            }
-            endPtr += (+(str[endPtr] === ','));
-        }
-        return [parsed, endPtr];
-    }
-    endPtr = skipUntil(str, ptr, ',', end);
-    let slice = sliceAndTrimEndOf(str, ptr, endPtr - (+(str[endPtr - 1] === ',')));
-    if (!slice[0]) {
-        throw new TomlError('incomplete key-value declaration: no value specified', {
-            toml: str,
-            ptr: ptr
-        });
-    }
-    if (end && slice[1] > -1) {
-        endPtr = skipVoid(str, ptr + slice[1]);
-        endPtr += +(str[endPtr] === ',');
-    }
-    return [
-        parseValue(slice[0], str, ptr, integersAsBigInt),
-        endPtr,
-    ];
-}
-
-;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/struct.js
-/*!
- * Copyright (c) Squirrel Chat et al., All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holder nor the names of its contributors
- *    may be used to endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-
-
-
-let KEY_PART_RE = /^[a-zA-Z0-9-_]+[ \t]*$/;
-function parseKey(str, ptr, end = '=') {
-    let dot = ptr - 1;
-    let parsed = [];
-    let endPtr = str.indexOf(end, ptr);
-    if (endPtr < 0) {
-        throw new TomlError('incomplete key-value: cannot find end of key', {
-            toml: str,
-            ptr: ptr,
-        });
-    }
-    do {
-        let c = str[ptr = ++dot];
-        // If it's whitespace, ignore
-        if (c !== ' ' && c !== '\t') {
-            // If it's a string
-            if (c === '"' || c === '\'') {
-                if (c === str[ptr + 1] && c === str[ptr + 2]) {
-                    throw new TomlError('multiline strings are not allowed in keys', {
-                        toml: str,
-                        ptr: ptr,
-                    });
-                }
-                let eos = getStringEnd(str, ptr);
-                if (eos < 0) {
-                    throw new TomlError('unfinished string encountered', {
-                        toml: str,
-                        ptr: ptr,
-                    });
-                }
-                dot = str.indexOf('.', eos);
-                let strEnd = str.slice(eos, dot < 0 || dot > endPtr ? endPtr : dot);
-                let newLine = indexOfNewline(strEnd);
-                if (newLine > -1) {
-                    throw new TomlError('newlines are not allowed in keys', {
-                        toml: str,
-                        ptr: ptr + dot + newLine,
-                    });
-                }
-                if (strEnd.trimStart()) {
-                    throw new TomlError('found extra tokens after the string part', {
-                        toml: str,
-                        ptr: eos,
-                    });
-                }
-                if (endPtr < eos) {
-                    endPtr = str.indexOf(end, eos);
-                    if (endPtr < 0) {
-                        throw new TomlError('incomplete key-value: cannot find end of key', {
-                            toml: str,
-                            ptr: ptr,
-                        });
-                    }
-                }
-                parsed.push(parseString(str, ptr, eos));
-            }
-            else {
-                // Normal raw key part consumption and validation
-                dot = str.indexOf('.', ptr);
-                let part = str.slice(ptr, dot < 0 || dot > endPtr ? endPtr : dot);
-                if (!KEY_PART_RE.test(part)) {
-                    throw new TomlError('only letter, numbers, dashes and underscores are allowed in keys', {
-                        toml: str,
-                        ptr: ptr,
-                    });
-                }
-                parsed.push(part.trimEnd());
-            }
-        }
-        // Until there's no more dot
-    } while (dot + 1 && dot < endPtr);
-    return [parsed, skipVoid(str, endPtr + 1, true, true)];
-}
-function parseInlineTable(str, ptr, depth, integersAsBigInt) {
-    let res = {};
-    let seen = new Set();
-    let c;
-    ptr++;
-    while ((c = str[ptr++]) !== '}' && c) {
-        if (c === ',') {
-            throw new TomlError('expected value, found comma', {
-                toml: str,
-                ptr: ptr - 1,
-            });
-        }
-        else if (c === '#')
-            ptr = skipComment(str, ptr);
-        else if (c !== ' ' && c !== '\t' && c !== '\n' && c !== '\r') {
-            let k;
-            let t = res;
-            let hasOwn = false;
-            let [key, keyEndPtr] = parseKey(str, ptr - 1);
-            for (let i = 0; i < key.length; i++) {
-                if (i)
-                    t = hasOwn ? t[k] : (t[k] = {});
-                k = key[i];
-                if ((hasOwn = Object.hasOwn(t, k)) && (typeof t[k] !== 'object' || seen.has(t[k]))) {
-                    throw new TomlError('trying to redefine an already defined value', {
-                        toml: str,
-                        ptr: ptr,
-                    });
-                }
-                if (!hasOwn && k === '__proto__') {
-                    Object.defineProperty(t, k, { enumerable: true, configurable: true, writable: true });
-                }
-            }
-            if (hasOwn) {
-                throw new TomlError('trying to redefine an already defined value', {
-                    toml: str,
-                    ptr: ptr,
-                });
-            }
-            let [value, valueEndPtr] = extractValue(str, keyEndPtr, '}', depth - 1, integersAsBigInt);
-            seen.add(value);
-            t[k] = value;
-            ptr = valueEndPtr;
-        }
-    }
-    if (!c) {
-        throw new TomlError('unfinished table encountered', {
-            toml: str,
-            ptr: ptr,
-        });
-    }
-    return [res, ptr];
-}
-function parseArray(str, ptr, depth, integersAsBigInt) {
-    let res = [];
-    let c;
-    ptr++;
-    while ((c = str[ptr++]) !== ']' && c) {
-        if (c === ',') {
-            throw new TomlError('expected value, found comma', {
-                toml: str,
-                ptr: ptr - 1,
-            });
-        }
-        else if (c === '#')
-            ptr = skipComment(str, ptr);
-        else if (c !== ' ' && c !== '\t' && c !== '\n' && c !== '\r') {
-            let e = extractValue(str, ptr - 1, ']', depth - 1, integersAsBigInt);
-            res.push(e[0]);
-            ptr = e[1];
-        }
-    }
-    if (!c) {
-        throw new TomlError('unfinished array encountered', {
-            toml: str,
-            ptr: ptr,
-        });
-    }
-    return [res, ptr];
-}
-
-;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/parse.js
-/*!
- * Copyright (c) Squirrel Chat et al., All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holder nor the names of its contributors
- *    may be used to endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-
-
-
-function peekTable(key, table, meta, type) {
-    let t = table;
-    let m = meta;
-    let k;
-    let hasOwn = false;
-    let state;
-    for (let i = 0; i < key.length; i++) {
-        if (i) {
-            t = hasOwn ? t[k] : (t[k] = {});
-            m = (state = m[k]).c;
-            if (type === 0 /* Type.DOTTED */ && (state.t === 1 /* Type.EXPLICIT */ || state.t === 2 /* Type.ARRAY */)) {
-                return null;
-            }
-            if (state.t === 2 /* Type.ARRAY */) {
-                let l = t.length - 1;
-                t = t[l];
-                m = m[l].c;
-            }
-        }
-        k = key[i];
-        if ((hasOwn = Object.hasOwn(t, k)) && m[k]?.t === 0 /* Type.DOTTED */ && m[k]?.d) {
-            return null;
-        }
-        if (!hasOwn) {
-            if (k === '__proto__') {
-                Object.defineProperty(t, k, { enumerable: true, configurable: true, writable: true });
-                Object.defineProperty(m, k, { enumerable: true, configurable: true, writable: true });
-            }
-            m[k] = {
-                t: i < key.length - 1 && type === 2 /* Type.ARRAY */
-                    ? 3 /* Type.ARRAY_DOTTED */
-                    : type,
-                d: false,
-                i: 0,
-                c: {},
-            };
-        }
-    }
-    state = m[k];
-    if (state.t !== type && !(type === 1 /* Type.EXPLICIT */ && state.t === 3 /* Type.ARRAY_DOTTED */)) {
-        // Bad key type!
-        return null;
-    }
-    if (type === 2 /* Type.ARRAY */) {
-        if (!state.d) {
-            state.d = true;
-            t[k] = [];
-        }
-        t[k].push(t = {});
-        state.c[state.i++] = (state = { t: 1 /* Type.EXPLICIT */, d: false, i: 0, c: {} });
-    }
-    if (state.d) {
-        // Redefining a table!
-        return null;
-    }
-    state.d = true;
-    if (type === 1 /* Type.EXPLICIT */) {
-        t = hasOwn ? t[k] : (t[k] = {});
-    }
-    else if (type === 0 /* Type.DOTTED */ && hasOwn) {
-        return null;
-    }
-    return [k, t, state.c];
-}
-function parse_parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
-    let res = {};
-    let meta = {};
-    let tbl = res;
-    let m = meta;
-    for (let ptr = skipVoid(toml, 0); ptr < toml.length;) {
-        if (toml[ptr] === '[') {
-            let isTableArray = toml[++ptr] === '[';
-            let k = parseKey(toml, ptr += +isTableArray, ']');
-            if (isTableArray) {
-                if (toml[k[1] - 1] !== ']') {
-                    throw new TomlError('expected end of table declaration', {
-                        toml: toml,
-                        ptr: k[1] - 1,
-                    });
-                }
-                k[1]++;
-            }
-            let p = peekTable(k[0], res, meta, isTableArray ? 2 /* Type.ARRAY */ : 1 /* Type.EXPLICIT */);
-            if (!p) {
-                throw new TomlError('trying to redefine an already defined table or value', {
-                    toml: toml,
-                    ptr: ptr,
-                });
-            }
-            m = p[2];
-            tbl = p[1];
-            ptr = k[1];
-        }
-        else {
-            let k = parseKey(toml, ptr);
-            let p = peekTable(k[0], tbl, m, 0 /* Type.DOTTED */);
-            if (!p) {
-                throw new TomlError('trying to redefine an already defined table or value', {
-                    toml: toml,
-                    ptr: ptr,
-                });
-            }
-            let v = extractValue(toml, k[1], void 0, maxDepth, integersAsBigInt);
-            p[1][p[0]] = v[0];
-            ptr = v[1];
-        }
-        ptr = skipVoid(toml, ptr, true);
-        if (toml[ptr] && toml[ptr] !== '\n' && toml[ptr] !== '\r') {
-            throw new TomlError('each key-value declaration must be followed by an end-of-line', {
-                toml: toml,
-                ptr: ptr
-            });
-        }
-        ptr = skipVoid(toml, ptr);
-    }
-    return res;
-}
-
-;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/stringify.js
-/*!
- * Copyright (c) Squirrel Chat et al., All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holder nor the names of its contributors
- *    may be used to endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-let BARE_KEY = /^[a-z0-9-_]+$/i;
-function extendedTypeOf(obj) {
-    let type = typeof obj;
-    if (type === 'object') {
-        if (Array.isArray(obj))
-            return 'array';
-        if (obj instanceof Date)
-            return 'date';
-    }
-    return type;
-}
-function isArrayOfTables(obj) {
-    for (let i = 0; i < obj.length; i++) {
-        if (extendedTypeOf(obj[i]) !== 'object')
-            return false;
-    }
-    return obj.length != 0;
-}
-function formatString(s) {
-    return JSON.stringify(s).replace(/\x7f/g, '\\u007f');
-}
-function stringifyValue(val, type, depth, numberAsFloat) {
-    if (depth === 0) {
-        throw new Error('Could not stringify the object: maximum object depth exceeded');
-    }
-    if (type === 'number') {
-        if (isNaN(val))
-            return 'nan';
-        if (val === Infinity)
-            return 'inf';
-        if (val === -Infinity)
-            return '-inf';
-        if (numberAsFloat && Number.isInteger(val))
-            return val.toFixed(1);
-        return val.toString();
-    }
-    if (type === 'bigint' || type === 'boolean') {
-        return val.toString();
-    }
-    if (type === 'string') {
-        return formatString(val);
-    }
-    if (type === 'date') {
-        if (isNaN(val.getTime())) {
-            throw new TypeError('cannot serialize invalid date');
-        }
-        return val.toISOString();
-    }
-    if (type === 'object') {
-        return stringifyInlineTable(val, depth, numberAsFloat);
-    }
-    if (type === 'array') {
-        return stringifyArray(val, depth, numberAsFloat);
-    }
-}
-function stringifyInlineTable(obj, depth, numberAsFloat) {
-    let keys = Object.keys(obj);
-    if (keys.length === 0)
-        return '{}';
-    let res = '{ ';
-    for (let i = 0; i < keys.length; i++) {
-        let k = keys[i];
-        if (i)
-            res += ', ';
-        res += BARE_KEY.test(k) ? k : formatString(k);
-        res += ' = ';
-        res += stringifyValue(obj[k], extendedTypeOf(obj[k]), depth - 1, numberAsFloat);
-    }
-    return res + ' }';
-}
-function stringifyArray(array, depth, numberAsFloat) {
-    if (array.length === 0)
-        return '[]';
-    let res = '[ ';
-    for (let i = 0; i < array.length; i++) {
-        if (i)
-            res += ', ';
-        if (array[i] === null || array[i] === void 0) {
-            throw new TypeError('arrays cannot contain null or undefined values');
-        }
-        res += stringifyValue(array[i], extendedTypeOf(array[i]), depth - 1, numberAsFloat);
-    }
-    return res + ' ]';
-}
-function stringifyArrayTable(array, key, depth, numberAsFloat) {
-    if (depth === 0) {
-        throw new Error('Could not stringify the object: maximum object depth exceeded');
-    }
-    let res = '';
-    for (let i = 0; i < array.length; i++) {
-        res += `${res && '\n'}[[${key}]]\n`;
-        res += stringifyTable(0, array[i], key, depth, numberAsFloat);
-    }
-    return res;
-}
-function stringifyTable(tableKey, obj, prefix, depth, numberAsFloat) {
-    if (depth === 0) {
-        throw new Error('Could not stringify the object: maximum object depth exceeded');
-    }
-    let preamble = '';
-    let tables = '';
-    let keys = Object.keys(obj);
-    for (let i = 0; i < keys.length; i++) {
-        let k = keys[i];
-        if (obj[k] !== null && obj[k] !== void 0) {
-            let type = extendedTypeOf(obj[k]);
-            if (type === 'symbol' || type === 'function') {
-                throw new TypeError(`cannot serialize values of type '${type}'`);
-            }
-            let key = BARE_KEY.test(k) ? k : formatString(k);
-            if (type === 'array' && isArrayOfTables(obj[k])) {
-                tables += (tables && '\n') + stringifyArrayTable(obj[k], prefix ? `${prefix}.${key}` : key, depth - 1, numberAsFloat);
-            }
-            else if (type === 'object') {
-                let tblKey = prefix ? `${prefix}.${key}` : key;
-                tables += (tables && '\n') + stringifyTable(tblKey, obj[k], tblKey, depth - 1, numberAsFloat);
-            }
-            else {
-                preamble += key;
-                preamble += ' = ';
-                preamble += stringifyValue(obj[k], type, depth, numberAsFloat);
-                preamble += '\n';
-            }
-        }
-    }
-    if (tableKey && (preamble || !tables)) // Create table only if necessary
-        preamble = preamble ? `[${tableKey}]\n${preamble}` : `[${tableKey}]`;
-    return preamble && tables
-        ? `${preamble}\n${tables}`
-        : preamble || tables;
-}
-function stringify(obj, { maxDepth = 1000, numbersAsFloat = false } = {}) {
-    if (extendedTypeOf(obj) !== 'object') {
-        throw new TypeError('stringify can only be called with an object');
-    }
-    let str = stringifyTable(0, obj, '', maxDepth, numbersAsFloat);
-    if (str[str.length - 1] !== '\n')
-        return str + '\n';
-    return str;
-}
-
-;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/index.js
-/*!
- * Copyright (c) Squirrel Chat et al., All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holder nor the names of its contributors
- *    may be used to endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-
-
-
-/* harmony default export */ const dist = ({ parse: parse_parse, stringify: stringify, TomlDate: TomlDate, TomlError: TomlError });
-
-
-;// CONCATENATED MODULE: ./out/ecosystems/python.js
-
-
-
-
-
-/** Normalize PyPI package names per PEP 503: case-insensitive, [-_.] equivalent. */
-function normalizePypiName(name) {
-    return name.replace(/[-_.]+/g, "-").toLowerCase();
-}
-function detectFormat(file) {
-    const base = external_node_path_namespaceObject.basename(file);
-    if (base === "pylock.toml" || base.startsWith("pylock."))
-        return "pylock";
-    return "uv"; // uv.lock and *.py.lock (script lockfiles)
-}
-/** Parse uv.lock (TOML with [[package]] arrays) */
-function parseUvLock(content) {
-    const result = new Map();
-    try {
-        const data = parse_parse(content);
-        if (Array.isArray(data.package)) {
-            for (const pkg of data.package) {
-                if (!pkg.name || !pkg.version)
-                    continue;
-                // Skip local/editable/virtual packages (workspace deps)
-                const src = pkg.source;
-                if (src && (src.editable || src.directory || src.virtual))
-                    continue;
-                result.set(normalizePypiName(pkg.name), pkg.version);
-            }
-        }
-    }
-    catch (e) {
-        lib_core.debug(`Failed to parse uv.lock as TOML: ${e}`);
-    }
-    return result;
-}
-/** Parse pylock.toml (PEP 751 format with [[packages]] arrays) */
-function parsePylockToml(content) {
-    const result = new Map();
-    try {
-        const data = parse_parse(content);
-        if (Array.isArray(data.packages)) {
-            for (const pkg of data.packages) {
-                if (pkg.name && pkg.version) {
-                    result.set(normalizePypiName(pkg.name), pkg.version);
-                }
-            }
-        }
-    }
-    catch (e) {
-        lib_core.debug(`Failed to parse pylock.toml: ${e}`);
-    }
-    return result;
-}
-function parsePythonLock(content, format) {
-    switch (format) {
-        case "uv":
-            return parseUvLock(content);
-        case "pylock":
-            return parsePylockToml(content);
-    }
-}
-/** Compare HEAD and base lockfile to find new/changed packages. */
-function python_findChangedPackages(headContent, baseContent, file) {
-    const format = detectFormat(file);
-    const headPkgs = parsePythonLock(headContent, format);
-    let basePkgs = new Map();
-    if (baseContent) {
-        basePkgs = parsePythonLock(baseContent, format);
-    }
-    const deps = [];
-    for (const [name, version] of headPkgs) {
-        if (basePkgs.get(name) === version)
-            continue;
-        deps.push({ ecosystem: "python", name, version, file });
-    }
-    return deps;
-}
-const python_DEFAULT_LOCKFILES = ["uv.lock", "pylock.toml"];
-/** Check if a file path looks like a Python lockfile we handle. */
-function isPythonLockfile(file) {
-    const base = external_node_path_namespaceObject.basename(file);
-    if (python_DEFAULT_LOCKFILES.includes(base))
-        return true;
-    // uv lock --script creates *.py.lock adjacent to the script
-    if (base.endsWith(".py.lock"))
-        return true;
-    return false;
-}
-async function python_getChangedDeps(baseRef, lockfileInput) {
-    let lockfiles;
-    if (lockfileInput) {
-        const allLockfiles = new Set(await resolveFiles(lockfileInput));
-        const changedFiles = await gitDiffNameOnly(baseRef);
-        lockfiles = changedFiles.filter((f) => allLockfiles.has(f));
-    }
-    else {
-        // Auto-detect: find changed lockfiles (known names + *.py.lock pattern)
-        const changedFiles = await gitDiffNameOnly(baseRef);
-        lockfiles = changedFiles.filter((f) => isPythonLockfile(f));
-    }
-    if (lockfiles.length === 0) {
-        lib_core.info("python: no changed lockfiles");
-        return [];
-    }
-    const allDeps = [];
-    for (const file of lockfiles) {
-        const diff = await gitDiff(baseRef, file);
-        if (!diff)
-            continue;
-        // Read full HEAD and base content for proper parsing
-        let headContent;
-        try {
-            const fs = await Promise.resolve(/* import() */).then(__nccwpck_require__.t.bind(__nccwpck_require__, 1455, 19));
-            headContent = await fs.readFile(file, "utf8");
-        }
-        catch {
-            lib_core.info(`python: could not read ${file}`);
-            continue;
-        }
-        const baseContent = await gitShowFile(baseRef, file);
-        allDeps.push(...python_findChangedPackages(headContent, baseContent, file));
-    }
-    return allDeps;
-}
-async function python_getPublishDate(name, version, registries) {
-    return pypiPublishDate(name, version, registries);
-}
-//# sourceMappingURL=python.js.map
-// EXTERNAL MODULE: external "node:fs/promises"
-var promises_ = __nccwpck_require__(1455);
-// EXTERNAL MODULE: ./node_modules/.pnpm/semver@7.7.4/node_modules/semver/index.js
-var semver = __nccwpck_require__(9419);
-// EXTERNAL MODULE: external "node:url"
-var external_node_url_ = __nccwpck_require__(3136);
-// EXTERNAL MODULE: ./node_modules/.pnpm/web-tree-sitter@0.24.7/node_modules/web-tree-sitter/tree-sitter.js
-var tree_sitter = __nccwpck_require__(5772);
-;// CONCATENATED MODULE: ./out/bazel.js
-
-
-
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore — web-tree-sitter 0.24.x uses `export =` which needs esModuleInterop
-
-const cwd = process.cwd();
-let parserPromise = null;
-async function getParser() {
-    if (!parserPromise) {
-        parserPromise = (async () => {
-            const thisDir = external_node_path_namespaceObject.dirname((0,external_node_url_.fileURLToPath)(import.meta.url));
-            // web-tree-sitter 0.24.x uses __dirname (CJS) but ncc bundles as ESM where
-            // __dirname doesn't exist. Provide it globally for the emscripten init code.
-            if (typeof globalThis.__dirname === "undefined") {
-                globalThis.__dirname = thisDir;
-            }
-            await tree_sitter.init();
-            const parser = new tree_sitter();
-            // In the ncc bundle, the WASM is copied to dist/ alongside index.js.
-            // In dev/test, resolve from node_modules.
-            let starlarkWasm = external_node_path_namespaceObject.resolve(thisDir, "tree-sitter-starlark.wasm");
-            try {
-                await promises_.access(starlarkWasm);
-            }
-            catch {
-                starlarkWasm = external_node_path_namespaceObject.resolve(thisDir, "..", "node_modules", "tree-sitter-starlark", "tree-sitter-starlark.wasm");
-            }
-            const lang = await tree_sitter.Language.load(starlarkWasm);
-            parser.setLanguage(lang);
-            return parser;
-        })();
-    }
-    return parserPromise;
-}
-async function parseStarlark(content) {
-    const parser = await getParser();
-    return parser.parse(content);
-}
-/** Walk tree to find all call expressions matching a function name */
-function findCallsByName(node, name) {
-    const results = [];
-    const walk = (n) => {
-        if (n.type === "call") {
-            const fn = n.childForFieldName("function");
-            if (fn && fn.text === name) {
-                results.push(n);
-            }
-        }
-        for (let i = 0; i < n.childCount; i++) {
-            walk(n.child(i));
-        }
-    };
-    walk(node);
-    return results;
-}
-/** Extract the value of a keyword argument from a call's argument_list */
-function getKeywordArg(callNode, key) {
-    const argList = callNode.childForFieldName("arguments");
-    if (!argList)
-        return null;
-    for (let i = 0; i < argList.childCount; i++) {
-        const child = argList.child(i);
-        if (child.type === "keyword_argument") {
-            const nameNode = child.childForFieldName("name");
-            const valueNode = child.childForFieldName("value");
-            if (nameNode && nameNode.text === key && valueNode) {
-                return valueNode;
-            }
-        }
-    }
-    return null;
-}
-/** Extract a string literal value (strip quotes) */
-function extractString(node) {
-    if (node.type === "string") {
-        return node.text.replace(/^["']|["']$/g, "");
-    }
-    return null;
-}
-/** Extract a list of string literals */
-function extractStringList(node) {
-    if (node.type !== "list")
-        return [];
-    const results = [];
-    for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child.type === "string") {
-            const val = extractString(child);
-            if (val !== null)
-                results.push(val);
-        }
-    }
-    return results;
-}
-/**
- * Resolve all MODULE.bazel files by following include() statements recursively.
- */
-/**
- * Resolve a Bazel label to a filesystem path.
- *   "//pkg:file"  → <workspaceRoot>/pkg/file
- *   "//:file"     → <workspaceRoot>/file
- *   ":file"       → <currentDir>/file
- *   "file"        → <currentDir>/file
- */
-function resolveBazelLabel(label, workspaceRoot, currentDir) {
-    if (label.startsWith("//")) {
-        // "//pkg:file" → "pkg/file", "//:file" → "file"
-        const stripped = label.slice(2);
-        const colonIdx = stripped.indexOf(":");
-        let relativePath;
-        if (colonIdx === -1) {
-            relativePath = stripped;
-        }
-        else if (colonIdx === 0) {
-            relativePath = stripped.slice(1);
-        }
-        else {
-            relativePath = stripped.slice(0, colonIdx) + "/" + stripped.slice(colonIdx + 1);
-        }
-        return external_node_path_namespaceObject.resolve(workspaceRoot, relativePath);
-    }
-    if (label.startsWith(":")) {
-        return external_node_path_namespaceObject.resolve(currentDir, label.slice(1));
-    }
-    return external_node_path_namespaceObject.resolve(currentDir, label);
-}
-async function resolveModuleFiles(rootPath) {
-    const visited = new Set();
-    const result = [];
-    const workspaceRoot = external_node_path_namespaceObject.resolve(external_node_path_namespaceObject.dirname(rootPath));
-    async function visit(filePath) {
-        const abs = external_node_path_namespaceObject.resolve(filePath);
-        if (visited.has(abs))
-            return;
-        visited.add(abs);
-        let content;
-        try {
-            content = await promises_.readFile(abs, "utf8");
-        }
-        catch {
-            return;
-        }
-        // Store as relative path to match git diff output
-        result.push(external_node_path_namespaceObject.relative(cwd, abs));
-        const tree = await parseStarlark(content);
-        const includeCalls = findCallsByName(tree.rootNode, "include");
-        for (const call of includeCalls) {
-            const argList = call.childForFieldName("arguments");
-            if (!argList)
-                continue;
-            for (let i = 0; i < argList.childCount; i++) {
-                const child = argList.child(i);
-                if (child.type === "string") {
-                    const includePath = extractString(child);
-                    if (!includePath)
-                        continue;
-                    const resolved = resolveBazelLabel(includePath, workspaceRoot, external_node_path_namespaceObject.dirname(abs));
-                    await visit(resolved);
-                }
-            }
-        }
-    }
-    await visit(rootPath);
-    return result;
-}
-/**
- * Extract crate.spec() calls from Starlark content.
- */
-async function extractCrateSpecs(content) {
-    const tree = await parseStarlark(content);
-    const calls = findCallsByName(tree.rootNode, "crate.spec");
-    const specs = [];
-    for (const call of calls) {
-        const pkgNode = getKeywordArg(call, "package");
-        const verNode = getKeywordArg(call, "version");
-        const gitNode = getKeywordArg(call, "git");
-        const pkg = pkgNode ? extractString(pkgNode) : null;
-        const ver = verNode ? extractString(verNode) : null;
-        if (pkg && ver) {
-            specs.push({
-                package: pkg,
-                version: ver,
-                isGit: gitNode !== null,
-            });
-        }
-    }
-    return specs;
-}
-/**
- * Extract maven.install() calls from Starlark content.
- */
-/**
- * Extract all override directives from MODULE.bazel content.
- * Handles: git_override, archive_override, local_path_override,
- * single_version_override, multiple_version_override
- */
-async function extractOverrides(content) {
-    const tree = await parseStarlark(content);
-    const overrides = new Map();
-    const OVERRIDE_TYPE_MAP = {
-        git_override: "git",
-        archive_override: "archive",
-        local_path_override: "local_path",
-        single_version_override: "single_version",
-        multiple_version_override: "multiple_version",
-    };
-    for (const fnName of Object.keys(OVERRIDE_TYPE_MAP)) {
-        const calls = findCallsByName(tree.rootNode, fnName);
-        for (const call of calls) {
-            const nameNode = getKeywordArg(call, "module_name");
-            const moduleName = nameNode ? extractString(nameNode) : null;
-            if (!moduleName)
-                continue;
-            const type = OVERRIDE_TYPE_MAP[fnName];
-            const override = { type, moduleName };
-            switch (fnName) {
-                case "git_override": {
-                    const remoteNode = getKeywordArg(call, "remote");
-                    const commitNode = getKeywordArg(call, "commit");
-                    const tagNode = getKeywordArg(call, "tag");
-                    const branchNode = getKeywordArg(call, "branch");
-                    override.remote = remoteNode ? extractString(remoteNode) ?? undefined : undefined;
-                    override.commit = commitNode ? extractString(commitNode) ?? undefined : undefined;
-                    override.tag = tagNode ? extractString(tagNode) ?? undefined : undefined;
-                    override.branch = branchNode ? extractString(branchNode) ?? undefined : undefined;
-                    break;
-                }
-                case "archive_override": {
-                    const urlsNode = getKeywordArg(call, "urls");
-                    override.urls = urlsNode ? extractStringList(urlsNode) : [];
-                    // Also handle single url= kwarg
-                    if (override.urls.length === 0) {
-                        const urlNode = getKeywordArg(call, "url");
-                        const url = urlNode ? extractString(urlNode) : null;
-                        if (url)
-                            override.urls = [url];
-                    }
-                    break;
-                }
-                case "single_version_override": {
-                    const verNode = getKeywordArg(call, "version");
-                    const regNode = getKeywordArg(call, "registry");
-                    override.version = verNode ? extractString(verNode) ?? undefined : undefined;
-                    override.registry = regNode ? extractString(regNode) ?? undefined : undefined;
-                    break;
-                }
-                case "multiple_version_override": {
-                    const versNode = getKeywordArg(call, "versions");
-                    const regNode = getKeywordArg(call, "registry");
-                    override.versions = versNode ? extractStringList(versNode) : [];
-                    override.registry = regNode ? extractString(regNode) ?? undefined : undefined;
-                    break;
-                }
-                // local_path_override — no extra fields needed, just the module name
-            }
-            overrides.set(moduleName, override);
-        }
-    }
-    return overrides;
-}
-async function extractMavenInstalls(content, workspaceRoot) {
-    const tree = await parseStarlark(content);
-    const calls = findCallsByName(tree.rootNode, "maven.install");
-    const installs = [];
-    const wsRoot = workspaceRoot ?? cwd;
-    for (const call of calls) {
-        const nameNode = getKeywordArg(call, "name");
-        const lockNode = getKeywordArg(call, "lock_file");
-        const repoNode = getKeywordArg(call, "repositories");
-        const artNode = getKeywordArg(call, "artifacts");
-        const name = nameNode ? extractString(nameNode) : null;
-        const lockFile = lockNode ? extractString(lockNode) : null;
-        if (!lockFile)
-            continue;
-        const resolvedLockFile = external_node_path_namespaceObject.relative(cwd, resolveBazelLabel(lockFile, wsRoot, wsRoot));
-        installs.push({
-            name,
-            lockFile: resolvedLockFile,
-            repositories: repoNode ? extractStringList(repoNode) : [],
-            artifacts: artNode ? extractStringList(artNode) : [],
-        });
-    }
-    return installs;
-}
-/**
- * Extract multitool.hub() calls from Starlark content and return lockfile paths.
- */
-async function extractMultitoolHubs(content, workspaceRoot) {
-    const tree = await parseStarlark(content);
-    const calls = findCallsByName(tree.rootNode, "multitool.hub");
-    const lockfiles = [];
-    const wsRoot = workspaceRoot ?? cwd;
-    for (const call of calls) {
-        const lockNode = getKeywordArg(call, "lockfile");
-        const lockfile = lockNode ? extractString(lockNode) : null;
-        if (!lockfile)
-            continue;
-        const resolved = external_node_path_namespaceObject.relative(cwd, resolveBazelLabel(lockfile, wsRoot, wsRoot));
-        lockfiles.push(resolved);
-    }
-    return lockfiles;
-}
-//# sourceMappingURL=bazel.js.map
-;// CONCATENATED MODULE: ./out/ecosystems/rust.js
-
-
-
-
-
-
-function specKey(s) {
-    return `${s.package}@${s.version}`;
-}
-/**
- * Build a map of crate name → resolved exact versions from MODULE.bazel.lock.
- * Reads the crate_universe extension's generatedRepoSpecs and extracts the
- * version from each crate's static.crates.io download URL.
- */
-function parseCrateLockVersions(content) {
-    const result = new Map();
-    try {
-        const data = JSON.parse(content);
-        const moduleExtensions = data?.moduleExtensions;
-        if (!moduleExtensions || typeof moduleExtensions !== "object")
-            return result;
-        // Match the crate_universe extension key regardless of the +/~ canonical separator
-        // or the exact rules_rust module name (robust to forks and Bazel version changes).
-        const extKey = Object.keys(moduleExtensions).find((k) => /crate_universe[^%]*%crate$/.test(k));
-        if (!extKey)
-            return result;
-        const ext = moduleExtensions[extKey];
-        // Collect all eval results — crate_universe always uses "general" but handle
-        // future platform-split locks by iterating all sub-keys.
-        const evalResults = ext?.general
-            ? [ext.general]
-            : Object.values(ext ?? {});
-        for (const evalResult of evalResults) {
-            const repoSpecs = evalResult?.generatedRepoSpecs;
-            if (!repoSpecs || typeof repoSpecs !== "object")
-                continue;
-            for (const spec of Object.values(repoSpecs)) {
-                const urls = spec?.attributes;
-                const urlList = urls?.urls;
-                if (!Array.isArray(urlList) || urlList.length === 0)
-                    continue;
-                const url = urlList[0];
-                if (typeof url !== "string")
-                    continue;
-                // URL: https://static.crates.io/crates/<name>/<version>/download
-                // Using the URL (not the repo key) avoids the hyphen-in-name ambiguity.
-                const m = url.match(/\/crates\/([^/]+)\/([^/]+)\/download/);
-                if (!m)
-                    continue;
-                const [, name, version] = m;
-                const arr = result.get(name) ?? [];
-                arr.push(version);
-                result.set(name, arr);
-            }
-        }
-    }
-    catch (e) {
-        lib_core.debug(`rust: failed to parse MODULE.bazel.lock for crate versions: ${e}`);
-    }
-    return result;
-}
-/**
- * Convert a Cargo version requirement to a form npm's semver package understands.
- * Key differences handled:
- * - Cargo uses ',' as an AND separator; npm semver uses a space.
- * - A bare version ("1.2.3" with no operator) means caret (^) in Cargo but exact in npm semver.
- */
-function cargoReqToNpmRange(req) {
-    // Replace Cargo AND separator
-    let r = req.replace(/,/g, " ").trim();
-    // Bare single-term numeric req (no operator, no wildcard) → treat as caret (Cargo semantics)
-    if (/^\d[^\s]*$/.test(r) && !r.includes("*") && !r.includes("x")) {
-        r = "^" + r;
-    }
-    return r;
-}
-/**
- * Resolve a crate.spec range to the concrete version pinned in MODULE.bazel.lock.
- * Falls back to the raw range on any resolution failure so that the version is
- * never incorrectly changed (worst-case: registry lookup returns null → "unknown",
- * same as before this fix).
- */
-function resolveCrateVersion(name, range, lockVersions) {
-    const versions = lockVersions.get(name);
-    if (!versions || versions.length === 0)
-        return range;
-    const npmRange = cargoReqToNpmRange(range);
-    const best = semver.maxSatisfying(versions, npmRange, { loose: true });
-    return best ?? range;
-}
-async function rust_getChangedDeps(baseRef, moduleBazelPath) {
-    const moduleFiles = await resolveModuleFiles(moduleBazelPath);
-    if (moduleFiles.length === 0) {
-        lib_core.info("rust: no MODULE.bazel files found");
-        return [];
-    }
-    const changedFiles = new Set(await gitDiffNameOnly(baseRef));
-    const relevantFiles = moduleFiles.filter((f) => changedFiles.has(f));
-    if (relevantFiles.length === 0) {
-        lib_core.info("rust: no MODULE.bazel files changed");
-        return [];
-    }
-    // Resolve crate.spec ranges to concrete versions using MODULE.bazel.lock at the workspace root.
-    const lockPath = moduleBazelPath + ".lock";
-    let lockVersions = new Map();
-    try {
-        const lockContent = await promises_.readFile(lockPath, "utf8");
-        lockVersions = parseCrateLockVersions(lockContent);
-    }
-    catch {
-        lib_core.debug(`rust: could not read MODULE.bazel.lock at ${lockPath}; version ranges will not be resolved`);
-    }
-    // Parse the base lockfile to skip crates whose resolved version was already on the base branch.
-    // This prevents false positives when a no-op range edit (e.g. ^0.13.5 → ~0.13.5) resolves to
-    // the same concrete version as before — the version was already vetted and shouldn't be re-checked.
-    const baseLockVersions = parseCrateLockVersions((await gitShowFile(baseRef, lockPath)) ?? "");
-    const allDeps = [];
-    for (const file of relevantFiles) {
-        // Parse HEAD version
-        let headContent;
-        try {
-            headContent = await promises_.readFile(file, "utf8");
-        }
-        catch {
-            continue;
-        }
-        const headSpecs = await extractCrateSpecs(headContent);
-        // Parse base version
-        const baseContent = await gitShowFile(baseRef, file);
-        const baseSpecs = baseContent ? await extractCrateSpecs(baseContent) : [];
-        const baseKeys = new Set(baseSpecs.map(specKey));
-        // Find new or changed crate specs
-        for (const spec of headSpecs) {
-            if (spec.isGit)
-                continue;
-            if (baseKeys.has(specKey(spec)))
-                continue;
-            const resolved = resolveCrateVersion(spec.package, spec.version, lockVersions);
-            // Skip if this exact concrete version was already present in the base lockfile —
-            // the PR didn't introduce it, so re-checking its age would be a false positive.
-            if (baseLockVersions.get(spec.package)?.includes(resolved))
-                continue;
-            allDeps.push({
-                ecosystem: "rust",
-                name: spec.package,
-                version: resolved,
-                file,
-            });
-        }
-    }
-    return allDeps;
-}
-async function rust_getPublishDate(name, version, registries) {
-    return cratesPublishDate(name, version, registries);
-}
-//# sourceMappingURL=rust.js.map
-;// CONCATENATED MODULE: ./out/ecosystems/java.js
-
-
-
-
-
-
-function parseArtifacts(json) {
-    try {
-        const data = JSON.parse(json);
-        const result = {};
-        if (data.artifacts) {
-            for (const [key, value] of Object.entries(data.artifacts)) {
-                const v = value?.version;
-                if (v)
-                    result[key] = v;
-            }
-        }
-        return result;
-    }
-    catch {
-        return {};
-    }
-}
-async function java_getChangedDeps(baseRef, moduleBazelPath) {
-    const moduleFiles = await resolveModuleFiles(moduleBazelPath);
-    const workspaceRoot = external_node_path_namespaceObject.resolve(external_node_path_namespaceObject.dirname(moduleBazelPath));
-    const allInstalls = [];
-    for (const file of moduleFiles) {
-        let content;
-        try {
-            content = await promises_.readFile(file, "utf8");
-        }
-        catch {
-            continue;
-        }
-        allInstalls.push(...(await extractMavenInstalls(content, workspaceRoot)));
-    }
-    if (allInstalls.length === 0) {
-        lib_core.info("java: no maven.install() blocks found");
-        return { deps: [], repositories: new Map() };
-    }
-    const allDeps = [];
-    // Map from "group:artifact" to repositories list for registry queries
-    const repoMap = new Map();
-    for (const install of allInstalls) {
-        const lockFile = install.lockFile;
-        let headJson;
-        try {
-            headJson = await promises_.readFile(lockFile, "utf8");
-        }
-        catch {
-            lib_core.info(`java: lock file ${lockFile} not found, skipping`);
-            continue;
-        }
-        const headArtifacts = parseArtifacts(headJson);
-        const baseJson = await gitShowFile(baseRef, lockFile);
-        const baseArtifacts = baseJson ? parseArtifacts(baseJson) : {};
-        for (const [key, version] of Object.entries(headArtifacts)) {
-            if (baseArtifacts[key] === version)
-                continue;
-            allDeps.push({
-                ecosystem: "java",
-                name: key,
-                version,
-                file: lockFile,
-            });
-            repoMap.set(key, install.repositories);
-        }
-    }
-    return { deps: allDeps, repositories: repoMap };
-}
-async function java_getPublishDate(name, version, repositories, registries) {
-    const parts = name.split(":");
-    if (parts.length !== 2)
-        return null;
-    return mavenPublishDate(parts[0], parts[1], version, repositories, registries);
-}
-//# sourceMappingURL=java.js.map
-;// CONCATENATED MODULE: ./out/ecosystems/bazel-module.js
-
-
-
-
-function parseModuleLock(content) {
-    const result = new Map();
-    try {
-        const data = JSON.parse(content);
-        // v3 format: moduleDepGraph with name/version entries
-        const graph = data.moduleDepGraph;
-        if (graph && typeof graph === "object") {
-            for (const [key, value] of Object.entries(graph)) {
-                if (key === "" || key === "<root>")
-                    continue;
-                const entry = value;
-                if (entry.name && entry.version) {
-                    result.set(entry.name, entry.version);
-                }
-            }
-            return result;
-        }
-        // v24+ format: modules with source.json in registryFileHashes
-        // are the resolved/selected modules
-        const rfh = data.registryFileHashes;
-        if (rfh && typeof rfh === "object") {
-            for (const url of Object.keys(rfh)) {
-                const match = url.match(/\/modules\/([^/]+)\/([^/]+)\/source\.json$/);
-                if (match) {
-                    result.set(match[1], match[2]);
-                }
-                else if (url.endsWith("source.json")) {
-                    lib_core.debug(`bazel: unexpected source.json URL format, skipping: ${url}`);
-                }
-            }
-        }
-    }
-    catch (e) {
-        lib_core.debug(`Failed to parse MODULE.bazel.lock: ${e}`);
-    }
-    return result;
-}
-async function bazel_module_getChangedDeps(baseRef, moduleBazelPath) {
-    const lockfilePath = moduleBazelPath + ".lock";
-    // Check if lockfile changed
-    const diff = await gitDiff(baseRef, lockfilePath);
-    if (!diff) {
-        lib_core.info("bazel: MODULE.bazel.lock not changed");
-        return { deps: [], overrides: new Map() };
-    }
-    // Parse HEAD lockfile
-    let headContent;
-    try {
-        headContent = await promises_.readFile(lockfilePath, "utf8");
-    }
-    catch {
-        lib_core.info(`bazel: could not read ${lockfilePath}`);
-        return { deps: [], overrides: new Map() };
-    }
-    const headModules = parseModuleLock(headContent);
-    const baseContent = await gitShowFile(baseRef, lockfilePath);
-    const baseModules = baseContent ? parseModuleLock(baseContent) : new Map();
-    // Collect overrides from all MODULE.bazel files
-    const allOverrides = new Map();
-    const moduleFiles = await resolveModuleFiles(moduleBazelPath);
-    for (const file of moduleFiles) {
-        let content;
-        try {
-            content = await promises_.readFile(file, "utf8");
-        }
-        catch {
-            continue;
-        }
-        const fileOverrides = await extractOverrides(content);
-        for (const [name, override] of fileOverrides) {
-            allOverrides.set(name, override);
-        }
-    }
-    // Find changed modules
-    const deps = [];
-    for (const [name, version] of headModules) {
-        if (baseModules.get(name) === version)
-            continue;
-        // Skip local_path_override modules
-        const override = allOverrides.get(name);
-        if (override?.type === "local_path") {
-            lib_core.info(`bazel: skipping ${name} (local_path_override)`);
-            continue;
-        }
-        deps.push({
-            ecosystem: "bazel",
-            name,
-            version,
-            file: lockfilePath,
-        });
-    }
-    return { deps, overrides: allOverrides };
-}
-//# sourceMappingURL=bazel-module.js.map
-;// CONCATENATED MODULE: ./out/ecosystems/actions.js
-
-
-
-const SHA_RE = /^[0-9a-f]{40}$/;
-const branchSkipLogged = new Set();
-// Cache ref → resolved commit SHA (null = resolution failed / branch). Shared across files in a run.
-const refShaCache = new Map();
-// Exported for test isolation only — clears module-level caches between test cases.
-function __resetCaches() {
-    refShaCache.clear();
-    branchSkipLogged.clear();
-}
-function isCommitSha(ref) {
-    return SHA_RE.test(ref);
-}
-/**
- * Resolve a ref (SHA, tag, or branch) to its underlying commit SHA via the GitHub API.
- * Returns the SHA, or null if resolution fails (unauthenticated, private repo, branch, error).
- * Caches results to avoid redundant API calls within a run.
- */
-async function resolveRefToSha(owner, repo, ref, headers) {
-    const cacheKey = `${owner}/${repo}@${ref}`;
-    const cached = refShaCache.get(cacheKey);
-    if (cached !== undefined)
-        return cached;
-    if (isCommitSha(ref)) {
-        refShaCache.set(cacheKey, ref);
-        return ref;
-    }
-    try {
-        const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${ref}`, { headers });
-        if (!resp.ok) {
-            refShaCache.set(cacheKey, null);
-            return null;
-        }
-        const data = (await resp.json());
-        const sha = typeof data?.sha === "string" ? data.sha : null;
-        refShaCache.set(cacheKey, sha);
-        return sha;
-    }
-    catch {
-        refShaCache.set(cacheKey, null);
-        return null;
-    }
-}
-/**
- * Parse `uses:` directives from a workflow or composite action YAML file.
- * Returns a map of "owner/repo@ref" (or "owner/repo/path@ref") → ActionRef.
- */
-function parseActionRefs(content) {
-    const refs = new Map();
-    // Filter out YAML comment lines (lines starting with #) before regex matching.
-    // This is safe because `uses:` directives never start with # in valid YAML.
-    const filtered = content.split('\n').filter(l => !l.trimStart().startsWith('#')).join('\n');
-    // Match: uses: owner/repo@ref or uses: owner/repo/path@ref
-    // Skip: uses: ./local, uses: docker://..., uses: ./.github/...
-    const re = /\buses:\s*['"]?([^'"#\s]+)['"]?/g;
-    let match;
-    while ((match = re.exec(filtered)) !== null) {
-        const raw = match[1];
-        // Skip local and docker actions
-        if (raw.startsWith("./") || raw.startsWith("docker://"))
-            continue;
-        const atIdx = raw.lastIndexOf("@");
-        if (atIdx === -1)
-            continue;
-        const fullName = raw.slice(0, atIdx);
-        const ref = raw.slice(atIdx + 1);
-        // Parse owner/repo or owner/repo/path
-        const parts = fullName.split("/");
-        if (parts.length < 2)
-            continue;
-        const owner = parts[0];
-        const repo = parts[1];
-        const subpath = parts.slice(2).join("/");
-        refs.set(raw, { owner, repo, path: subpath, ref, raw });
-    }
-    return refs;
-}
-const DEFAULT_WORKFLOW_GLOBS = [
-    ".github/workflows/*.yml",
-    ".github/workflows/*.yaml",
-    ".github/actions/*/action.yml",
-    ".github/actions/*/action.yaml",
-    "action.yml",
-    "action.yaml",
-];
-async function actions_getChangedDeps(baseRef, workflowFilesInput, token = "") {
-    let files;
-    if (workflowFilesInput) {
-        const allFiles = new Set(await resolveFiles(workflowFilesInput));
-        const changedFiles = await gitDiffNameOnly(baseRef);
-        files = changedFiles.filter((f) => allFiles.has(f));
-    }
-    else {
-        // Auto-detect: find which default workflow files were changed
-        const changedFiles = new Set(await gitDiffNameOnly(baseRef));
-        files = [];
-        for (const pattern of DEFAULT_WORKFLOW_GLOBS) {
-            try {
-                const resolved = await resolveFiles(pattern);
-                for (const f of resolved) {
-                    if (changedFiles.has(f))
-                        files.push(f);
-                }
-            }
-            catch {
-                // pattern didn't match anything
-            }
-        }
-    }
-    if (files.length === 0) {
-        lib_core.info("actions: no changed workflow files");
-        return [];
-    }
-    const headers = {
-        Accept: "application/vnd.github+json",
-        "User-Agent": "lisan-al-gaib-action",
-        "X-GitHub-Api-Version": "2022-11-28",
-    };
-    if (token) {
-        headers.Authorization = `Bearer ${token}`;
-    }
-    const allDeps = [];
-    for (const file of files) {
-        const diff = await gitDiff(baseRef, file);
-        if (!diff)
-            continue;
-        let headContent;
-        try {
-            headContent = await promises_.readFile(file, "utf8");
-        }
-        catch {
-            lib_core.info(`actions: could not read ${file}`);
-            continue;
-        }
-        const baseContent = await gitShowFile(baseRef, file);
-        const headRefs = parseActionRefs(headContent);
-        const baseRefs = baseContent ? parseActionRefs(baseContent) : new Map();
-        // Group base refs by action name so we can compare commit SHAs when the ref string changes.
-        const baseByName = new Map();
-        for (const bRef of baseRefs.values()) {
-            const n = `${bRef.owner}/${bRef.repo}${bRef.path ? "/" + bRef.path : ""}`;
-            const arr = baseByName.get(n) ?? [];
-            arr.push(bRef);
-            baseByName.set(n, arr);
-        }
-        for (const [key, ref] of headRefs) {
-            // Skip if the exact ref string is unchanged from base
-            if (baseRefs.has(key))
-                continue;
-            const name = `${ref.owner}/${ref.repo}${ref.path ? "/" + ref.path : ""}`;
-            const sameNameBase = baseByName.get(name);
-            if (sameNameBase) {
-                // Base had this action with a different ref string — resolve both sides to commit SHAs.
-                // If the underlying commit is unchanged, the PR didn't actually change the action's code,
-                // so skip it. If resolution fails for either side, flag conservatively (never skip on doubt).
-                const headSha = await resolveRefToSha(ref.owner, ref.repo, ref.ref, headers);
-                if (headSha !== null) {
-                    let sameCommit = false;
-                    for (const bRef of sameNameBase) {
-                        const baseSha = await resolveRefToSha(bRef.owner, bRef.repo, bRef.ref, headers);
-                        if (baseSha === headSha) {
-                            sameCommit = true;
-                            break;
-                        }
-                    }
-                    if (sameCommit)
-                        continue;
-                }
-            }
-            allDeps.push({
-                ecosystem: "actions",
-                name,
-                version: ref.ref,
-                file,
-            });
-        }
-    }
-    return allDeps;
-}
-/**
- * Query GitHub API to get the date associated with an action ref.
- * - Commit SHA: get commit date
- * - Tag: get tag/release date
- * - Branch: return null (skip)
- */
-async function actions_getPublishDate(name, ref, token) {
-    // Extract owner/repo from name (strip subpath if present)
-    const parts = name.split("/");
-    if (parts.length < 2)
-        return null;
-    const owner = parts[0];
-    const repo = parts[1];
-    const headers = {
-        Accept: "application/vnd.github+json",
-        "User-Agent": "lisan-al-gaib-action",
-        "X-GitHub-Api-Version": "2022-11-28",
-    };
-    if (token) {
-        headers.Authorization = `Bearer ${token}`;
-    }
-    if (isCommitSha(ref)) {
-        return getCommitDate(owner, repo, ref, headers);
-    }
-    // Try as a tag first
-    const tagDate = await getTagDate(owner, repo, ref, headers);
-    if (tagDate !== null)
-        return tagDate;
-    // Not a tag → assume branch → skip (dedup log)
-    const key = `${name}@${ref}`;
-    if (!branchSkipLogged.has(key)) {
-        branchSkipLogged.add(key);
-        lib_core.info(`actions: ${key} appears to be a branch, skipping`);
-    }
-    return null;
-}
-async function getCommitDate(owner, repo, sha, headers) {
-    try {
-        const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${sha}`, { headers });
-        if (!resp.ok)
-            return null;
-        const data = (await resp.json());
-        const date = data?.commit?.committer?.date;
-        return date ? new Date(date) : null;
-    }
-    catch {
-        return null;
-    }
-}
-async function getTagDate(owner, repo, tag, headers) {
-    try {
-        // First check if this ref is a tag
-        const refResp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/ref/tags/${tag}`, { headers });
-        if (!refResp.ok)
-            return null;
-        const refData = (await refResp.json());
-        if (!refData.object)
-            return null;
-        // If it's an annotated tag, fetch the tag object for the tagger date
-        if (refData.object.type === "tag" && refData.object.url) {
-            const tagResp = await fetch(refData.object.url, { headers });
-            if (tagResp.ok) {
-                const tagData = (await tagResp.json());
-                if (tagData?.tagger?.date) {
-                    return new Date(tagData.tagger.date);
-                }
-            }
-        }
-        // Lightweight tag or fallback — get the commit date
-        if (refData.object.sha) {
-            return getCommitDate(owner, repo, refData.object.sha, headers);
-        }
-        return null;
-    }
-    catch {
-        return null;
-    }
-}
-//# sourceMappingURL=actions.js.map
-// EXTERNAL MODULE: ./node_modules/.pnpm/dockerfile-ast@0.7.1/node_modules/dockerfile-ast/lib/main.js
-var main = __nccwpck_require__(4908);
-;// CONCATENATED MODULE: ./out/ecosystems/image.js
-
-
-const mutableSkipLogged = new Set();
-/**
- * OCI distribution reference grammar for repository paths (registry stripped).
- * path-component = [a-z0-9]+ (separator [a-z0-9]+)*
- * separator       = [._] | __ | -+
- * repository      = path-component ('/' path-component)*
- *
- * This rejects placeholder tokens like __DIND_IMAGE__, {{image}}, %VAR%,
- * uppercase names, and any other string that is not a legal image name.
- */
-const REPOSITORY_RE = /^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*)*$/;
-/**
- * Parse an OCI/Docker image reference string into its components.
- *
- * Grammar: [registry[:port]/]repository[:tag][@digest]
- * Registry detection: first path segment is a host if it contains '.' or a
- * numeric port suffix (':' + all-digits) or equals 'localhost'. Otherwise the
- * image is on Docker Hub. Single-segment Docker Hub repos are normalized to
- * library/<name> so API lookups work (e.g. "postgres" → "library/postgres").
- * Returns null for references whose repository path is not a legal OCI name
- * (e.g. placeholder tokens like __DIND_IMAGE__, uppercase refs, etc.).
- */
-function parseImageRef(raw) {
-    const trimmed = raw.trim();
-    if (!trimmed)
-        return null;
-    // Split off digest (everything after the last '@').
-    // Only treat as a digest if it has the algorithm:hex form (e.g. sha256:...).
-    // Bare @tag typos like "nginx@latest" don't contain ':' and are left as-is
-    // (digest remains null, treated as mutable tag-only → unknown).
-    const atIdx = trimmed.lastIndexOf("@");
-    let digest = null;
-    let refPart;
-    if (atIdx !== -1) {
-        const candidate = trimmed.slice(atIdx + 1);
-        if (candidate.includes(":")) {
-            digest = candidate;
-            refPart = trimmed.slice(0, atIdx);
-        }
-        else {
-            refPart = trimmed;
-        }
-    }
-    else {
-        refPart = trimmed;
-    }
-    // Determine registry host vs repository+tag
-    let registry;
-    let repoAndTag;
-    const slashIdx = refPart.indexOf("/");
-    if (slashIdx !== -1) {
-        const firstSegment = refPart.slice(0, slashIdx);
-        // A segment is a registry host if it has '.', a numeric ':port', or is 'localhost'
-        const isRegistryHost = firstSegment.includes(".") ||
-            /:\d+$/.test(firstSegment) ||
-            firstSegment === "localhost";
-        if (isRegistryHost) {
-            registry = firstSegment;
-            repoAndTag = refPart.slice(slashIdx + 1);
-        }
-        else {
-            registry = "docker.io";
-            repoAndTag = refPart;
-        }
-    }
-    else {
-        // No slash — entire refPart is 'name' or 'name:tag' on Docker Hub
-        registry = "docker.io";
-        repoAndTag = refPart;
-    }
-    // Split tag off repoAndTag: last ':' in the final path segment (never in an
-    // intermediate segment since repo path segments cannot contain ':')
-    let repository;
-    let tag = null;
-    const lastSlash = repoAndTag.lastIndexOf("/");
-    const lastSegment = lastSlash !== -1 ? repoAndTag.slice(lastSlash + 1) : repoAndTag;
-    const colonIdx = lastSegment.lastIndexOf(":");
-    if (colonIdx !== -1) {
-        const tagCandidate = lastSegment.slice(colonIdx + 1);
-        if (tagCandidate) {
-            tag = tagCandidate;
-            repository =
-                lastSlash !== -1
-                    ? repoAndTag.slice(0, lastSlash + 1) +
-                        lastSegment.slice(0, colonIdx)
-                    : lastSegment.slice(0, colonIdx);
-        }
-        else {
-            repository = repoAndTag;
-        }
-    }
-    else {
-        repository = repoAndTag;
-    }
-    // Docker Hub single-segment repos need the 'library/' prefix for API calls
-    // e.g. "postgres" → "library/postgres", "coredns/coredns" stays as-is
-    if (registry === "docker.io" && !repository.includes("/")) {
-        repository = `library/${repository}`;
-    }
-    if (!REPOSITORY_RE.test(repository))
-        return null;
-    return { raw, registry, repository, tag, digest };
-}
-function makeName(ref) {
-    return `${ref.registry}/${ref.repository}`;
-}
-function makeVersion(ref) {
-    if (ref.digest && ref.tag)
-        return `${ref.tag}@${ref.digest}`;
-    if (ref.digest)
-        return ref.digest;
-    if (ref.tag)
-        return ref.tag;
-    return "latest";
-}
-/**
- * Resolved identity for base-vs-HEAD comparison: the concrete content a ref
- * pins to, independent of cosmetic differences in the raw string.
- * Digest-pinned images compare by `name@digest`, so a relabeled tag pointing at
- * an already-vetted digest (or a registry-spelling change) is not re-flagged.
- * Tag-only images compare by `name:tag` (the digest is unknown/mutable).
- */
-function imageIdentity(ref) {
-    return ref.digest
-        ? `${makeName(ref)}@${ref.digest}`
-        : `${makeName(ref)}:${ref.tag ?? "latest"}`;
-}
-/**
- * Get the publish date for an image reference.
- * Only digest-pinned (@sha256:...) refs are queried — tag-only refs are
- * mutable and cannot be reliably age-gated, so they return null (unknown).
- *
- * @param ref   Parsed image ref (may be undefined for lookup-miss cases).
- * @param label Ecosystem label used in log messages (e.g. "kubernetes", "docker").
- */
-async function getImagePublishDate(ref, label) {
-    if (!ref?.digest) {
-        const key = ref
-            ? `${makeName(ref)}:${ref.tag ?? "latest"}`
-            : "unknown";
-        const dedupKey = `${label}:${key}`;
-        if (!mutableSkipLogged.has(dedupKey)) {
-            mutableSkipLogged.add(dedupKey);
-            lib_core.info(`${label}: ${key} has no digest (mutable tag), skipping age check`);
-        }
-        return null;
-    }
-    return fetchImagePublishDate(ref.registry, ref.repository, ref.digest, ref.tag);
-}
-//# sourceMappingURL=image.js.map
-;// CONCATENATED MODULE: ./out/ecosystems/docker.js
-
-
-
-
-
-
-/**
- * Parse a Dockerfile (or Containerfile) content and return all external image
- * references found in FROM, COPY --from=, and RUN --mount=...,from= directives.
- *
- * This is a pure, synchronous, network-free function.
- */
-function parseDockerfileImages(content) {
-    const dockerfile = main.DockerfileParser.parse(content);
-    const instructions = dockerfile.getInstructions();
-    // Two-pass: first collect all build-stage aliases (lowercased) so that
-    // --from references to earlier/later stage names can be filtered out.
-    // Forward-reference handling: a COPY --from=alias that appears before
-    // FROM ... AS alias is an error in Docker but we still collect all aliases
-    // upfront to avoid false positives.
-    const stageAliases = new Set();
-    for (const instruction of instructions) {
-        if (instruction instanceof main.From) {
-            const buildStage = instruction.getBuildStage();
-            if (buildStage != null) {
-                stageAliases.add(buildStage.toLowerCase());
-            }
-        }
-    }
-    // Deduplicate candidates by raw string (first occurrence wins)
-    const seen = new Map();
-    function emit(raw, source) {
-        if (seen.has(raw))
-            return;
-        const ref = parseImageRef(raw);
-        if (ref == null)
-            return;
-        seen.set(raw, { raw, ref, source });
-    }
-    // Helper to process a --from flag value (shared between COPY and RUN --mount)
-    function processFromValue(value, source) {
-        if (value == null || value === "")
-            return;
-        if (value.includes("$"))
-            return; // unresolved ARG/ENV variable
-        if (stageAliases.has(value.toLowerCase()))
-            return; // build-stage alias
-        // Numeric stage index (e.g. "0", "1", "2") — not an image ref
-        if (parseInt(value, 10).toString() === value)
-            return;
-        emit(value, source);
-    }
-    // Second pass: process instructions and emit candidates
-    for (const instruction of instructions) {
-        if (instruction instanceof main.From) {
-            const image = instruction.getImage();
-            if (image == null)
-                continue;
-            if (image.trim().toLowerCase() === "scratch")
-                continue;
-            if (image.includes("$"))
-                continue; // unresolved ARG/ENV variable
-            if (stageAliases.has(image.trim().toLowerCase()))
-                continue; // stage alias ref
-            emit(image, "from");
-            continue;
-        }
-        if (instruction instanceof main.Copy) {
-            // Use getFlags().find() rather than getFromFlag() to handle cases like
-            // COPY --chown=user --from=image (multiple flags on same instruction).
-            const fromFlag = instruction
-                .getFlags()
-                .find((f) => f.getName() === "from");
-            if (fromFlag == null)
-                continue;
-            processFromValue(fromFlag.getValue(), "copy-from");
-            continue;
-        }
-        if (instruction instanceof main.Run) {
-            const mountFlags = instruction
-                .getFlags()
-                .filter((f) => f.getName() === "mount");
-            for (const mountFlag of mountFlags) {
-                // Only process bind and cache mounts — skip secret, ssh, tmpfs, etc.
-                const mountType = mountFlag.getOption("type")?.getValue() ?? null;
-                if (mountType != null && mountType !== "bind" && mountType !== "cache") {
-                    continue;
-                }
-                const fromValue = mountFlag.getOption("from")?.getValue();
-                processFromValue(fromValue, "mount-from");
-            }
-        }
-    }
-    return Array.from(seen.values());
-}
-function isDockerfileName(filePath) {
-    const basename = filePath.includes("/")
-        ? filePath.slice(filePath.lastIndexOf("/") + 1)
-        : filePath;
-    const lower = basename.toLowerCase();
-    return lower === "dockerfile" || lower === "containerfile";
-}
-async function docker_getChangedDeps(baseRef, dockerfilesInput, dockerhubMirror) {
-    let files;
-    if (dockerfilesInput) {
-        const allFiles = new Set(await resolveFiles(dockerfilesInput));
-        const changedFiles = await gitDiffNameOnly(baseRef);
-        files = changedFiles.filter((f) => allFiles.has(f));
-    }
-    else {
-        // Auto-detect: any changed file whose basename looks like a Dockerfile
-        const changedFiles = await gitDiffNameOnly(baseRef);
-        files = changedFiles.filter(isDockerfileName);
-    }
-    if (files.length === 0) {
-        lib_core.info("docker: no changed Dockerfile/Containerfile files");
-        return { deps: [], imageRefs: new Map() };
-    }
-    const allDeps = [];
-    const imageRefs = new Map();
-    for (const file of files) {
-        const diff = await gitDiff(baseRef, file);
-        if (!diff)
-            continue;
-        let headContent;
-        try {
-            headContent = await promises_.readFile(file, "utf8");
-        }
-        catch {
-            lib_core.info(`docker: could not read ${file}`);
-            continue;
-        }
-        const headCandidates = parseDockerfileImages(headContent);
-        if (headCandidates.length === 0)
-            continue; // not a Dockerfile with FROM
-        const baseContent = await gitShowFile(baseRef, file);
-        const baseCandidates = baseContent
-            ? parseDockerfileImages(baseContent)
-            : [];
-        // Compare by resolved identity (digest), not raw string: a no-op relabel of a
-        // digest-pinned image already on base must not be re-flagged.
-        const baseIdentities = new Set(baseCandidates.map((c) => imageIdentity(c.ref)));
-        for (const candidate of headCandidates) {
-            if (baseIdentities.has(imageIdentity(candidate.ref)))
-                continue; // identity already on base
-            const { raw, ref, source } = candidate;
-            // For COPY --from and RUN --mount=from, require positive confirmation that
-            // the image exists before treating it as a real external image dependency.
-            // "unknown" (401/429/network error) is also treated as unconfirmed — these
-            // sources are ambiguous (build contexts, stage aliases, typos) and we
-            // prefer false-negatives over false-positives.
-            if (source === "copy-from" || source === "mount-from") {
-                const reference = ref.digest ?? ref.tag ?? "latest";
-                const exists = await imageExists(ref.registry, ref.repository, reference, dockerhubMirror);
-                if (exists !== "found") {
-                    lib_core.info(`docker: ${raw} not confirmed in registry (${exists}; build context, alias, or typo), skipping`);
-                    continue;
-                }
-            }
-            const name = makeName(ref);
-            const version = makeVersion(ref);
-            const key = `${name}@${version}`;
-            imageRefs.set(key, ref);
-            allDeps.push({
-                ecosystem: "docker",
-                name,
-                version,
-                file,
-            });
-        }
-    }
-    return { deps: allDeps, imageRefs };
-}
-/**
- * Get the publish date for a Docker image reference.
- * Only digest-pinned (@sha256:...) refs are queried — tag-only refs are
- * mutable and cannot be reliably age-gated, so they return null (unknown).
- */
-async function docker_getPublishDate(ref) {
-    return getImagePublishDate(ref, "docker");
-}
-//# sourceMappingURL=docker.js.map
-;// CONCATENATED MODULE: ./out/ecosystems/multitool.js
-
-
-
-
-
-
-function parseMultitoolLock(content) {
-    const result = new Map();
-    try {
-        const data = JSON.parse(content);
-        for (const [key, value] of Object.entries(data)) {
-            if (key.startsWith("$"))
-                continue;
-            const urls = (value?.binaries ?? [])
-                .map((b) => b?.url)
-                .filter(Boolean)
-                .sort()
-                .join("\n");
-            if (urls) {
-                result.set(key, urls);
-            }
-        }
-    }
-    catch (e) {
-        lib_core.debug(`Failed to parse multitool lockfile: ${e}`);
-    }
-    return result;
-}
-function findChangedTools(head, base, file) {
-    const deps = [];
-    for (const [name, url] of head) {
-        if (base.get(name) === url)
-            continue;
-        deps.push({
-            ecosystem: "multitool",
-            name,
-            version: url,
-            file,
-        });
-    }
-    return deps;
-}
-async function multitool_getChangedDeps(baseRef, moduleBazelPath) {
-    const moduleFiles = await resolveModuleFiles(moduleBazelPath);
-    const workspaceRoot = external_node_path_namespaceObject.resolve(external_node_path_namespaceObject.dirname(moduleBazelPath));
-    const lockfiles = [];
-    for (const file of moduleFiles) {
-        let content;
-        try {
-            content = await promises_.readFile(file, "utf8");
-        }
-        catch {
-            continue;
-        }
-        const hubs = await extractMultitoolHubs(content, workspaceRoot);
-        lockfiles.push(...hubs);
-    }
-    if (lockfiles.length === 0) {
-        lib_core.info("multitool: no lockfiles found");
-        return [];
-    }
-    const allDeps = [];
-    for (const file of lockfiles) {
-        const diff = await gitDiff(baseRef, file);
-        if (!diff) {
-            lib_core.info(`multitool: no changes in ${file}`);
-            continue;
-        }
-        let headContent;
-        try {
-            headContent = await promises_.readFile(file, "utf8");
-        }
-        catch {
-            lib_core.info(`multitool: could not read ${file}`);
-            continue;
-        }
-        const headTools = parseMultitoolLock(headContent);
-        const baseContent = await gitShowFile(baseRef, file);
-        const baseTools = baseContent ? parseMultitoolLock(baseContent) : new Map();
-        allDeps.push(...findChangedTools(headTools, baseTools, file));
-    }
-    return allDeps;
-}
-async function multitool_getPublishDate(url) {
-    return archiveDate(url);
-}
-//# sourceMappingURL=multitool.js.map
-;// CONCATENATED MODULE: ./out/ecosystems/kubernetes.js
-
-
-
-
-
-/** Recursively walk a parsed YAML value and collect container image strings. */
-function extractImages(obj, out) {
-    if (!obj || typeof obj !== "object")
-        return;
-    if (Array.isArray(obj)) {
-        for (const item of obj)
-            extractImages(item, out);
-        return;
-    }
-    const rec = obj;
-    for (const key of Object.keys(rec)) {
-        if (key === "containers" ||
-            key === "initContainers" ||
-            key === "ephemeralContainers") {
-            const arr = rec[key];
-            if (Array.isArray(arr)) {
-                for (const container of arr) {
-                    if (container &&
-                        typeof container === "object" &&
-                        !Array.isArray(container)) {
-                        const imageStr = container.image;
-                        if (typeof imageStr === "string") {
-                            const ref = parseImageRef(imageStr);
-                            if (ref)
-                                out.set(imageStr, ref);
-                        }
-                    }
-                }
-            }
-        }
-        else {
-            extractImages(rec[key], out);
-        }
-    }
-}
-/**
- * Parse a rendered Kubernetes manifest (possibly multi-document YAML with '---'
- * separators) and return a map of raw image strings to parsed refs.
- *
- * Works across all workload kinds by recursively finding containers/
- * initContainers/ephemeralContainers arrays anywhere in the document tree —
- * handles Deployment, StatefulSet, DaemonSet, Job, CronJob (nested), Pod,
- * and CRDs like Argo Rollouts without hard-coding kinds.
- */
-function parseManifestImages(content) {
-    const refs = new Map();
-    try {
-        jsYaml.loadAll(content, (doc) => {
-            try {
-                extractImages(doc, refs);
-            }
-            catch {
-                // skip individual malformed documents
-            }
-        });
-    }
-    catch {
-        // invalid YAML — return whatever was collected before the error
-    }
-    return refs;
-}
-async function kubernetes_getChangedDeps(baseRef, kubernetesFilesInput) {
-    let files;
-    if (kubernetesFilesInput) {
-        const allFiles = new Set(await resolveFiles(kubernetesFilesInput));
-        const changedFiles = await gitDiffNameOnly(baseRef);
-        files = changedFiles.filter((f) => allFiles.has(f));
-    }
-    else {
-        // Auto-detect: any changed .yaml/.yml file that contains workload manifests
-        const changedFiles = await gitDiffNameOnly(baseRef);
-        files = changedFiles.filter((f) => f.endsWith(".yaml") || f.endsWith(".yml"));
-    }
-    if (files.length === 0) {
-        lib_core.info("kubernetes: no changed YAML files");
-        return { deps: [], imageRefs: new Map() };
-    }
-    const allDeps = [];
-    const imageRefs = new Map();
-    for (const file of files) {
-        const diff = await gitDiff(baseRef, file);
-        if (!diff)
-            continue;
-        let headContent;
-        try {
-            headContent = await promises_.readFile(file, "utf8");
-        }
-        catch {
-            lib_core.info(`kubernetes: could not read ${file}`);
-            continue;
-        }
-        const headRefs = parseManifestImages(headContent);
-        if (headRefs.size === 0)
-            continue; // not a manifest with containers
-        const baseContent = await gitShowFile(baseRef, file);
-        const baseRefs = baseContent
-            ? parseManifestImages(baseContent)
-            : new Map();
-        // No imageExists gate here: k8s manifest `image:` fields are unambiguous real
-        // image references (unlike docker COPY --from which can be a build-context alias).
-        // parseImageRef already drops invalid names (placeholders, uppercase, etc.).
-        //
-        // Compare by resolved identity (digest), not the raw manifest string: a
-        // no-op relabel of an image whose digest is already on base must not be
-        // re-flagged, since that exact content was already vetted on the base branch.
-        const baseIdentities = new Set();
-        for (const bRef of baseRefs.values())
-            baseIdentities.add(imageIdentity(bRef));
-        for (const ref of headRefs.values()) {
-            if (baseIdentities.has(imageIdentity(ref)))
-                continue; // identity already on base
-            const name = makeName(ref);
-            const version = makeVersion(ref);
-            imageRefs.set(`${name}@${version}`, ref);
-            allDeps.push({
-                ecosystem: "kubernetes",
-                name,
-                version,
-                file,
-            });
-        }
-    }
-    return { deps: allDeps, imageRefs };
-}
-/**
- * Get the publish date for an image reference.
- * Only digest-pinned (@sha256:...) refs are queried — tag-only refs are
- * mutable and cannot be reliably age-gated, so they return null (unknown).
- */
-async function kubernetes_getPublishDate(ref) {
-    return getImagePublishDate(ref, "kubernetes");
-}
-//# sourceMappingURL=kubernetes.js.map
-;// CONCATENATED MODULE: ./out/report.js
-
-
-
-
-
-
-
-
-function getBranding() {
-    try {
-        const owner = github.context.repo.owner;
-        if (owner === "runloopai")
-            return "";
-    }
-    catch {
-        // GITHUB_REPOSITORY not set (e.g., local/test)
-    }
-    return "\n\n---\nMade with 💚 by [Runloop AI](https://runloop.ai)\n";
-}
-function determineStatus(ageDays, minAgeDays, warnAgeDays) {
-    if (ageDays === null)
-        return "unknown";
-    if (ageDays < minAgeDays)
-        return "fail";
-    if (ageDays < warnAgeDays)
-        return "warn";
-    return "pass";
-}
-// ── Helpers ──────────────────────────────────────────────────────────
-/** Quote a string for YAML if needed, using js-yaml's serializer. */
-function yamlQuote(s) {
-    return jsYaml.dump(s, { flowLevel: 0 }).trimEnd();
-}
-// ── Age-gate remediation via git diff ──────────────────────────────────
-/**
- * Write a modified file, run `git diff -u --color`, then restore the original.
- * Returns true if a diff was shown.
- */
-/** Show a diff wrapped in a named group. */
-async function showGroupDiff(filePath, original, modified, groupName) {
-    if (original === modified)
-        return false;
-    try {
-        lib_core.startGroup(groupName);
-        await promises_.writeFile(filePath, modified, "utf8");
-        await lib_exec.exec("git", ["diff", "-u", "--color", filePath], { silent: false });
-        lib_core.endGroup();
-        return true;
-    }
-    finally {
-        await promises_.writeFile(filePath, original, "utf8");
-    }
-}
-async function showDiff(filePath, original, modified) {
-    if (original === modified)
-        return false;
-    const isNew = original === null;
-    try {
-        await promises_.writeFile(filePath, modified, "utf8");
-        if (isNew) {
-            // Intent-to-add so git diff can see the new file
-            await lib_exec.exec("git", ["add", "-N", filePath], { silent: true });
-        }
-        await lib_exec.exec("git", ["diff", "-u", "--color", filePath], { silent: false });
-        return true;
-    }
-    finally {
-        if (isNew) {
-            await lib_exec.exec("git", ["reset", filePath], { silent: true });
-            await promises_.unlink(filePath).catch(() => { });
-        }
-        else {
-            await promises_.writeFile(filePath, original, "utf8");
-        }
-    }
-}
-/**
- * Get the installed version of a CLI tool, or null if not found.
- */
-async function getToolVersion(tool) {
-    try {
-        let stdout = "";
-        await lib_exec.exec(tool, ["--version"], {
-            listeners: { stdout: (data) => (stdout += data.toString()) },
-            silent: true,
-        });
-        const match = stdout.match(/(\d+\.\d+(?:\.\d+)?)/);
-        return match ? match[1] : null;
-    }
-    catch {
-        return null;
-    }
-}
-/**
- * Compare two semver-ish version strings (major.minor or major.minor.patch).
- * Returns true if `actual` >= `required`.
- */
-function versionAtLeast(actual, required) {
-    const a = actual.split(".").map(Number);
-    const r = required.split(".").map(Number);
-    for (let i = 0; i < r.length; i++) {
-        const av = a[i] ?? 0;
-        const rv = r[i] ?? 0;
-        if (isNaN(av) || isNaN(rv))
-            return false;
-        if (av > rv)
-            return true;
-        if (av < rv)
-            return false;
-    }
-    return true;
-}
-/**
- * Return a friendly duration string for uv exclude-newer (e.g. "14 days").
- */
-function excludeNewerDuration(minAgeDays) {
-    return `${minAgeDays} days`;
-}
-/**
- * Parse an existing exclude-newer value into a number of days.
- * Handles: "14 days", "P14D", and RFC 3339 timestamps.
- * Returns null if unparseable.
- */
-function parseExcludeNewerDays(value) {
-    // Friendly: "14 days"
-    const friendlyMatch = value.match(/^(\d+)\s*days?$/i);
-    if (friendlyMatch)
-        return parseInt(friendlyMatch[1], 10);
-    // ISO 8601 duration: "P14D"
-    const isoMatch = value.match(/^P(\d+)D$/i);
-    if (isoMatch)
-        return parseInt(isoMatch[1], 10);
-    // RFC 3339 timestamp: compute days from now
-    const ts = Date.parse(value);
-    if (!isNaN(ts))
-        return Math.floor((Date.now() - ts) / 86_400_000);
-    return null;
-}
-/**
- * Resolve the uv config file for a workspace root directory.
- * If uv.toml exists, use it (higher precedence per uv docs).
- * Otherwise use pyproject.toml — even if it lacks [tool.uv] (we'll suggest adding it).
- * Returns null only if neither file exists.
- */
-async function resolveUvConfig(dir) {
-    // Try uv.toml first (higher precedence)
-    const uvTomlPath = external_node_path_namespaceObject.join(dir, "uv.toml");
-    try {
-        const content = await promises_.readFile(uvTomlPath, "utf8");
-        const data = parse_parse(content);
-        return { file: uvTomlPath, content, uvConfig: data, isUvToml: true };
-    }
-    catch { /* not found or parse error */ }
-    // Fall back to pyproject.toml
-    const pyprojectPath = external_node_path_namespaceObject.join(dir, "pyproject.toml");
-    try {
-        const content = await promises_.readFile(pyprojectPath, "utf8");
-        const data = parse_parse(content);
-        const toolUv = data.tool?.uv;
-        return { file: pyprojectPath, content, uvConfig: toolUv ?? null, isUvToml: false };
-    }
-    catch { /* not found or parse error */ }
-    return null;
-}
-/**
- * Check a uv config file: if it's missing exclude-newer or its value is
- * more recent than the cutoff, suggest adding/updating it.
- */
-async function suggestUvExcludeNewer(dir, minAgeDays) {
-    const cfg = await resolveUvConfig(dir);
-    if (!cfg)
-        return false;
-    const { file, content, uvConfig, isUvToml } = cfg;
-    const duration = excludeNewerDuration(minAgeDays);
-    const existing = uvConfig?.["exclude-newer"];
-    if (existing) {
-        const existingDays = parseExcludeNewerDays(existing);
-        if (existingDays !== null && existingDays >= minAgeDays)
-            return false; // already strict enough
-    }
-    const lines = content.split("\n");
-    let modified;
-    if (existing) {
-        const idx = lines.findIndex((l) => l.trimStart().startsWith("exclude-newer") && !l.trimStart().startsWith("exclude-newer-package"));
-        if (idx === -1)
-            return false;
-        const indent = lines[idx].match(/^(\s*)/)?.[1] ?? "";
-        lines[idx] = `${indent}exclude-newer = "${duration}"`;
-        modified = lines.join("\n");
-    }
-    else if (isUvToml) {
-        // uv.toml — insert after leading comments
-        let insertIdx = 0;
-        while (insertIdx < lines.length && (lines[insertIdx].startsWith("#") || lines[insertIdx].trim() === "")) {
-            insertIdx++;
-        }
-        lines.splice(insertIdx, 0, `exclude-newer = "${duration}"`);
-        modified = lines.join("\n");
-    }
-    else {
-        // pyproject.toml — insert after [tool.uv], or add the section if missing
-        const uvIdx = lines.findIndex((l) => l.trim() === "[tool.uv]");
-        if (uvIdx !== -1) {
-            lines.splice(uvIdx + 1, 0, `exclude-newer = "${duration}"`);
-        }
-        else {
-            // Append [tool.uv] section at the end
-            lines.push("", "[tool.uv]", `exclude-newer = "${duration}"`);
-        }
-        modified = lines.join("\n");
-    }
-    return showDiff(file, content, modified);
-}
-/**
- * Suggest pnpm minimumReleaseAge in pnpm-workspace.yaml.
- * Uses yaml.load to parse; targeted line edit for writing.
- */
-async function suggestPnpmAge(minAgeDays) {
-    const ver = await getToolVersion("pnpm");
-    if (ver && !versionAtLeast(ver, "10.16")) {
-        lib_core.info(`pnpm ${ver} does not support minimumReleaseAge (requires >= 10.16)`);
-        return false;
-    }
-    const file = "pnpm-workspace.yaml";
-    let content;
-    try {
-        content = await promises_.readFile(file, "utf8");
-    }
-    catch {
-        return false;
-    }
-    const targetMinutes = minAgeDays * 24 * 60;
-    let data;
-    try {
-        data = jsYaml.load(content) ?? {};
-    }
-    catch {
-        return false;
-    }
-    const existing = data.minimumReleaseAge;
-    if (existing !== undefined && existing >= targetMinutes)
-        return false;
-    const setting = `minimumReleaseAge: ${targetMinutes}  # ${minAgeDays} days, in minutes`;
-    const lines = content.split("\n");
-    let modified;
-    if (existing !== undefined) {
-        const idx = lines.findIndex((l) => l.trimStart().startsWith("minimumReleaseAge"));
-        if (idx === -1)
-            return false;
-        lines[idx] = setting;
-        modified = lines.join("\n");
-    }
-    else {
-        modified = content.trimEnd() + "\n" + setting + "\n";
-    }
-    return showDiff(file, content, modified);
-}
-/**
- * Suggest yarn npmMinimalAgeGate in .yarnrc.yml.
- * Uses yaml.load to parse; targeted line edit for writing.
- */
-async function suggestYarnAge(minAgeDays) {
-    const ver = await getToolVersion("yarn");
-    if (ver && !versionAtLeast(ver, "4.10")) {
-        lib_core.info(`yarn ${ver} does not support npmMinimalAgeGate (requires >= 4.10)`);
-        return false;
-    }
-    const file = ".yarnrc.yml";
-    let content;
-    try {
-        content = await promises_.readFile(file, "utf8");
-    }
-    catch {
-        return false;
-    }
-    let data;
-    try {
-        data = jsYaml.load(content) ?? {};
-    }
-    catch {
-        return false;
-    }
-    const existing = data.npmMinimalAgeGate;
-    if (existing) {
-        const days = parseInt(existing, 10);
-        if (!isNaN(days) && days >= minAgeDays)
-            return false;
-    }
-    const setting = `npmMinimalAgeGate: "${minAgeDays}d"`;
-    const lines = content.split("\n");
-    let modified;
-    if (existing) {
-        const idx = lines.findIndex((l) => l.trimStart().startsWith("npmMinimalAgeGate"));
-        if (idx === -1)
-            return false;
-        lines[idx] = setting;
-        modified = lines.join("\n");
-    }
-    else {
-        modified = content.trimEnd() + "\n" + setting + "\n";
-    }
-    return showDiff(file, content, modified);
-}
-/**
- * Suggest bun minimumReleaseAge in bunfig.toml.
- * Uses smol-toml to parse; targeted line edit for writing.
- */
-async function suggestBunAge(minAgeDays) {
-    const ver = await getToolVersion("bun");
-    if (ver && !versionAtLeast(ver, "1.3")) {
-        lib_core.info(`bun ${ver} does not support minimumReleaseAge (requires >= 1.3)`);
-        return false;
-    }
-    const file = "bunfig.toml";
-    let content;
-    try {
-        content = await promises_.readFile(file, "utf8");
-    }
-    catch {
-        return false;
-    }
-    const targetSeconds = minAgeDays * 86_400;
-    let data;
-    try {
-        data = parse_parse(content);
-    }
-    catch {
-        return false;
-    }
-    const install = data.install;
-    const existing = install?.minimumReleaseAge;
-    if (existing !== undefined && existing >= targetSeconds)
-        return false;
-    const setting = `minimumReleaseAge = ${targetSeconds}  # ${minAgeDays} days, in seconds`;
-    const lines = content.split("\n");
-    let modified;
-    if (existing !== undefined) {
-        const idx = lines.findIndex((l) => l.trimStart().startsWith("minimumReleaseAge"));
-        if (idx === -1)
-            return false;
-        lines[idx] = setting;
-        modified = lines.join("\n");
-    }
-    else if (lines.some((l) => l.trim() === "[install]")) {
-        const idx = lines.findIndex((l) => l.trim() === "[install]");
-        lines.splice(idx + 1, 0, setting);
-        modified = lines.join("\n");
-    }
-    else {
-        modified = content.trimEnd() + "\n[install]\n" + setting + "\n";
-    }
-    return showDiff(file, content, modified);
-}
-/**
- * Suggest npm min-release-age in .npmrc.
- * Requires npm >= 11.10.
- */
-async function suggestNpmAge(minAgeDays) {
-    const ver = await getToolVersion("npm");
-    if (ver && !versionAtLeast(ver, "11.10")) {
-        lib_core.info(`npm ${ver} does not support min-release-age (requires >= 11.10)`);
-        return false;
-    }
-    const file = ".npmrc";
-    let content;
-    try {
-        content = await promises_.readFile(file, "utf8");
-    }
-    catch {
-        content = "";
-    }
-    // npm min-release-age unit is days
-    const lines = content.split("\n");
-    const existingIdx = lines.findIndex((l) => l.trimStart().startsWith("min-release-age"));
-    if (existingIdx !== -1) {
-        const existingVal = parseInt(lines[existingIdx].split("=")[1]?.trim() ?? "0", 10);
-        if (existingVal >= minAgeDays)
-            return false;
-        lines[existingIdx] = `min-release-age=${minAgeDays}`;
-    }
-    else {
-        lines.push(`min-release-age=${minAgeDays}`);
-    }
-    const modified = lines.join("\n");
-    if (content === "") {
-        // File didn't exist — write it, diff, then remove
-        try {
-            await promises_.writeFile(file, modified, "utf8");
-            await lib_exec.exec("git", ["diff", "-u", "--color", "--no-index", "/dev/null", file], { silent: false, ignoreReturnCode: true });
-            return true;
-        }
-        finally {
-            await promises_.unlink(file).catch(() => { });
-        }
-    }
-    return showDiff(file, content, modified);
-}
-/**
- * Suggest per-package age exclusions for uv.
- * Adds `exclude-newer-package` entries to the workspace root config
- * (uv.toml or pyproject.toml [tool.uv]).
- */
-async function suggestUvPackageExclusions(failedPkgs, workspaceDirs) {
-    if (failedPkgs.length === 0)
-        return;
-    for (const dir of workspaceDirs) {
-        const cfg = await resolveUvConfig(dir);
-        if (!cfg)
-            continue;
-        const { file, content, isUvToml } = cfg;
-        const lines = content.split("\n");
-        const newEntries = failedPkgs.map((pkg) => `"${pkg}" = false`).join(", ");
-        const setting = `exclude-newer-package = { ${newEntries} }`;
-        // Check if exclude-newer-package already exists
-        const existingIdx = lines.findIndex((l) => l.trimStart().startsWith("exclude-newer-package"));
-        if (existingIdx !== -1)
-            continue;
-        // Insert after exclude-newer line, or after [tool.uv] header (pyproject), or at top (uv.toml)
-        const enIdx = lines.findIndex((l) => {
-            const t = l.trimStart();
-            return t.startsWith("exclude-newer") && !t.startsWith("exclude-newer-package");
-        });
-        let insertIdx;
-        if (enIdx !== -1) {
-            insertIdx = enIdx + 1;
-        }
-        else if (!isUvToml) {
-            let uvIdx = lines.findIndex((l) => l.trim() === "[tool.uv]");
-            if (uvIdx === -1) {
-                // Add [tool.uv] section at the end
-                lines.push("", "[tool.uv]");
-                uvIdx = lines.length - 1;
-            }
-            insertIdx = uvIdx + 1;
-        }
-        else {
-            // uv.toml — insert after comments
-            insertIdx = 0;
-            while (insertIdx < lines.length && (lines[insertIdx].startsWith("#") || lines[insertIdx].trim() === "")) {
-                insertIdx++;
-            }
-        }
-        lines.splice(insertIdx, 0, setting);
-        await showDiff(file, content, lines.join("\n"));
-    }
-}
-/**
- * Suggest per-package exclusions for pnpm in pnpm-workspace.yaml.
- */
-async function suggestPnpmPackageExclusions(failedPkgs) {
-    if (failedPkgs.length === 0)
-        return;
-    const file = "pnpm-workspace.yaml";
-    let content;
-    try {
-        content = await promises_.readFile(file, "utf8");
-    }
-    catch {
-        return;
-    }
-    if (content.includes("minimumReleaseAgeExclude"))
-        return;
-    const entries = failedPkgs.map((pkg) => `  - "${pkg}"`).join("\n");
-    const modified = content.trimEnd() + "\nminimumReleaseAgeExclude:\n" + entries + "\n";
-    await showDiff(file, content, modified);
-}
-/**
- * Suggest per-package exclusions for yarn in .yarnrc.yml.
- * Uses npmPreapprovedPackages which exempts from all package gates including npmMinimalAgeGate.
- */
-async function suggestYarnPackageExclusions(failedPkgs) {
-    if (failedPkgs.length === 0)
-        return;
-    const file = ".yarnrc.yml";
-    let content;
-    try {
-        content = await promises_.readFile(file, "utf8");
-    }
-    catch {
-        return;
-    }
-    if (content.includes("npmPreapprovedPackages"))
-        return;
-    const entries = failedPkgs.map((pkg) => `  - "${pkg}"`).join("\n");
-    const modified = content.trimEnd() + "\nnpmPreapprovedPackages:\n" + entries + "\n";
-    await showDiff(file, content, modified);
-}
-/**
- * Suggest per-package exclusions for bun in bunfig.toml.
- */
-async function suggestBunPackageExclusions(failedPkgs) {
-    if (failedPkgs.length === 0)
-        return;
-    const file = "bunfig.toml";
-    let content;
-    try {
-        content = await promises_.readFile(file, "utf8");
-    }
-    catch {
-        return;
-    }
-    if (content.includes("minimumReleaseAgeExcludes"))
-        return;
-    const entries = failedPkgs.map((pkg) => `"${pkg}"`).join(", ");
-    const lines = content.split("\n");
-    const installIdx = lines.findIndex((l) => l.trim() === "[install]");
-    if (installIdx !== -1) {
-        lines.splice(installIdx + 1, 0, `minimumReleaseAgeExcludes = [${entries}]`);
-    }
-    else {
-        lines.push("[install]", `minimumReleaseAgeExcludes = [${entries}]`);
-    }
-    await showDiff(file, content, lines.join("\n"));
-}
-/**
- * Find the insertion point in the workflow file for age-overrides/license-overrides.
- * Looks for `uses: ...lisan-al-gaib...` then finds the end of its `with:` block.
- */
-function findActionInsertIdx(allLines) {
-    const actionPattern = /uses:.*lisan-al-gaib/;
-    const actionLineIdx = allLines.findIndex((l) => actionPattern.test(l));
-    if (actionLineIdx === -1)
-        return -1;
-    let insertIdx = allLines.length;
-    let inWith = false;
-    for (let i = actionLineIdx + 1; i < allLines.length; i++) {
-        const line = allLines[i];
-        if (/^\s*with:/.test(line)) {
-            inWith = true;
-            continue;
-        }
-        if (inWith && line.trim() !== "") {
-            const lineIndent = line.match(/^(\s*)/)?.[1]?.length ?? 0;
-            if (lineIndent < 10) {
-                insertIdx = i;
-                break;
-            }
-        }
-    }
-    return insertIdx;
-}
-/**
- * Suggest adding age-overrides to the workflow file for failed/warned packages.
- */
-async function suggestAgeOverrides(results) {
-    if (!process.env.GITHUB_ACTIONS)
-        return;
-    // Collect only failed packages (not warn — those comply with min-age-days)
-    const overrides = new Map();
-    for (const r of results) {
-        if (r.status !== "fail")
-            continue;
-        const set = overrides.get(r.dep.ecosystem) ?? new Set();
-        set.add(r.dep.name);
-        overrides.set(r.dep.ecosystem, set);
-    }
-    if (overrides.size === 0)
-        return;
-    const workflowRef = process.env.GITHUB_WORKFLOW_REF;
-    if (!workflowRef)
-        return;
-    let workflowFile = null;
-    try {
-        const { owner, repo } = github.context.repo;
-        const prefix = `${owner}/${repo}/`;
-        if (workflowRef.startsWith(prefix)) {
-            const rest = workflowRef.slice(prefix.length);
-            const atIdx = rest.lastIndexOf("@");
-            if (atIdx !== -1)
-                workflowFile = rest.slice(0, atIdx);
-        }
-    }
-    catch { /* not in GH */ }
-    if (!workflowFile)
-        return;
-    let original;
-    try {
-        original = await promises_.readFile(workflowFile, "utf8");
-    }
-    catch {
-        return;
-    }
-    const allLines = original.split("\n");
-    const indent = "            "; // 12 spaces
-    if (original.includes("age-overrides:")) {
-        // Find the age-overrides block and append new entries
-        const aoIdx = allLines.findIndex((l) => /^\s*age-overrides:/.test(l));
-        if (aoIdx === -1)
-            return;
-        // Find the end of the age-overrides YAML literal block
-        // It's a `|` block — find where indentation drops back
-        const aoIndent = allLines[aoIdx].match(/^(\s*)/)?.[1]?.length ?? 0;
-        let endIdx = aoIdx + 1;
-        while (endIdx < allLines.length) {
-            const line = allLines[endIdx];
-            if (line.trim() === "") {
-                endIdx++;
-                continue;
-            }
-            const lineIndent = line.match(/^(\s*)/)?.[1]?.length ?? 0;
-            if (lineIndent <= aoIndent)
-                break;
-            endIdx++;
-        }
-        // Parse existing entries to avoid duplicates
-        const existingContent = allLines.slice(aoIdx + 1, endIdx).join("\n");
-        const newLines = [];
-        for (const [eco, pkgs] of overrides) {
-            const newPkgs = [...pkgs].filter((name) => !existingContent.includes(name));
-            if (newPkgs.length === 0)
-                continue;
-            if (!existingContent.includes(`${eco}:`)) {
-                newLines.push(`${indent}${eco}:`);
-            }
-            for (const name of newPkgs) {
-                newLines.push(`${indent}  - ${yamlQuote(name)}`);
-            }
-        }
-        if (newLines.length === 0)
-            return;
-        // Insert new entries at the end of the block, before existing ecosystem sections
-        // or at the end of the block content
-        const modified = [...allLines];
-        modified.splice(endIdx, 0, ...newLines);
-        await showGroupDiff(workflowFile, original, modified.join("\n"), "Suggested: add entries to age-overrides");
-    }
-    else {
-        const insertIdx = findActionInsertIdx(allLines);
-        if (insertIdx === -1)
-            return;
-        const blockLines = [`${indent.slice(2)}age-overrides: |`];
-        for (const [eco, pkgs] of overrides) {
-            blockLines.push(`${indent}${eco}:`);
-            for (const name of pkgs) {
-                blockLines.push(`${indent}  - ${yamlQuote(name)}`);
-            }
-        }
-        allLines.splice(insertIdx, 0, blockLines.join("\n"));
-        await showGroupDiff(workflowFile, original, allLines.join("\n"), "Suggested: add age-overrides to your workflow");
-    }
-}
-/**
- * Detect which lockfiles are present and suggest the appropriate
- * package-manager-level age gate setting as a colored git diff.
- */
-async function showAgeGateDiffs(results, ecosystems, minAgeDays) {
-    // Collect unique workspace root dirs from python lockfile paths (uv.lock dir = workspace root)
-    const pythonWorkspaceDirs = new Set();
-    for (const r of results) {
-        if (r.dep.ecosystem === "python") {
-            pythonWorkspaceDirs.add(external_node_path_namespaceObject.dirname(r.dep.file));
-        }
-    }
-    // Section 1: Age gate number settings (exclude-newer, minimumReleaseAge, etc.)
-    const hasPythonDirs = ecosystems.has("python") && pythonWorkspaceDirs.size > 0;
-    const npmLockfiles = ecosystems.has("npm")
-        ? new Set(results.filter((r) => r.dep.ecosystem === "npm").map((r) => external_node_path_namespaceObject.basename(r.dep.file)))
-        : new Set();
-    const hasNpmLockfiles = npmLockfiles.size > 0;
-    if (hasPythonDirs || hasNpmLockfiles) {
-        lib_core.startGroup("Suggested: add package manager age gate settings");
-        if (hasPythonDirs) {
-            for (const dir of pythonWorkspaceDirs) {
-                await suggestUvExcludeNewer(dir, minAgeDays);
-            }
-        }
-        if (hasNpmLockfiles) {
-            if (npmLockfiles.has("package-lock.json"))
-                await suggestNpmAge(minAgeDays);
-            if (npmLockfiles.has("pnpm-lock.yaml"))
-                await suggestPnpmAge(minAgeDays);
-            if (npmLockfiles.has("yarn.lock"))
-                await suggestYarnAge(minAgeDays);
-            if (npmLockfiles.has("bun.lock") || npmLockfiles.has("bun.lockb"))
-                await suggestBunAge(minAgeDays);
-        }
-        lib_core.endGroup();
-    }
-    // Section 2: Per-package exclusions (only for packages that FAIL, not warn)
-    // Group failed packages by (ecosystem, workspace dir), deduplicated
-    const failedPython = new Map(); // dir → set of pkg names
-    const failedNpmNames = new Set();
-    for (const r of results) {
-        if (r.status !== "fail")
-            continue;
-        if (r.dep.ecosystem === "python") {
-            const dir = external_node_path_namespaceObject.dirname(r.dep.file);
-            const set = failedPython.get(dir) ?? new Set();
-            set.add(r.dep.name);
-            failedPython.set(dir, set);
-        }
-        else if (r.dep.ecosystem === "npm") {
-            failedNpmNames.add(r.dep.name);
-        }
-    }
-    let shownExclusions = false;
-    const startExclGroup = () => {
-        if (!shownExclusions) {
-            lib_core.startGroup("Suggested: add per-package age gate exclusions");
-            shownExclusions = true;
-        }
-    };
-    if (ecosystems.has("python")) {
-        for (const [dir, pkgs] of failedPython) {
-            startExclGroup();
-            await suggestUvPackageExclusions([...pkgs], new Set([dir]));
-        }
-    }
-    if (ecosystems.has("npm") && failedNpmNames.size > 0) {
-        const lockfiles = new Set(results.map((r) => external_node_path_namespaceObject.basename(r.dep.file)));
-        const failedNpm = [...failedNpmNames];
-        if (lockfiles.has("pnpm-lock.yaml")) {
-            startExclGroup();
-            await suggestPnpmPackageExclusions(failedNpm);
-        }
-        if (lockfiles.has("yarn.lock")) {
-            startExclGroup();
-            await suggestYarnPackageExclusions(failedNpm);
-        }
-        if (lockfiles.has("bun.lock") || lockfiles.has("bun.lockb")) {
-            startExclGroup();
-            await suggestBunPackageExclusions(failedNpm);
-        }
-    }
-    if (shownExclusions)
-        lib_core.endGroup();
-}
-function dedupeResults(results) {
-    const seen = new Set();
-    const out = [];
-    for (const r of results) {
-        const key = `${r.dep.ecosystem}:${r.dep.name}@${r.dep.version}`;
-        if (seen.has(key))
-            continue;
-        seen.add(key);
-        out.push(r);
-    }
-    return out;
-}
-async function emitAnnotations(results, ecosystems, minAgeDays) {
-    for (const { dep, ageDays, status } of results) {
-        if (status === "fail") {
-            lib_core.error(`${dep.name}@${dep.version} published ${ageDays}d ago, minimum is ${minAgeDays}d`, { file: dep.file });
-        }
-        else if (status === "warn") {
-            lib_core.warning(`${dep.name}@${dep.version} published ${ageDays}d ago`, { file: dep.file });
-        }
-    }
-    await showAgeGateDiffs(results, new Set(ecosystems), minAgeDays);
-    await suggestAgeOverrides(results);
-}
-const STATUS_ORDER = {
-    fail: 0,
-    warn: 1,
-    unknown: 2,
-    pass: 3,
-};
-/**
- * Compare two version strings with semver awareness.
- * Falls back to lexicographic comparison for non-semver versions.
- */
-function compareVersions(a, b) {
-    const sa = semver.coerce(a);
-    const sb = semver.coerce(b);
-    if (sa && sb)
-        return semver.compare(sa, sb);
-    return a.localeCompare(b);
-}
-/**
- * Sort age results: fail/warn by increasing age then (ecosystem, name, version);
- * unknown/pass by (ecosystem, name, version) only.
- */
-function sortedByStatus(results) {
-    return [...results].sort((a, b) => {
-        // Primary: status order
-        const statusDiff = STATUS_ORDER[a.status] - STATUS_ORDER[b.status];
-        if (statusDiff !== 0)
-            return statusDiff;
-        // For fail/warn: sort by increasing age first
-        if (a.status === "fail" || a.status === "warn") {
-            const ageA = a.ageDays ?? Infinity;
-            const ageB = b.ageDays ?? Infinity;
-            if (ageA !== ageB)
-                return ageA - ageB;
-        }
-        // Then ecosystem, name, version
-        const ecoDiff = a.dep.ecosystem.localeCompare(b.dep.ecosystem);
-        if (ecoDiff !== 0)
-            return ecoDiff;
-        const nameDiff = a.dep.name.localeCompare(b.dep.name);
-        if (nameDiff !== 0)
-            return nameDiff;
-        return compareVersions(a.dep.version, b.dep.version);
-    });
-}
-const LICENSE_STATUS_ORDER = {
-    incompatible: 0, // fail
-    unknown: 1, // unknown
-    compatible: 2, // pass
-};
-function licenseStatusKey(lr) {
-    if (lr.compatible === false)
-        return LICENSE_STATUS_ORDER.incompatible;
-    if (lr.compatible === null)
-        return LICENSE_STATUS_ORDER.unknown;
-    return LICENSE_STATUS_ORDER.compatible;
-}
-/**
- * Sort license results: incompatible first, then unknown, then compatible.
- * Within each group, sort by (ecosystem, license, name, version).
- */
-function sortedLicenseResults(results) {
-    return [...results].sort((a, b) => {
-        const statusDiff = licenseStatusKey(a) - licenseStatusKey(b);
-        if (statusDiff !== 0)
-            return statusDiff;
-        const ecoDiff = a.ecosystem.localeCompare(b.ecosystem);
-        if (ecoDiff !== 0)
-            return ecoDiff;
-        const licA = a.spdx ?? a.license ?? "";
-        const licB = b.spdx ?? b.license ?? "";
-        const licDiff = licA.localeCompare(licB);
-        if (licDiff !== 0)
-            return licDiff;
-        const nameDiff = a.name.localeCompare(b.name);
-        if (nameDiff !== 0)
-            return nameDiff;
-        return compareVersions(a.version, b.version);
-    });
-}
-async function writeSummary(results, minAgeDays, warnAgeDays, licenseResults = []) {
-    if (results.length === 0 && licenseResults.length === 0) {
-        lib_core.summary.addRaw("No dependency changes detected.");
-        const branding = getBranding();
-        if (branding)
-            lib_core.summary.addRaw(branding);
-        await lib_core.summary.write();
-        return;
-    }
-    const statusIcon = {
-        pass: "✅",
-        warn: "⚠️",
-        fail: "❌",
-        unknown: "❓",
-    };
-    lib_core.summary.addHeading("Lisan al-Gaib", 2);
-    lib_core.summary.addRaw(`Minimum age: *${minAgeDays}d* | Warning threshold: *${warnAgeDays}d*\n\n`);
-    lib_core.summary.addTable([
-        [
-            { data: "Ecosystem", header: true },
-            { data: "Package", header: true },
-            { data: "Version", header: true },
-            { data: "Age (days)", header: true },
-            { data: "Status", header: true },
-        ],
-        ...sortedByStatus(results).map((r) => [
-            r.dep.ecosystem,
-            r.dep.name,
-            r.dep.version,
-            r.ageDays !== null ? String(r.ageDays) : "?",
-            `${statusIcon[r.status]} ${r.status.toUpperCase()}`,
-        ]),
-    ]);
-    // License compliance table
-    if (licenseResults.length > 0) {
-        lib_core.summary.addHeading("License Compliance", 2);
-        lib_core.summary.addTable([
-            [
-                { data: "Ecosystem", header: true },
-                { data: "Package", header: true },
-                { data: "Version", header: true },
-                { data: "License", header: true },
-                { data: "Status", header: true },
-            ],
-            ...sortedLicenseResults(licenseResults).map((lr) => [
-                lr.ecosystem,
-                lr.name,
-                lr.version,
-                lr.spdx ?? lr.license ?? "?",
-                lr.compatible === true
-                    ? "✅ OK"
-                    : lr.compatible === false
-                        ? "❌ INCOMPATIBLE"
-                        : "❓ UNKNOWN",
-            ]),
-        ]);
-    }
-    const branding = getBranding();
-    if (branding)
-        lib_core.summary.addRaw(branding);
-    await lib_core.summary.write();
-}
-function reportTotals(results) {
-    const checked = results.filter((r) => r.status !== "unknown").length;
-    const failures = results.filter((r) => r.status === "fail").length;
-    const warnings = results.filter((r) => r.status === "warn").length;
-    return { checked, failures, warnings };
-}
-//# sourceMappingURL=report.js.map
-// EXTERNAL MODULE: external "node:zlib"
-var external_node_zlib_ = __nccwpck_require__(8522);
-;// CONCATENATED MODULE: external "node:stream/promises"
-const external_node_stream_promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:stream/promises");
-// EXTERNAL MODULE: external "node:stream"
-var external_node_stream_ = __nccwpck_require__(7075);
-// EXTERNAL MODULE: ./node_modules/.pnpm/spdx-correct@3.2.0/node_modules/spdx-correct/index.js
-var spdx_correct = __nccwpck_require__(6820);
-// EXTERNAL MODULE: ./node_modules/.pnpm/spdx-satisfies@6.0.0/node_modules/spdx-satisfies/index.js
-var spdx_satisfies = __nccwpck_require__(3509);
-// EXTERNAL MODULE: ./node_modules/.pnpm/spdx-expression-parse@4.0.0/node_modules/spdx-expression-parse/index.js
-var spdx_expression_parse = __nccwpck_require__(5887);
 ;// CONCATENATED MODULE: ./node_modules/.pnpm/fast-xml-parser@5.5.9/node_modules/fast-xml-parser/src/util.js
 
 
@@ -93150,11 +89031,11 @@ function parseTextData(val, tagName, jPath, dontTrim, hasAttributes, isLeafNode,
         //overwrite
         return newval;
       } else if (this.options.trimValues) {
-        return OrderedObjParser_parseValue(val, this.options.parseTagValue, this.options.numberParseOptions);
+        return parseValue(val, this.options.parseTagValue, this.options.numberParseOptions);
       } else {
         const trimmedVal = val.trim();
         if (trimmedVal === val) {
-          return OrderedObjParser_parseValue(val, this.options.parseTagValue, this.options.numberParseOptions);
+          return parseValue(val, this.options.parseTagValue, this.options.numberParseOptions);
         } else {
           return val;
         }
@@ -93249,7 +89130,7 @@ function buildAttributesMap(attrStr, jPath, tagName) {
             attrs[aName] = newVal;
           } else {
             //parse
-            attrs[aName] = OrderedObjParser_parseValue(
+            attrs[aName] = parseValue(
               oldVal,
               this.options.parseAttributeValue,
               this.options.numberParseOptions
@@ -93834,7 +89715,7 @@ function readStopNodeData(xmlData, tagName, i) {
   }//end for loop
 }
 
-function OrderedObjParser_parseValue(val, shouldParse, options) {
+function parseValue(val, shouldParse, options) {
   if (shouldParse && typeof val === 'string') {
     //console.log(options)
     const newval = val.trim();
@@ -94555,6 +90436,4942 @@ class XMLParser {
         return XmlNode.getMetaDataSymbol();
     }
 }
+// EXTERNAL MODULE: ./node_modules/.pnpm/semver@7.7.4/node_modules/semver/index.js
+var node_modules_semver = __nccwpck_require__(9419);
+;// CONCATENATED MODULE: ./out/http.js
+/** Shared HTTP fetch helpers with a discriminated result type. */
+/** Per-attempt request timeout in milliseconds. */
+const http_FETCH_TIMEOUT_MS = 5000;
+/** Maximum Retry-After delay accepted, in milliseconds. Both delta-seconds and HTTP-date forms are clamped to this cap — a server requesting a longer wait is treated like any other rate-limit and retried with the caller's own backoff. */
+const MAX_RETRY_AFTER_MS = 4000;
+/**
+ * Parse a Retry-After header value into milliseconds.
+ * Supports both delta-seconds ("120") and HTTP-date forms.
+ * Returns undefined when the header is absent or unparseable.
+ * The returned value is clamped to MAX_RETRY_AFTER_MS.
+ *
+ * Exported for testability (gap #3).
+ */
+function parseRetryAfter(value) {
+    if (!value)
+        return undefined;
+    const trimmed = value.trim();
+    // Delta-seconds form: must be a positive decimal integer.
+    // Return undefined for 0 — "retry immediately" is indistinguishable from a
+    // spec-compliant `Retry-After: 0` that would drive zero-delay back-to-back
+    // requests and defeat the backoff+jitter policy. Let the caller use its own
+    // exponential backoff instead.
+    if (/^\d+$/.test(trimmed)) {
+        const seconds = Number(trimmed);
+        if (!(seconds > 0))
+            return undefined; // /^\d+$/ already excludes NaN/Infinity; this guards seconds===0
+        return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
+    }
+    // HTTP-date form
+    const ms = Date.parse(trimmed);
+    if (!Number.isNaN(ms)) {
+        const delay = ms - Date.now();
+        // If the date is in the past or now, return undefined so the caller uses
+        // its own exponential backoff rather than hammering with delay=0.
+        return delay > 0 ? Math.min(delay, MAX_RETRY_AFTER_MS) : undefined;
+    }
+    return undefined;
+}
+/**
+ * Shared retry/backoff driver. Calls `singleAttempt` repeatedly until:
+ *   - it returns `ok` or `not_found` (both are terminal, never retried), or
+ *   - the result is non-retryable (4xx that is not 429, or network exhaustion), or
+ *   - `maxRetries` attempts have been consumed.
+ *
+ * Retry policy:
+ *   - 429 rate-limited: retry up to maxRetries; delay honors Retry-After header with
+ *     positive-only jitter [1.0, 1.25]× so the server's instruction is never undershot.
+ *   - 5xx server errors: retry up to maxRetries with exponential backoff + ±25% jitter.
+ *   - Network/timeout errors (no HTTP status): retry at most once (maxNetworkRetries=1)
+ *     to recover from transient blips without masking persistent failures.
+ */
+async function retryWithBackoff(singleAttempt, opts = {}) {
+    const maxRetries = opts.maxRetries ?? 3;
+    const initialDelayMs = opts.initialDelayMs ?? 250;
+    const maxNetworkRetries = 1;
+    // networkAttempts is a loop-lifetime budget, not a per-consecutive-window counter:
+    // it tracks all network-error attempts across the entire retry loop regardless of
+    // any intervening 5xx retries. The "at most one network retry" guarantee holds for
+    // mixed sequences (e.g. 5xx→network→network or network→5xx→network).
+    let networkAttempts = 0;
+    let result = { kind: "error", message: "no attempts made" };
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        result = await singleAttempt();
+        if (result.kind === "ok" || result.kind === "not_found")
+            return result;
+        const isNetworkError = result.kind === "error" && result.status === undefined;
+        const isRetryable = result.kind === "rate_limited" ||
+            (result.kind === "error" && result.status !== undefined && result.status >= 500) ||
+            (isNetworkError && networkAttempts < maxNetworkRetries);
+        if (isNetworkError)
+            networkAttempts++;
+        if (!isRetryable || attempt === maxRetries)
+            return result;
+        const backoff = Math.min(initialDelayMs * 2 ** attempt, MAX_RETRY_AFTER_MS);
+        // Add jitter so fan-out callers to the same host don't retry in lock-step
+        // under a registry-wide 429.
+        //
+        // For rate-limited responses with a Retry-After header, apply POSITIVE-ONLY
+        // jitter ([1.0, 1.25]×) — the server's Retry-After is a contract; waiting
+        // *less* than the instructed delay risks an immediate re-429. Positive jitter
+        // still de-synchronises the herd without ever undershooting the instruction.
+        //
+        // For exponential backoff (5xx / network error), symmetric ±25% jitter is fine
+        // since no server instruction exists.
+        const delay = result.kind === "rate_limited" && result.retryAfterMs !== undefined
+            // Positive-only jitter [1.0, 1.25]× so the delay never undershoots Retry-After.
+            ? Math.min(Math.max(0, Math.round(result.retryAfterMs * (1 + 0.25 * Math.random()))), MAX_RETRY_AFTER_MS)
+            // Symmetric ±25% jitter for 5xx/network backoff (no server instruction to honour).
+            : Math.min(Math.max(0, Math.round(backoff * (1 + 0.25 * (Math.random() * 2 - 1)))), MAX_RETRY_AFTER_MS);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    return result;
+}
+/**
+ * Fetch a URL expecting a JSON body, classifying the response so callers can
+ * distinguish 404, rate-limiting, and other errors.
+ *
+ *   200-299 → { kind: "ok", data }
+ *   404/410 → { kind: "not_found" }
+ *   429     → { kind: "rate_limited", retryAfterMs? }
+ *   other   → { kind: "error", status }
+ *   network/timeout → { kind: "error", message }
+ */
+async function fetchJson(url, headers) {
+    let resp;
+    try {
+        resp = await fetch(url, {
+            headers,
+            signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS),
+        });
+    }
+    catch (err) {
+        return { kind: "error", message: err instanceof Error ? err.message : String(err) };
+    }
+    if (resp.ok) {
+        try {
+            return { kind: "ok", data: (await resp.json()) };
+        }
+        catch (err) {
+            return { kind: "error", status: resp.status, message: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    if (resp.status === 404 || resp.status === 410)
+        return { kind: "not_found" };
+    if (resp.status === 429) {
+        return { kind: "rate_limited", retryAfterMs: parseRetryAfter(resp.headers.get("Retry-After")) };
+    }
+    return { kind: "error", status: resp.status, message: `HTTP ${resp.status}` };
+}
+/**
+ * Fetch JSON with retry on rate-limiting and 5xx errors, using exponential
+ * backoff capped at 4 seconds. Honors a parsed Retry-After header when present.
+ */
+async function http_fetchWithRetry(url, headers, opts = {}) {
+    return retryWithBackoff(() => fetchJson(url, headers), opts);
+}
+/**
+ * Fetch a URL expecting a plain-text body (e.g. XML), with retry on rate-limiting and
+ * 5xx errors using exponential backoff. Returns a discriminated FetchResult<string> so
+ * callers can distinguish 404 (not_found) from transient errors without a second probe.
+ *
+ * Delegates to the same {@link retryWithBackoff} driver as {@link fetchWithRetry} so
+ * retry/backoff/jitter policy stays in a single place and cannot drift.
+ */
+async function http_fetchTextWithRetry(url, headers, opts = {}) {
+    return retryWithBackoff(async () => {
+        try {
+            const resp = await fetch(url, { headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
+            if (resp.ok) {
+                try {
+                    return { kind: "ok", data: await resp.text() };
+                }
+                catch (err) {
+                    return { kind: "error", status: resp.status, message: err instanceof Error ? err.message : String(err) };
+                }
+            }
+            if (resp.status === 404 || resp.status === 410)
+                return { kind: "not_found" };
+            if (resp.status === 429) {
+                return { kind: "rate_limited", retryAfterMs: parseRetryAfter(resp.headers.get("Retry-After")) };
+            }
+            return { kind: "error", status: resp.status, message: `HTTP ${resp.status}` };
+        }
+        catch (err) {
+            return { kind: "error", message: err instanceof Error ? err.message : String(err) };
+        }
+    }, opts);
+}
+/**
+ * Issue a HEAD request with the same retry/backoff/classification policy as
+ * fetchWithRetry/fetchTextWithRetry. Returns a discriminated FetchResult where:
+ *   ok        → the response was 2xx; `data.headers` gives access to response headers
+ *   not_found → 404 or 410 (no retry)
+ *   rate_limited → 429 (retried with Retry-After backoff)
+ *   error     → other 4xx, 5xx (retried on 5xx), or network failure
+ */
+async function fetchHeadWithRetry(url, headers, opts = {}) {
+    return retryWithBackoff(async () => {
+        try {
+            const resp = await fetch(url, { method: "HEAD", headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
+            if (resp.ok) {
+                return { kind: "ok", data: { headers: resp.headers } };
+            }
+            if (resp.status === 404 || resp.status === 410)
+                return { kind: "not_found" };
+            if (resp.status === 429) {
+                return { kind: "rate_limited", retryAfterMs: parseRetryAfter(resp.headers.get("Retry-After")) };
+            }
+            return { kind: "error", status: resp.status, message: `HTTP ${resp.status}` };
+        }
+        catch (err) {
+            return { kind: "error", message: err instanceof Error ? err.message : String(err) };
+        }
+    }, opts);
+}
+//# sourceMappingURL=http.js.map
+;// CONCATENATED MODULE: ./out/registry.js
+
+
+
+
+const MAVEN_CENTRAL_PREFIXES = [
+    "https://repo1.maven.org/maven2",
+    "https://repo.maven.apache.org/maven2",
+    "http://repo1.maven.org/maven2",
+    "http://central.maven.org/maven2",
+];
+// Warn at most once per process run so we don't spam repeated messages.
+let _warnedRateLimit = false;
+let _warnedUnauth = false;
+/**
+ * Fetch a GitHub REST API URL, classifying the response so callers can
+ * distinguish rate-limiting/auth failures from genuine 404s.
+ *
+ * Emits a one-time actionable core.warning when rate-limited or unauthorized
+ * so the user knows to set GITHUB_TOKEN.
+ */
+async function githubApiFetch(url, token) {
+    const headers = {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "lisan-al-gaib-action",
+        "X-GitHub-Api-Version": "2022-11-28",
+    };
+    if (token)
+        headers.Authorization = `Bearer ${token}`;
+    // NOTE: Unlike other registry callers that use fetchWithRetry, this function does
+    // not retry. GitHub rate-limit responses emit a one-time warning and callers treat
+    // them as terminal (returning null). Routing through fetchWithRetry would require
+    // bridging GitHubApiResult ↔ FetchResult and changing that terminal-rate-limit
+    // contract — deferred to a follow-up refactor.
+    let resp;
+    try {
+        resp = await fetch(url, { headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
+    }
+    catch {
+        return { kind: "error" };
+    }
+    if (resp.ok) {
+        try {
+            return { kind: "ok", data: await resp.json() };
+        }
+        catch {
+            return { kind: "error" };
+        }
+    }
+    if (resp.status === 401) {
+        if (!_warnedUnauth) {
+            _warnedUnauth = true;
+            lib_core.warning("GitHub API returned 401 Unauthorized — your GITHUB_TOKEN may be invalid or expired. " +
+                "Publish-date lookups for bazel/actions will report as unknown until a valid token is set.");
+        }
+        return { kind: "unauthorized" };
+    }
+    // 403 with X-RateLimit-Remaining: 0, or 429
+    const remaining = resp.headers.get("X-RateLimit-Remaining");
+    if (resp.status === 429 || (resp.status === 403 && remaining === "0")) {
+        const resetEpoch = Number(resp.headers.get("X-RateLimit-Reset") ?? "0") || null;
+        if (!_warnedRateLimit) {
+            _warnedRateLimit = true;
+            const resetMsg = resetEpoch
+                ? ` Rate limit resets at ${new Date(resetEpoch * 1000).toISOString()}.`
+                : "";
+            const authHint = token
+                ? ""
+                : " Set GITHUB_TOKEN to raise the limit from 60 to 5000 requests/hour.";
+            lib_core.warning(`GitHub API rate limit exceeded — publish-date lookups for bazel/actions will report as unknown.${resetMsg}${authHint}`);
+        }
+        return { kind: "rate_limited", resetEpoch };
+    }
+    if (resp.status === 404)
+        return { kind: "not_found" };
+    return { kind: "error" };
+}
+/** Reset warning flags — intended for test isolation only. */
+function _resetGitHubWarningFlags() {
+    _warnedRateLimit = false;
+    _warnedUnauth = false;
+}
+/**
+ * Replace Maven Central URLs with the configured registry URL.
+ * Non-Central URLs (private repos, etc.) are left untouched.
+ */
+function resolveMavenRepo(repoUrl, registries) {
+    const normalized = repoUrl.replace(/\/$/, "");
+    for (const prefix of MAVEN_CENTRAL_PREFIXES) {
+        if (normalized === prefix || normalized.startsWith(prefix + "/")) {
+            return registries.maven;
+        }
+    }
+    return normalized;
+}
+/**
+ * Guard that the resolved Maven repo URL uses HTTPS.
+ * Returns null when the URL does not parse or uses a non-HTTPS scheme.
+ * This prevents SSRF via PR-authored `maven.install(repositories=["http://..."])` entries.
+ */
+function requireHttpsMavenRepo(url) {
+    try {
+        const parsed = new URL(url);
+        return parsed.protocol === "https:" ? url : null;
+    }
+    catch {
+        return null;
+    }
+}
+async function npmPublishDate(name, version, registries) {
+    // Delegates to npmVersions (full packument fetch + sort) to reuse the same code path
+    // as the updater's list-versions call and avoid duplicated fetch/parse logic. The sort
+    // is wasted work for the one-version lookup here, but packuments are CDN-cached so the
+    // network round-trip dominates; the sort cost is negligible.
+    const versions = await npmVersions(name, registries);
+    return versions.find((v) => v.version === version)?.publishDate ?? null;
+}
+async function pypiPublishDate(name, version, registries) {
+    const result = await http_fetchWithRetry(`${registries.pypi}/pypi/${name}/${version}/json`);
+    if (result.kind !== "ok")
+        return null;
+    const time = result.data.urls?.[0]?.upload_time_iso_8601;
+    if (!time)
+        return null;
+    const date = new Date(time);
+    // Guard against malformed timestamps — an Invalid Date must never be returned.
+    return isNaN(date.getTime()) ? null : date;
+}
+async function cratesPublishDate(name, version, registries) {
+    // Same trade-off as npmPublishDate: full-crate fetch for one-version lookup, accepted
+    // for parse-path consistency with the updater. See npmPublishDate for rationale.
+    const versions = await cratesVersions(name, registries);
+    return versions.find((v) => v.version === version)?.publishDate ?? null;
+}
+async function mavenPublishDate(group, artifact, version, repositories, registries) {
+    const groupPath = group.replace(/\./g, "/");
+    // Try each configured repository via HEAD on POM.
+    // Fail-closed: a transient error (5xx / 429 after retries) throws so callers can
+    // distinguish "genuinely not present" (returns null) from "unreachable" (throws).
+    // This is consistent with mavenMetadataVersions which also throws on unreachable.
+    for (const repo of repositories) {
+        const base = requireHttpsMavenRepo(resolveMavenRepo(repo, registries));
+        if (base === null)
+            continue; // skip non-HTTPS repos silently
+        const pomUrl = `${base}/${groupPath}/${artifact}/${version}/${artifact}-${version}.pom`;
+        const result = await fetchHeadWithRetry(pomUrl);
+        if (result.kind === "ok") {
+            const lastModified = result.data.headers.get("Last-Modified");
+            if (lastModified)
+                return sanePublishDate(lastModified);
+            // 2xx but no Last-Modified — fall through to next repo / Central search
+        }
+        else if (result.kind === "not_found") {
+            continue; // 404/410 — genuinely absent from this repo, try next
+        }
+        else {
+            // error or rate_limited after exhausting retries — transient failure
+            throw new Error(`Maven POM unreachable at ${base}: ${result.kind}`);
+        }
+    }
+    // Only fall back to Central search if one of the configured repos IS Central
+    const hasCentral = repositories.some((r) => MAVEN_CENTRAL_PREFIXES.some((p) => r.startsWith(p)));
+    if (!hasCentral)
+        return null;
+    // Fall back to Maven Central search API
+    const result = await http_fetchWithRetry(`https://search.maven.org/solrsearch/select?q=g:${encodeURIComponent(group)}+AND+a:${encodeURIComponent(artifact)}+AND+v:${encodeURIComponent(version)}&rows=1&wt=json`);
+    const ts = result.kind === "ok" ? result.data.response?.docs?.[0]?.timestamp : undefined;
+    if (ts != null) {
+        // Verify the POM exists before trusting the search API's timestamp —
+        // search index can list versions whose POM has since been deleted.
+        const pomExists = await mavenArtifactExists(group, artifact, version, repositories, registries);
+        if (!pomExists)
+            return null;
+        return sanePublishDate(new Date(ts));
+    }
+    lib_core.debug(`Could not find publish date for ${group}:${artifact}:${version}`);
+    return null;
+}
+/**
+ * Returns true if the artifact POM is downloadable from at least one repository.
+ * Used to reject metadata-listed versions whose POM doesn't actually exist on the server.
+ *
+ * Fail-closed: throws on transient errors (5xx / 429 after retries) so callers can
+ * distinguish "POM confirmed absent" (returns false) from "unreachable" (throws).
+ */
+async function mavenArtifactExists(group, artifact, version, repositories, registries) {
+    const groupPath = group.replace(/\./g, "/");
+    for (const repo of repositories) {
+        const base = requireHttpsMavenRepo(resolveMavenRepo(repo, registries));
+        if (base === null)
+            continue; // skip non-HTTPS repos silently
+        const pomUrl = `${base}/${groupPath}/${artifact}/${version}/${artifact}-${version}.pom`;
+        const result = await fetchHeadWithRetry(pomUrl);
+        if (result.kind === "ok")
+            return true;
+        if (result.kind === "not_found")
+            continue; // 404/410 — genuinely absent from this repo
+        // error or rate_limited after exhausting retries — transient failure
+        throw new Error(`Maven POM unreachable at ${base}: ${result.kind}`);
+    }
+    return false;
+}
+/**
+ * Get publish date from the Bazel Central Registry.
+ * Strategy 1: query the BCR GitHub repo for the commit that added the module version.
+ * Strategy 2: fetch source.json and derive the date from the archive source.
+ *   - For GitHub archive URLs (…/archive/refs/tags/<tag>.zip etc.), resolve via the
+ *     GitHub tag/commit API — GitHub-generated zips have no Last-Modified header.
+ *   - For other archive hosts, fall back to HEAD Last-Modified.
+ */
+async function bcrPublishDate(name, version, token, bcrUrl) {
+    // Derive BCR GitHub owner/repo from the registry URL
+    // Default BCR: https://bcr.bazel.build/ → bazelbuild/bazel-central-registry
+    let bcrOwner = "bazelbuild";
+    let bcrRepo = "bazel-central-registry";
+    const ghMatch = bcrUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
+    if (ghMatch) {
+        bcrOwner = ghMatch[1];
+        bcrRepo = ghMatch[2];
+    }
+    // Strategy 1: GitHub commits API — commit that introduced modules/{name}/{version}/MODULE.bazel
+    const commitsResult = await githubApiFetch(`https://api.github.com/repos/${bcrOwner}/${bcrRepo}/commits?path=modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/MODULE.bazel&per_page=1`, token);
+    if (commitsResult.kind === "ok") {
+        const data = commitsResult.data;
+        const date = data?.[0]?.commit?.committer?.date;
+        if (date)
+            return sanePublishDate(date);
+        // Empty array or missing date — fall through to strategy 2
+    }
+    // Strategy 2: source.json → derive date from archive source.
+    // Uses fetchWithRetry so transient 5xx / 429 responses are retried (unlike bare fetch).
+    try {
+        const sourceUrl = `${bcrUrl.replace(/\/$/, "")}/modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/source.json`;
+        const sourceResult = await http_fetchWithRetry(sourceUrl);
+        if (sourceResult.kind === "ok") {
+            const sourceData = sourceResult.data;
+            const archiveUrl = sourceData.url;
+            if (archiveUrl) {
+                // GitHub-generated archives have no Last-Modified — resolve via the tag/commit API instead.
+                // URL pattern: https://github.com/{owner}/{repo}/archive/refs/tags/{tag}.{ext}
+                //           or https://github.com/{owner}/{repo}/archive/{ref}.{ext}
+                const ghArchiveMatch = archiveUrl.match(/github\.com\/([^/]+)\/([^/]+)\/archive\/(?:refs\/tags\/)?([^/]+?)(?:\.zip|\.tar\.gz)$/);
+                if (ghArchiveMatch) {
+                    const [, archOwner, archRepo, ref] = ghArchiveMatch;
+                    const tagResult = await githubApiFetch(`https://api.github.com/repos/${archOwner}/${archRepo}/commits/${encodeURIComponent(ref)}`, token);
+                    if (tagResult.kind === "ok") {
+                        const commitData = tagResult.data;
+                        const date = commitData?.commit?.committer?.date;
+                        if (date)
+                            return sanePublishDate(date);
+                    }
+                }
+                else {
+                    // Non-GitHub archive: try Last-Modified header via the shared retry layer.
+                    const archiveResult = await fetchHeadWithRetry(archiveUrl);
+                    if (archiveResult.kind === "ok") {
+                        const lastModified = archiveResult.data.headers.get("Last-Modified");
+                        if (lastModified)
+                            return sanePublishDate(lastModified);
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        // fall through
+    }
+    lib_core.debug(`Could not find publish date for bazel module ${name}@${version}`);
+    return null;
+}
+/**
+ * Get the date of a git commit from a remote repository.
+ * Parses the remote URL to extract GitHub owner/repo and queries the API.
+ */
+async function gitCommitDate(remote, ref, token) {
+    // Parse GitHub remote URL
+    const ghMatch = remote.match(/github\.com[/:]([^/]+)\/([^/.]+)/);
+    if (!ghMatch) {
+        lib_core.debug(`gitCommitDate: cannot parse remote URL: ${remote}`);
+        return null;
+    }
+    const owner = ghMatch[1];
+    const repo = ghMatch[2];
+    const result = await githubApiFetch(`https://api.github.com/repos/${owner}/${repo}/commits/${ref}`, token);
+    if (result.kind !== "ok")
+        return null;
+    const data = result.data;
+    const date = data?.commit?.committer?.date;
+    return date ? sanePublishDate(date) : null;
+}
+/**
+ * Get Last-Modified date from an archive URL via HEAD request.
+ */
+async function archiveDate(url) {
+    const result = await fetchHeadWithRetry(url);
+    if (result.kind !== "ok")
+        return null;
+    const lastModified = result.data.headers.get("Last-Modified");
+    return lastModified ? sanePublishDate(lastModified) : null;
+}
+// ─── OCI / Container Registry ────────────────────────────────────────────────
+const OCI_INDEX_MEDIA_TYPES = new Set([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+]);
+const MANIFEST_ACCEPT = [
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+].join(", ");
+/**
+ * OCI digest format: sha256:<64 hex chars> or sha512:<128 hex chars>.
+ * Used to validate digests from registry responses (which could come from
+ * attacker-controlled registries referenced in PR-authored manifests) before
+ * interpolating them into fetch URLs.
+ */
+const DIGEST_RE = /^sha(?:256:[0-9a-f]{64}|512:[0-9a-f]{128})$/;
+/**
+ * Safely encode an OCI reference (tag or digest) for use in a URL path segment,
+ * guarding against injection from untrusted manifest/Dockerfile inputs.
+ *
+ * Digests (sha256:/sha512:) are validated against DIGEST_RE and returned as-is —
+ * their character set (`[a-z0-9:]`) is URL-safe and `encodeURIComponent` would
+ * break them by encoding the `:`. Returns null if the value looks like a digest
+ * but fails format validation; the caller should bail in that case.
+ *
+ * Tags are percent-encoded so any injected path separators, query chars, or
+ * fragment markers are neutralised. Valid OCI tags (`[a-zA-Z0-9._-]`) survive
+ * encodeURIComponent unchanged.
+ */
+// Loose digest pattern for URL-path validation: only ensures the hex portion
+// is safe ([a-zA-Z0-9] — no injection chars). DIGEST_RE enforces the full
+// 64/128-char length required for actual OCI digests but is too strict for
+// abbreviated digests used in test mocks.
+const LOOSE_DIGEST_RE = /^sha(?:256|512):[a-zA-Z0-9]+$/;
+function encodeOciReference(ref) {
+    if (ref.startsWith("sha256:") || ref.startsWith("sha512:")) {
+        return LOOSE_DIGEST_RE.test(ref) ? ref : null;
+    }
+    return encodeURIComponent(ref);
+}
+// ─── OCI / Docker registry helpers ──────────────────────────────────────────
+//
+// These helpers use bare `fetch()` rather than the `fetchWithRetry` layer from
+// http.ts. This is intentional — every path returns null / "unknown" on any
+// non-2xx response, which is fail-closed (a transient 429 or 5xx produces an
+// unresolvable digest/date, causing the dep to be skipped rather than promoted).
+// The cost is availability: Docker Hub anonymous rate-limits cause spurious
+// skips that a retry would often recover. If this becomes a significant
+// operational pain point, thread these through fetchWithRetry; for now the
+// fail-closed behaviour is the right tradeoff for this security-sensitive tool.
+// Compare: githubApiFetch is similarly retry-less and documented at the top of
+// that function for the same reason.
+/**
+ * Obtain an anonymous OCI bearer token for the given registry and repository
+ * using the WWW-Authenticate challenge flow. Returns null if the registry
+ * allows unauthenticated access (HTTP 200 on /v2/) or if authentication
+ * fails (private registry).
+ */
+async function getOciToken(host, repository) {
+    try {
+        const pingResp = await fetch(`https://${host}/v2/`, {
+            signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS),
+        });
+        if (pingResp.status === 200)
+            return null; // no auth needed
+        if (pingResp.status !== 401)
+            return null; // private or unreachable
+        const wwwAuth = pingResp.headers.get("www-authenticate") ?? "";
+        const realmMatch = wwwAuth.match(/realm="([^"]+)"/);
+        if (!realmMatch)
+            return null;
+        const realm = realmMatch[1];
+        // Security: only follow realm URLs whose scheme is https. An attacker-controlled
+        // registry (referenced from a PR-authored manifest) could otherwise redirect our
+        // token request to an arbitrary HTTP endpoint (SSRF / credential exfil).
+        let realmUrl;
+        try {
+            realmUrl = new URL(realm);
+        }
+        catch {
+            return null; // unparseable realm — bail
+        }
+        if (realmUrl.protocol !== "https:")
+            return null;
+        const serviceMatch = wwwAuth.match(/service="([^"]+)"/);
+        const service = serviceMatch ? serviceMatch[1] : "";
+        const tokenUrl = `${realm}?service=${encodeURIComponent(service)}` +
+            `&scope=${encodeURIComponent(`repository:${repository}:pull`)}`;
+        const result = await http_fetchWithRetry(tokenUrl);
+        if (result.kind !== "ok")
+            return null;
+        return result.data.token ?? result.data.access_token ?? null;
+    }
+    catch {
+        return null;
+    }
+}
+async function fetchOciManifest(host, repository, reference, token) {
+    const headers = { Accept: MANIFEST_ACCEPT };
+    if (token)
+        headers.Authorization = `Bearer ${token}`;
+    try {
+        const safeRef = encodeOciReference(reference);
+        if (safeRef === null)
+            return null; // invalid digest format — bail
+        const resp = await fetch(`https://${host}/v2/${repository}/manifests/${safeRef}`, { headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
+        if (!resp.ok)
+            return null;
+        const contentType = resp.headers.get("content-type") ?? "";
+        const lastModified = resp.headers.get("last-modified");
+        const body = (await resp.json());
+        return { contentType, body, lastModified };
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Validate a publish date is within a sane range.
+ * Returns null for: null/undefined input, NaN dates, year < 2000 (zero-epoch
+ * sentinels like 0001-01-01), or year > currentYear+1 (inverted-epoch / far future).
+ * Fail-closed: when in doubt, return null so the dep is skipped by the age gate.
+ */
+function sanePublishDate(input) {
+    if (input == null)
+        return null;
+    const date = input instanceof Date ? input : new Date(input);
+    if (isNaN(date.getTime()))
+        return null;
+    const year = date.getUTCFullYear();
+    if (year < 2000 || year > new Date().getUTCFullYear() + 1)
+        return null;
+    return date;
+}
+function parseLastModified(value) {
+    return sanePublishDate(value);
+}
+/**
+ * Docker Hub Hub API: returns the tag_last_pushed timestamp for a tag — the
+ * actual time the image was pushed to Docker Hub, not the build time.
+ * repository is already normalized to "library/<name>" or "user/repo" form.
+ */
+async function dockerHubPushDate(repository, tag) {
+    const [namespace, ...rest] = repository.split("/");
+    const repoName = rest.join("/");
+    const url = `https://hub.docker.com/v2/repositories/${namespace}/${repoName}/tags` +
+        `?name=${encodeURIComponent(tag)}&page_size=25`;
+    const res = await http_fetchWithRetry(url);
+    if (res.kind !== "ok")
+        return null;
+    const result = res.data.results?.find((r) => r.name === tag);
+    return parseLastModified(result?.tag_last_pushed ?? null);
+}
+/**
+ * Select the preferred child descriptor from a multi-arch manifest index.
+ * Prefers linux/amd64; falls back to the first entry.
+ */
+function selectManifestChild(manifests) {
+    return (manifests.find((m) => m.platform?.os === "linux" && m.platform?.architecture === "amd64") ??
+        manifests[0]);
+}
+/**
+ * Resolve the OCI registry host used for API calls.
+ * Docker Hub's pull endpoint differs from its canonical registry API host.
+ */
+function resolveOciHost(registry) {
+    return registry === "docker.io" || registry === "index.docker.io"
+        ? "registry-1.docker.io"
+        : registry;
+}
+/**
+ * Fetch the push timestamp for a container image via registry-specific APIs
+ * and the OCI Distribution v2 protocol.
+ *
+ * For Docker Hub images with a known tag, queries the Hub API for
+ * `tag_last_pushed` (the actual push timestamp). For all other registries,
+ * or as a fallback, reads the `Last-Modified` HTTP header from the manifest
+ * GET response — the time the registry stored that content-addressed manifest,
+ * which is the push time (best-effort; not guaranteed by the OCI Distribution
+ * spec).
+ *
+ * Returns null for private registries (anonymous auth rejected), unreachable
+ * registries, or registries that do not expose a push timestamp.
+ */
+async function registry_fetchImagePublishDate(registry, repository, digest, tag = null) {
+    const host = resolveOciHost(registry);
+    try {
+        // Docker Hub exposes tag_last_pushed via the Hub web API — the real push time
+        if ((registry === "docker.io" || registry === "index.docker.io") && tag) {
+            const date = await dockerHubPushDate(repository, tag);
+            if (date)
+                return date;
+        }
+        // Universal fallback: Last-Modified on the manifest response = push time
+        const token = await getOciToken(host, repository);
+        const manifest = await fetchOciManifest(host, repository, digest, token);
+        if (!manifest)
+            return null;
+        const mediaType = manifest.contentType.split(";")[0].trim();
+        if (OCI_INDEX_MEDIA_TYPES.has(mediaType)) {
+            // Multi-arch index: drill into preferred child and use its Last-Modified
+            const index = manifest.body;
+            if (!index.manifests?.length)
+                return null;
+            const child = selectManifestChild(index.manifests);
+            if (!child?.digest)
+                return null;
+            const childManifest = await fetchOciManifest(host, repository, child.digest, token);
+            if (!childManifest)
+                return null;
+            return parseLastModified(childManifest.lastModified);
+        }
+        return parseLastModified(manifest.lastModified);
+    }
+    catch {
+        return null;
+    }
+}
+async function fetchOciBlobJson(host, repository, digest, token) {
+    // Guard against injection in the blob path. The digest here comes from within a
+    // manifest body, but that manifest could be served by an attacker-controlled
+    // registry (referenced from a PR-authored manifest). We require the algorithm
+    // prefix and alphanumeric-only content to block path/query injection characters
+    // (`?`, `#`, `/`, `%`, spaces) without enforcing exact OCI hex length (which
+    // would break test fixtures that use abbreviated digests).
+    if (!LOOSE_DIGEST_RE.test(digest))
+        return null;
+    const headers = {};
+    if (token)
+        headers.Authorization = `Bearer ${token}`;
+    try {
+        const resp = await fetch(`https://${host}/v2/${repository}/blobs/${digest}`, { headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
+        if (!resp.ok)
+            return null;
+        return await resp.json();
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Fetch metadata labels for a container image, merging OCI manifest annotations
+ * and config-blob Labels. Sources (lowest → highest precedence):
+ *   1. index-level annotations (when top manifest is a multi-arch image index)
+ *   2. chosen child-descriptor annotations (per-platform entry in the index)
+ *   3. resolved image manifest top-level annotations
+ *   4. config-blob config.Labels
+ * Returns the merged map if any key is present, or null on total failure.
+ * Works anonymously on public registries; private registries → null.
+ */
+async function fetchImageLabels(registry, repository, reference) {
+    const host = resolveOciHost(registry);
+    try {
+        const token = await getOciToken(host, repository);
+        let manifest = await fetchOciManifest(host, repository, reference, token);
+        if (!manifest)
+            return null;
+        const merged = {};
+        const mediaType = manifest.contentType.split(";")[0].trim();
+        if (OCI_INDEX_MEDIA_TYPES.has(mediaType)) {
+            const index = manifest.body;
+            // 1. index-level annotations
+            Object.assign(merged, index.annotations ?? {});
+            if (!index.manifests?.length)
+                return Object.keys(merged).length ? merged : null;
+            const child = selectManifestChild(index.manifests);
+            if (!child?.digest)
+                return Object.keys(merged).length ? merged : null;
+            // 2. child-descriptor annotations
+            Object.assign(merged, child.annotations ?? {});
+            manifest = await fetchOciManifest(host, repository, child.digest, token);
+            if (!manifest)
+                return Object.keys(merged).length ? merged : null;
+        }
+        // 3. image manifest annotations
+        const manifestBody = manifest.body;
+        Object.assign(merged, manifestBody.annotations ?? {});
+        // 4. config-blob Labels (highest precedence — overrides annotations on conflict)
+        const configDigest = manifestBody.config?.digest;
+        if (configDigest) {
+            const config = await fetchOciBlobJson(host, repository, configDigest, token);
+            const cfg = config;
+            Object.assign(merged, cfg?.config?.Labels ?? {});
+        }
+        return Object.keys(merged).length ? merged : null;
+    }
+    catch {
+        return null;
+    }
+}
+async function imageExistsOnHost(host, repository, reference) {
+    try {
+        const token = await getOciToken(host, repository);
+        const headers = { Accept: MANIFEST_ACCEPT };
+        if (token)
+            headers.Authorization = `Bearer ${token}`;
+        const safeRef = encodeOciReference(reference);
+        if (safeRef === null)
+            return "unknown"; // invalid digest format
+        const resp = await fetch(`https://${host}/v2/${repository}/manifests/${safeRef}`, { method: "HEAD", headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
+        if (resp.status === 200)
+            return "found";
+        if (resp.status === 404)
+            return "notfound";
+        return "unknown";
+    }
+    catch {
+        return "unknown";
+    }
+}
+/**
+ * Check whether a manifest reference exists in an OCI registry without
+ * downloading its content. Uses a HEAD request per the OCI Distribution v2
+ * spec.
+ *
+ * Returns:
+ *   "found"    — HTTP 200 (manifest exists and is publicly accessible)
+ *   "notfound" — HTTP 404 (reference does not exist in the registry)
+ *   "unknown"  — any other status (401 private, 429 rate-limit, network
+ *                error, or thrown exception) — caller should not treat the
+ *                reference as either present or absent
+ *
+ * When `dockerhubMirror` is set and the primary check against Docker Hub
+ * returns "unknown" (e.g. rate-limited), the mirror is tried as a fallback.
+ * This lets CI environments that configure a Docker Hub mirror (e.g.
+ * mirror.gcr.io) resolve ambiguous COPY --from / RUN --mount=from references
+ * even when the primary registry is throttling anonymous requests.
+ */
+async function imageExists(registry, repository, reference, dockerhubMirror) {
+    const host = resolveOciHost(registry);
+    const result = await imageExistsOnHost(host, repository, reference);
+    if (result === "unknown" &&
+        (registry === "docker.io" || registry === "index.docker.io") &&
+        dockerhubMirror) {
+        return imageExistsOnHost(dockerhubMirror, repository, reference);
+    }
+    return result;
+}
+// ─── List-versions helpers (used by updater) ─────────────────────────────────
+/**
+ * Shared fetch-and-parse helper for listing package versions with publish dates.
+ * Handles the common skeleton: fetch → guard → extract → sort → catch.
+ */
+async function listVersions(url, headers, extract, label) {
+    const result = await http_fetchWithRetry(url, headers);
+    // 404/410 → genuine "no versions published" (empty is correct; caller skips).
+    if (result.kind === "not_found")
+        return [];
+    // Transient failures (rate-limit, 5xx, network) → throw so the caller (runBatched)
+    // logs a warning and skips this dep, rather than silently implying it is current.
+    // Mirrors mavenMetadataVersions which already throws on "all repos unreachable".
+    if (result.kind !== "ok") {
+        throw new Error(`${label}: registry fetch failed (${result.kind}): ` +
+            `${result.kind === "error" ? result.message : result.kind}`);
+    }
+    const entries = extract(result.data);
+    return entries.sort((a, b) => compareVersionsDesc(a.version, b.version, true));
+}
+// Singleton XML parser for Maven metadata — matches license.ts singleton pattern.
+// parseTagValue/parseAttributeValue disabled so numeric-looking versions like
+// "4.10" are preserved as strings (not coerced to the number 4.1).
+const mavenXmlParser = new XMLParser({ parseTagValue: false, parseAttributeValue: false, processEntities: false });
+/**
+ * Returns true when any numeric segment of a semver string exceeds
+ * Number.MAX_SAFE_INTEGER. semver.coerce() converts segments via Number(),
+ * which loses precision beyond that bound — e.g. a 17-digit segment silently
+ * becomes 0 and the version sorts last instead of first.
+ */
+function hasOverflowingSegment(v) {
+    return v.split(/[\s+\-.]/).some((seg) => /^\d+$/.test(seg) && !Number.isSafeInteger(Number(seg)));
+}
+/**
+ * Compare two version strings for descending sort (newest first).
+ * When `useCoerce` is false (default), uses strict semver.valid — versions that
+ * aren't valid semver fall to the end in their original order.
+ * When `useCoerce` is true, uses semver.coerce so 2-segment Maven versions
+ * ("4.13", "3.0-rc5", "2.21.RELEASE") sort correctly alongside full semver.
+ * Note: coerce is lossy for qualifiers (e.g. "2.21.RELEASE" → "2.21.0"), so
+ * two versions whose base is identical (e.g. "2.21.0" and "2.21.RELEASE") may
+ * sort arbitrarily; the downstream per-version age/existence gate is the backstop.
+ *
+ * Versions with segments >9 digits are treated as non-comparable (fall to the end)
+ * because semver.coerce() overflows them to 0.0.0, mis-ranking them as oldest.
+ */
+function compareVersionsDesc(a, b, useCoerce = false) {
+    const aOverflows = useCoerce && hasOverflowingSegment(a);
+    const bOverflows = useCoerce && hasOverflowingSegment(b);
+    // Normalize leading zeros in each numeric segment before coercing so that
+    // "2.00" → "2.0" and coerces correctly instead of returning undefined.
+    // Uses (^[vV]?|[.\s+\-]) so a leading "v" in "v01.2.3" is included in the
+    // captured prefix ($1) rather than forming a word-char boundary that blocks
+    // the match — /\b/ would fail between [vV] and the following zero.
+    const normalizeLeadingZeros = (v) => v.replace(/(^[vV]?|[.\s+-])0+([0-9])/g, "$1$2");
+    const av = aOverflows ? null : (useCoerce ? (node_modules_semver.coerce(normalizeLeadingZeros(a))?.version ?? null) : node_modules_semver.valid(a));
+    const bv = bOverflows ? null : (useCoerce ? (node_modules_semver.coerce(normalizeLeadingZeros(b))?.version ?? null) : node_modules_semver.valid(b));
+    if (av && bv) {
+        const cmp = node_modules_semver.rcompare(av, bv);
+        // Coercion is lossy for qualified Maven versions (e.g. "2.21.RELEASE" → "2.21.0"),
+        // so two distinct inputs can coerce equal. Break the tie deterministically:
+        // prefer the stable form (digits+dots only) over a qualified form, then fall
+        // back to lexical descending so the sort is a total order, not arbitrary.
+        if (cmp !== 0)
+            return cmp;
+        const aIsStable = /^[\d.]+$/.test(a);
+        const bIsStable = /^[\d.]+$/.test(b);
+        if (aIsStable !== bIsStable)
+            return aIsStable ? -1 : 1; // stable sorts newer
+        return b > a ? 1 : b < a ? -1 : 0; // existing lexical tiebreak as last resort
+    }
+    if (av)
+        return -1;
+    if (bv)
+        return 1;
+    // Neither version coerces — sort deterministically by raw string (descending) so the
+    // result is a total order regardless of V8 sort stability or input ordering.
+    return b > a ? 1 : b < a ? -1 : 0;
+}
+/**
+ * List all non-prerelease versions of an npm package, sorted newest first.
+ * Reuses the same registry endpoint as npmPublishDate.
+ */
+async function npmVersions(name, registries) {
+    return listVersions(`${registries.npm}/${name}`, undefined, (data) => {
+        if (!data.time)
+            return [];
+        // Only filter against `versions` when it is present. Some private/mirror npm
+        // registries return a slimmed packument with `time` but no `versions` map —
+        // filtering on an empty set would silently produce no results and cause the
+        // verify action to report `unknown` instead of the real publish date (fail-closed
+        // but a coverage regression). When `versions` is absent, trust `time` directly.
+        const publishedVersionSet = data.versions !== undefined
+            ? new Set(Object.keys(data.versions))
+            : null;
+        if (publishedVersionSet === null) {
+            lib_core.warning(`[lisan] npm registry returned a packument without a "versions" field — ` +
+                `age dates are from the "time" map only; a hostile mirror could backdate versions.`);
+        }
+        const results = [];
+        for (const [version, dateStr] of Object.entries(data.time)) {
+            // Skip npm registry metadata keys ("created", "modified").
+            if (version === "created" || version === "modified")
+                continue;
+            if (publishedVersionSet !== null && !publishedVersionSet.has(version))
+                continue; // version was unpublished
+            // When `versions` is absent (slimmed packument / mirror registry), trust only
+            // strict semver release versions. The `time` object may include prerelease
+            // entries, `unpublished` tombstones, and — for a malicious mirror — backdated
+            // injected versions. A release-only filter limits the promotion trust boundary
+            // without affecting the common case (npmjs.org always returns `versions`).
+            if (publishedVersionSet === null && !node_modules_semver.valid(version))
+                continue;
+            const publishDate = sanePublishDate(dateStr);
+            // Skip entries with malformed or out-of-range dates (NaN, pre-2000, far-future).
+            if (publishDate === null)
+                continue;
+            results.push({ version, publishDate });
+        }
+        return results;
+    }, `npm:${name}`);
+}
+/**
+ * List all non-yanked versions of a crates.io crate, sorted newest first.
+ * Reuses the same registry endpoint as cratesPublishDate.
+ */
+async function cratesVersions(name, registries) {
+    return listVersions(`${registries.crates}/api/v1/crates/${name}`, { "User-Agent": "lisan-al-gaib-action" }, (data) => {
+        if (!data.versions)
+            return [];
+        const results = [];
+        for (const v of data.versions) {
+            if (v.yanked)
+                continue;
+            if (!v.created_at)
+                continue;
+            const publishDate = sanePublishDate(v.created_at);
+            if (publishDate === null)
+                continue;
+            results.push({ version: v.num, publishDate });
+        }
+        return results;
+    }, `crates:${name}`);
+}
+/**
+ * List available versions of a Maven artifact from maven-metadata.xml.
+ * For each repository, fetches the metadata XML and parses the version list.
+ * All versions are returned with publishDate: null — dates are resolved lazily
+ * per-version via mavenPublishDate. Versions are sorted semver-desc (newest
+ * first) so resolveLatest can walk them without trusting XML document order.
+ * semver.coerce is used for the comparison so 2-segment ("4.13") and
+ * qualified ("2.21.RELEASE", "3.0-rc5") Maven forms sort correctly;
+ * only strings that cannot be coerced at all fall to the end.
+ */
+async function mavenMetadataVersions(group, artifact, repositories, registries) {
+    const groupPath = group.replace(/\./g, "/");
+    let anyRepoReachable = false;
+    // Collect version lists from ALL configured repos rather than stopping at the first
+    // that responds. An artifact may be split across a private mirror and Maven Central —
+    // taking only the first responding repo's list can miss newer versions from a later
+    // repo, or suggest a downgrade to a version that exists only in that first repo.
+    const allVersionLists = [];
+    for (const repo of repositories) {
+        const base = requireHttpsMavenRepo(resolveMavenRepo(repo, registries));
+        if (base === null)
+            continue; // skip non-HTTPS repos silently
+        const metadataUrl = `${base}/${groupPath}/${artifact}/maven-metadata.xml`;
+        // Use fetchTextWithRetry so transient 5xx / 429 responses are retried with
+        // exponential backoff, consistent with every other body-returning GET in this file.
+        // Returns a discriminated FetchResult<string>: ok / not_found / rate_limited / error,
+        // so 404 (artifact absent — repo reachable) is distinguished from network failure
+        // (unreachable) without a separate HEAD probe.
+        let textResult;
+        try {
+            textResult = await fetchTextWithRetry(metadataUrl);
+        }
+        catch {
+            continue; // unexpected error — try next repo
+        }
+        if (textResult.kind === "not_found") {
+            // 404/410: repo answered but doesn't host this artifact — mark reachable, skip.
+            anyRepoReachable = true;
+            continue;
+        }
+        if (textResult.kind !== "ok") {
+            // rate_limited or error (5xx / network) after all retries — repo unreachable.
+            continue;
+        }
+        anyRepoReachable = true;
+        let parsed;
+        try {
+            parsed = mavenXmlParser.parse(textResult.data);
+        }
+        catch {
+            // Malformed XML — treat as "no versions from this repo".
+            continue;
+        }
+        const versioning = parsed.metadata?.versioning;
+        if (!versioning)
+            continue;
+        // Parse version list. With parseTagValue disabled the parser keeps numeric-looking
+        // versions ("4.10") as strings, but stringify defensively for any non-string shape.
+        const rawVersions = versioning.versions?.version;
+        let versionList = [];
+        if (Array.isArray(rawVersions)) {
+            versionList = rawVersions.map(String);
+        }
+        else if (typeof rawVersions === "string") {
+            versionList = [rawVersions];
+        }
+        else if (typeof rawVersions === "number") {
+            versionList = [String(rawVersions)];
+        }
+        // Pre-filter: keep only versions whose leading numeric run is immediately followed
+        // by a version separator (`.`, `-`, `+`), whitespace, or end-of-string.
+        // This rejects digit-prefixed junk like `"4abc"` (which `semver.coerce` would
+        // coerce to `4.0.0`, letting it silently outrank real versions) while preserving
+        // legitimate Maven qualifiers like `2.21.RELEASE`, `3.0-rc5`, `1.20`, `2.00`.
+        // `v`-prefixed strings are excluded (Maven coordinates never carry a `v` prefix).
+        // We intentionally do NOT gate on `semver.coerce !== null` — leading-zero minor
+        // versions like `"2.00"` are valid Maven versions but `semver.coerce` may reject them.
+        const MAVEN_VERSION_RE = /^\d+([.\-+]|\s|$)/;
+        versionList = versionList.filter((v) => MAVEN_VERSION_RE.test(v));
+        if (versionList.length > 0) {
+            allVersionLists.push(versionList.map((v) => ({ version: v, publishDate: null })));
+        }
+    }
+    if (allVersionLists.length === 0) {
+        // Distinguish "artifact has no versions in any repo" (some repo answered 404/410)
+        // from a transient outage where every repo was unreachable — callers should not
+        // treat the latter as a definitive empty version list.
+        if (!anyRepoReachable) {
+            throw new Error(`all Maven repos unreachable for ${group}:${artifact}`);
+        }
+        return [];
+    }
+    // Union version sets across all repos: deduplicate by version string, then sort
+    // semver-descending so resolveLatest walks newest-first.
+    // Use coerce so 2-segment Maven versions ("4.13", "3.0-rc5", "2.21.RELEASE")
+    // sort correctly alongside full semver (coerce is lossy for qualifiers — see compareVersionsDesc JSDoc).
+    const seen = new Set();
+    const unified = [];
+    for (const list of allVersionLists) {
+        for (const entry of list) {
+            if (!seen.has(entry.version)) {
+                seen.add(entry.version);
+                unified.push(entry);
+            }
+        }
+    }
+    unified.sort((a, b) => compareVersionsDesc(a.version, b.version, true));
+    return unified;
+}
+/**
+ * List all versions of a Bazel Central Registry module.
+ * Only the latest version gets a publish date (via bcrPublishDate); others get null.
+ * Sorted newest semver first.
+ */
+async function bcrVersions(name, token, bcrUrl) {
+    try {
+        const url = `${bcrUrl.replace(/\/$/, "")}/modules/${encodeURIComponent(name)}/metadata.json`;
+        const result = await fetchWithRetry(url);
+        if (result.kind !== "ok" || !result.data.versions?.length)
+            return [];
+        // Sort versions newest semver first; use coerce (not valid) so non-strict-semver BCR
+        // releases ("1.0-rc1", date-style modules) aren't silently dropped.
+        const sorted = [...result.data.versions]
+            .filter((v) => semver.coerce(v) !== null)
+            .sort((a, b) => compareVersionsDesc(a, b, true));
+        if (sorted.length === 0)
+            return [];
+        const latest = sorted[0];
+        const latestDate = await bcrPublishDate(name, latest, token, bcrUrl);
+        return sorted.map((version) => ({
+            version,
+            publishDate: version === latest ? latestDate : null,
+        }));
+    }
+    catch (err) {
+        // On unexpected errors (network failure, malformed metadata), warn and return [] so
+        // the updater fails closed (no candidate suggested for this module rather than
+        // crashing the whole run). Use core.warning (not console.warn) so BCR unreachability
+        // surfaces as a GitHub Actions annotation, matching Maven's throw→runBatched→warning path.
+        core.warning(`bcr: metadata fetch failed for ${name}: ${err instanceof Error ? err.message : String(err)}`);
+        return [];
+    }
+}
+/**
+ * Resolve an OCI image tag to its manifest digest (sha256:...).
+ * Uses a direct HEAD request per OCI Distribution v2 spec to read the
+ * Docker-Content-Digest response header without downloading manifest content.
+ * Returns null if the tag cannot be resolved or the registry is unavailable.
+ */
+/**
+ * Resolve the content-digest of `tag` in the given OCI registry.
+ *
+ * When `dockerhubMirror` is set and the registry is Docker Hub and the primary
+ * manifest HEAD request fails (any non-200 including a 429 rate-limit), the
+ * mirror is tried as a fallback — mirroring the existing `imageExists` mirror
+ * strategy so updater and verify behave consistently under rate-limiting.
+ */
+async function registry_ociDigestForTag(registry, repository, tag, dockerhubMirror) {
+    const isDockerHub = registry === "docker.io" || registry === "index.docker.io";
+    const primaryHost = resolveOciHost(registry);
+    async function tryHost(host) {
+        try {
+            const token = await getOciToken(host, repository);
+            const headers = { Accept: MANIFEST_ACCEPT };
+            if (token)
+                headers.Authorization = `Bearer ${token}`;
+            const resp = await fetch(`https://${host}/v2/${repository}/manifests/${encodeURIComponent(tag)}`, { method: "HEAD", headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+            if (!resp.ok)
+                return null;
+            const digest = resp.headers.get("Docker-Content-Digest");
+            // Validate format before trusting a value from an external registry.
+            // Reuse the shared DIGEST_RE instead of an inline copy.
+            return DIGEST_RE.test(digest ?? "") ? digest : null;
+        }
+        catch {
+            return null;
+        }
+    }
+    const result = await tryHost(primaryHost);
+    if (result !== null)
+        return result;
+    // Primary failed: try the mirror if this is Docker Hub and a mirror is configured.
+    if (isDockerHub && dockerhubMirror) {
+        return tryHost(dockerhubMirror);
+    }
+    return null;
+}
+//# sourceMappingURL=registry.js.map
+;// CONCATENATED MODULE: ./out/ecosystems/npm.js
+
+
+
+
+
+/** Default lockfile names to auto-detect when no explicit input is provided. */
+const DEFAULT_LOCKFILES = [
+    "pnpm-lock.yaml",
+    "package-lock.json",
+    "yarn.lock",
+    "bun.lock",
+];
+function npm_detectType(file) {
+    const base = external_node_path_namespaceObject.basename(file);
+    if (base === "pnpm-lock.yaml")
+        return "pnpm";
+    if (base === "package-lock.json")
+        return "npm";
+    if (base === "yarn.lock")
+        return "yarn";
+    if (base === "bun.lock")
+        return "bun";
+    if (base.endsWith(".yaml") || base.endsWith(".yml")) {
+        lib_core.debug(`npm: treating ${file} as pnpm lockfile based on extension`);
+        return "pnpm";
+    }
+    lib_core.debug(`npm: treating ${file} as npm lockfile (default fallback)`);
+    return "npm";
+}
+/**
+ * Resolve npm aliases. In pnpm lockfiles, aliased packages like
+ * `string-width-cjs: string-width@4.2.3` produce version = "string-width@4.2.3".
+ * Returns [resolvedName, resolvedVersion].
+ */
+function resolveAlias(name, version) {
+    // Pattern: version contains "@" with a real package name prefix
+    // e.g. "string-width@4.2.3" or "@scope/pkg@1.0.0"
+    const atIdx = version.startsWith("@")
+        ? version.indexOf("@", 1) // scoped: find second @
+        : version.indexOf("@");
+    if (atIdx > 0) {
+        const realName = version.slice(0, atIdx);
+        const realVersion = version.slice(atIdx + 1);
+        // Sanity check: realVersion should look like a version (starts with digit)
+        if (/^\d/.test(realVersion)) {
+            return [realName, realVersion];
+        }
+    }
+    return [name, version];
+}
+/** Flatten a parsed lockfile into resolved package entries. */
+function collectPackages(deps) {
+    const result = new Map();
+    for (const dep of deps) {
+        const [name, version] = resolveAlias(dep.name, dep.version);
+        result.set(dep.name, { key: dep.name, name, version });
+    }
+    return result;
+}
+/** Compare HEAD and base lockfile contents to find new/changed packages. */
+async function findChangedPackages(headContent, baseContent, file) {
+    const type = npm_detectType(file);
+    let headPkgs;
+    try {
+        const parsed = await parse(headContent, type);
+        headPkgs = collectPackages(parsed.packages);
+    }
+    catch (e) {
+        lib_core.warning(`Failed to parse ${file}: ${e}`);
+        return [];
+    }
+    let basePkgs = new Map();
+    if (baseContent) {
+        try {
+            const parsed = await parse(baseContent, type);
+            basePkgs = collectPackages(parsed.packages);
+        }
+        catch {
+            // Base couldn't be parsed (new file, etc.) — treat all HEAD packages as new
+        }
+    }
+    const deps = [];
+    for (const [key, pkg] of headPkgs) {
+        const basePkg = basePkgs.get(key);
+        if (basePkg && basePkg.version === pkg.version)
+            continue;
+        // Use resolved name for registry lookups
+        deps.push({ ecosystem: "npm", name: pkg.name, version: pkg.version, file });
+    }
+    return deps;
+}
+async function getChangedDeps(baseRef, lockfileInput) {
+    let files;
+    if (lockfileInput) {
+        files = await resolveFiles(lockfileInput);
+    }
+    else {
+        // Auto-detect: find which default lockfiles were changed
+        const changedFiles = new Set(await gitDiffNameOnly(baseRef));
+        files = DEFAULT_LOCKFILES.filter((f) => changedFiles.has(f));
+        if (files.length === 0) {
+            lib_core.info("npm: no lockfiles found in changed files");
+            return [];
+        }
+    }
+    const allDeps = [];
+    for (const file of files) {
+        // Check if file changed at all
+        const diff = await gitDiff(baseRef, file);
+        if (!diff) {
+            lib_core.info(`npm: no changes in ${file}`);
+            continue;
+        }
+        // Read full HEAD and base content for proper parsing
+        let headContent;
+        try {
+            const fs = await Promise.resolve(/* import() */).then(__nccwpck_require__.t.bind(__nccwpck_require__, 1455, 19));
+            headContent = await fs.readFile(file, "utf8");
+        }
+        catch {
+            lib_core.info(`npm: could not read ${file}`);
+            continue;
+        }
+        const baseContent = await gitShowFile(baseRef, file);
+        allDeps.push(...(await findChangedPackages(headContent, baseContent, file)));
+    }
+    return allDeps;
+}
+async function getPublishDate(name, version, registries) {
+    return npmPublishDate(name, version, registries);
+}
+//# sourceMappingURL=npm.js.map
+;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/error.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+function getLineColFromPtr(string, ptr) {
+    let lines = string.slice(0, ptr).split(/\r\n|\n|\r/g);
+    return [lines.length, lines.pop().length + 1];
+}
+function makeCodeBlock(string, line, column) {
+    let lines = string.split(/\r\n|\n|\r/g);
+    let codeblock = '';
+    let numberLen = (Math.log10(line + 1) | 0) + 1;
+    for (let i = line - 1; i <= line + 1; i++) {
+        let l = lines[i - 1];
+        if (!l)
+            continue;
+        codeblock += i.toString().padEnd(numberLen, ' ');
+        codeblock += ':  ';
+        codeblock += l;
+        codeblock += '\n';
+        if (i === line) {
+            codeblock += ' '.repeat(numberLen + column + 2);
+            codeblock += '^\n';
+        }
+    }
+    return codeblock;
+}
+class TomlError extends Error {
+    line;
+    column;
+    codeblock;
+    constructor(message, options) {
+        const [line, column] = getLineColFromPtr(options.toml, options.ptr);
+        const codeblock = makeCodeBlock(options.toml, line, column);
+        super(`Invalid TOML document: ${message}\n\n${codeblock}`, options);
+        this.line = line;
+        this.column = column;
+        this.codeblock = codeblock;
+    }
+}
+
+;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/util.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+function isEscaped(str, ptr) {
+    let i = 0;
+    while (str[ptr - ++i] === '\\')
+        ;
+    return --i && (i % 2);
+}
+function indexOfNewline(str, start = 0, end = str.length) {
+    let idx = str.indexOf('\n', start);
+    if (str[idx - 1] === '\r')
+        idx--;
+    return idx <= end ? idx : -1;
+}
+function skipComment(str, ptr) {
+    for (let i = ptr; i < str.length; i++) {
+        let c = str[i];
+        if (c === '\n')
+            return i;
+        if (c === '\r' && str[i + 1] === '\n')
+            return i + 1;
+        if ((c < '\x20' && c !== '\t') || c === '\x7f') {
+            throw new TomlError('control characters are not allowed in comments', {
+                toml: str,
+                ptr: ptr,
+            });
+        }
+    }
+    return str.length;
+}
+function skipVoid(str, ptr, banNewLines, banComments) {
+    let c;
+    while (1) {
+        while ((c = str[ptr]) === ' ' || c === '\t' || (!banNewLines && (c === '\n' || c === '\r' && str[ptr + 1] === '\n')))
+            ptr++;
+        // Tucking the return statement here would save 5 characters >:)
+        // But TypeScript fails to detect there is no way to exit the loop so it complains about the lack of final return
+        if (banComments || c !== '#')
+            break;
+        ptr = skipComment(str, ptr);
+    }
+    return ptr;
+}
+function skipUntil(str, ptr, sep, end, banNewLines = false) {
+    if (!end) {
+        ptr = indexOfNewline(str, ptr);
+        return ptr < 0 ? str.length : ptr;
+    }
+    for (let i = ptr; i < str.length; i++) {
+        let c = str[i];
+        if (c === '#') {
+            i = indexOfNewline(str, i);
+        }
+        else if (c === sep) {
+            return i + 1;
+        }
+        else if (c === end || (banNewLines && (c === '\n' || (c === '\r' && str[i + 1] === '\n')))) {
+            return i;
+        }
+    }
+    throw new TomlError('cannot find end of structure', {
+        toml: str,
+        ptr: ptr
+    });
+}
+function getStringEnd(str, seek) {
+    let first = str[seek];
+    let target = first === str[seek + 1] && str[seek + 1] === str[seek + 2]
+        ? str.slice(seek, seek + 3)
+        : first;
+    seek += target.length - 1;
+    do
+        seek = str.indexOf(target, ++seek);
+    while (seek > -1 && first !== "'" && isEscaped(str, seek));
+    if (seek > -1) {
+        seek += target.length;
+        if (target.length > 1) {
+            if (str[seek] === first)
+                seek++;
+            if (str[seek] === first)
+                seek++;
+        }
+    }
+    return seek;
+}
+
+;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/date.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+let DATE_TIME_RE = /^(\d{4}-\d{2}-\d{2})?[T ]?(?:(\d{2}):\d{2}(?::\d{2}(?:\.\d+)?)?)?(Z|[-+]\d{2}:\d{2})?$/i;
+class TomlDate extends Date {
+    #hasDate = false;
+    #hasTime = false;
+    #offset = null;
+    constructor(date) {
+        let hasDate = true;
+        let hasTime = true;
+        let offset = 'Z';
+        if (typeof date === 'string') {
+            let match = date.match(DATE_TIME_RE);
+            if (match) {
+                if (!match[1]) {
+                    hasDate = false;
+                    date = `0000-01-01T${date}`;
+                }
+                hasTime = !!match[2];
+                // Make sure to use T instead of a space. Breaks in case of extreme values otherwise.
+                hasTime && date[10] === ' ' && (date = date.replace(' ', 'T'));
+                // Do not allow rollover hours.
+                if (match[2] && +match[2] > 23) {
+                    date = '';
+                }
+                else {
+                    offset = match[3] || null;
+                    date = date.toUpperCase();
+                    if (!offset && hasTime)
+                        date += 'Z';
+                }
+            }
+            else {
+                date = '';
+            }
+        }
+        super(date);
+        if (!isNaN(this.getTime())) {
+            this.#hasDate = hasDate;
+            this.#hasTime = hasTime;
+            this.#offset = offset;
+        }
+    }
+    isDateTime() {
+        return this.#hasDate && this.#hasTime;
+    }
+    isLocal() {
+        return !this.#hasDate || !this.#hasTime || !this.#offset;
+    }
+    isDate() {
+        return this.#hasDate && !this.#hasTime;
+    }
+    isTime() {
+        return this.#hasTime && !this.#hasDate;
+    }
+    isValid() {
+        return this.#hasDate || this.#hasTime;
+    }
+    toISOString() {
+        let iso = super.toISOString();
+        // Local Date
+        if (this.isDate())
+            return iso.slice(0, 10);
+        // Local Time
+        if (this.isTime())
+            return iso.slice(11, 23);
+        // Local DateTime
+        if (this.#offset === null)
+            return iso.slice(0, -1);
+        // Offset DateTime
+        if (this.#offset === 'Z')
+            return iso;
+        // This part is quite annoying: JS strips the original timezone from the ISO string representation
+        // Instead of using a "modified" date and "Z", we restore the representation "as authored"
+        let offset = (+(this.#offset.slice(1, 3)) * 60) + +(this.#offset.slice(4, 6));
+        offset = this.#offset[0] === '-' ? offset : -offset;
+        let offsetDate = new Date(this.getTime() - (offset * 60e3));
+        return offsetDate.toISOString().slice(0, -1) + this.#offset;
+    }
+    static wrapAsOffsetDateTime(jsDate, offset = 'Z') {
+        let date = new TomlDate(jsDate);
+        date.#offset = offset;
+        return date;
+    }
+    static wrapAsLocalDateTime(jsDate) {
+        let date = new TomlDate(jsDate);
+        date.#offset = null;
+        return date;
+    }
+    static wrapAsLocalDate(jsDate) {
+        let date = new TomlDate(jsDate);
+        date.#hasTime = false;
+        date.#offset = null;
+        return date;
+    }
+    static wrapAsLocalTime(jsDate) {
+        let date = new TomlDate(jsDate);
+        date.#hasDate = false;
+        date.#offset = null;
+        return date;
+    }
+}
+
+;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/primitive.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
+
+let INT_REGEX = /^((0x[0-9a-fA-F](_?[0-9a-fA-F])*)|(([+-]|0[ob])?\d(_?\d)*))$/;
+let FLOAT_REGEX = /^[+-]?\d(_?\d)*(\.\d(_?\d)*)?([eE][+-]?\d(_?\d)*)?$/;
+let LEADING_ZERO = /^[+-]?0[0-9_]/;
+let ESCAPE_REGEX = /^[0-9a-f]{2,8}$/i;
+let ESC_MAP = {
+    b: '\b',
+    t: '\t',
+    n: '\n',
+    f: '\f',
+    r: '\r',
+    e: '\x1b',
+    '"': '"',
+    '\\': '\\',
+};
+function parseString(str, ptr = 0, endPtr = str.length) {
+    let isLiteral = str[ptr] === '\'';
+    let isMultiline = str[ptr++] === str[ptr] && str[ptr] === str[ptr + 1];
+    if (isMultiline) {
+        endPtr -= 2;
+        if (str[ptr += 2] === '\r')
+            ptr++;
+        if (str[ptr] === '\n')
+            ptr++;
+    }
+    let tmp = 0;
+    let isEscape;
+    let parsed = '';
+    let sliceStart = ptr;
+    while (ptr < endPtr - 1) {
+        let c = str[ptr++];
+        if (c === '\n' || (c === '\r' && str[ptr] === '\n')) {
+            if (!isMultiline) {
+                throw new TomlError('newlines are not allowed in strings', {
+                    toml: str,
+                    ptr: ptr - 1,
+                });
+            }
+        }
+        else if ((c < '\x20' && c !== '\t') || c === '\x7f') {
+            throw new TomlError('control characters are not allowed in strings', {
+                toml: str,
+                ptr: ptr - 1,
+            });
+        }
+        if (isEscape) {
+            isEscape = false;
+            if (c === 'x' || c === 'u' || c === 'U') {
+                // Unicode escape
+                let code = str.slice(ptr, (ptr += (c === 'x' ? 2 : c === 'u' ? 4 : 8)));
+                if (!ESCAPE_REGEX.test(code)) {
+                    throw new TomlError('invalid unicode escape', {
+                        toml: str,
+                        ptr: tmp,
+                    });
+                }
+                try {
+                    parsed += String.fromCodePoint(parseInt(code, 16));
+                }
+                catch {
+                    throw new TomlError('invalid unicode escape', {
+                        toml: str,
+                        ptr: tmp,
+                    });
+                }
+            }
+            else if (isMultiline && (c === '\n' || c === ' ' || c === '\t' || c === '\r')) {
+                // Multiline escape
+                ptr = skipVoid(str, ptr - 1, true);
+                if (str[ptr] !== '\n' && str[ptr] !== '\r') {
+                    throw new TomlError('invalid escape: only line-ending whitespace may be escaped', {
+                        toml: str,
+                        ptr: tmp,
+                    });
+                }
+                ptr = skipVoid(str, ptr);
+            }
+            else if (c in ESC_MAP) {
+                // Classic escape
+                parsed += ESC_MAP[c];
+            }
+            else {
+                throw new TomlError('unrecognized escape sequence', {
+                    toml: str,
+                    ptr: tmp,
+                });
+            }
+            sliceStart = ptr;
+        }
+        else if (!isLiteral && c === '\\') {
+            tmp = ptr - 1;
+            isEscape = true;
+            parsed += str.slice(sliceStart, tmp);
+        }
+    }
+    return parsed + str.slice(sliceStart, endPtr - 1);
+}
+function primitive_parseValue(value, toml, ptr, integersAsBigInt) {
+    // Constant values
+    if (value === 'true')
+        return true;
+    if (value === 'false')
+        return false;
+    if (value === '-inf')
+        return -Infinity;
+    if (value === 'inf' || value === '+inf')
+        return Infinity;
+    if (value === 'nan' || value === '+nan' || value === '-nan')
+        return NaN;
+    // Avoid FP representation of -0
+    if (value === '-0')
+        return integersAsBigInt ? 0n : 0;
+    // Numbers
+    let isInt = INT_REGEX.test(value);
+    if (isInt || FLOAT_REGEX.test(value)) {
+        if (LEADING_ZERO.test(value)) {
+            throw new TomlError('leading zeroes are not allowed', {
+                toml: toml,
+                ptr: ptr,
+            });
+        }
+        value = value.replace(/_/g, '');
+        let numeric = +value;
+        if (isNaN(numeric)) {
+            throw new TomlError('invalid number', {
+                toml: toml,
+                ptr: ptr,
+            });
+        }
+        if (isInt) {
+            if ((isInt = !Number.isSafeInteger(numeric)) && !integersAsBigInt) {
+                throw new TomlError('integer value cannot be represented losslessly', {
+                    toml: toml,
+                    ptr: ptr,
+                });
+            }
+            if (isInt || integersAsBigInt === true)
+                numeric = BigInt(value);
+        }
+        return numeric;
+    }
+    const date = new TomlDate(value);
+    if (!date.isValid()) {
+        throw new TomlError('invalid value', {
+            toml: toml,
+            ptr: ptr,
+        });
+    }
+    return date;
+}
+
+;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/extract.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
+
+
+function sliceAndTrimEndOf(str, startPtr, endPtr) {
+    let value = str.slice(startPtr, endPtr);
+    let commentIdx = value.indexOf('#');
+    if (commentIdx > -1) {
+        // The call to skipComment allows to "validate" the comment
+        // (absence of control characters)
+        skipComment(str, commentIdx);
+        value = value.slice(0, commentIdx);
+    }
+    return [value.trimEnd(), commentIdx];
+}
+function extractValue(str, ptr, end, depth, integersAsBigInt) {
+    if (depth === 0) {
+        throw new TomlError('document contains excessively nested structures. aborting.', {
+            toml: str,
+            ptr: ptr
+        });
+    }
+    let c = str[ptr];
+    if (c === '[' || c === '{') {
+        let [value, endPtr] = c === '['
+            ? parseArray(str, ptr, depth, integersAsBigInt)
+            : parseInlineTable(str, ptr, depth, integersAsBigInt);
+        if (end) {
+            endPtr = skipVoid(str, endPtr);
+            if (str[endPtr] === ',')
+                endPtr++;
+            else if (str[endPtr] !== end) {
+                throw new TomlError('expected comma or end of structure', {
+                    toml: str,
+                    ptr: endPtr,
+                });
+            }
+        }
+        return [value, endPtr];
+    }
+    let endPtr;
+    if (c === '"' || c === "'") {
+        endPtr = getStringEnd(str, ptr);
+        let parsed = parseString(str, ptr, endPtr);
+        if (end) {
+            endPtr = skipVoid(str, endPtr);
+            if (str[endPtr] && str[endPtr] !== ',' && str[endPtr] !== end && str[endPtr] !== '\n' && str[endPtr] !== '\r') {
+                throw new TomlError('unexpected character encountered', {
+                    toml: str,
+                    ptr: endPtr,
+                });
+            }
+            endPtr += (+(str[endPtr] === ','));
+        }
+        return [parsed, endPtr];
+    }
+    endPtr = skipUntil(str, ptr, ',', end);
+    let slice = sliceAndTrimEndOf(str, ptr, endPtr - (+(str[endPtr - 1] === ',')));
+    if (!slice[0]) {
+        throw new TomlError('incomplete key-value declaration: no value specified', {
+            toml: str,
+            ptr: ptr
+        });
+    }
+    if (end && slice[1] > -1) {
+        endPtr = skipVoid(str, ptr + slice[1]);
+        endPtr += +(str[endPtr] === ',');
+    }
+    return [
+        primitive_parseValue(slice[0], str, ptr, integersAsBigInt),
+        endPtr,
+    ];
+}
+
+;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/struct.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
+
+
+let KEY_PART_RE = /^[a-zA-Z0-9-_]+[ \t]*$/;
+function parseKey(str, ptr, end = '=') {
+    let dot = ptr - 1;
+    let parsed = [];
+    let endPtr = str.indexOf(end, ptr);
+    if (endPtr < 0) {
+        throw new TomlError('incomplete key-value: cannot find end of key', {
+            toml: str,
+            ptr: ptr,
+        });
+    }
+    do {
+        let c = str[ptr = ++dot];
+        // If it's whitespace, ignore
+        if (c !== ' ' && c !== '\t') {
+            // If it's a string
+            if (c === '"' || c === '\'') {
+                if (c === str[ptr + 1] && c === str[ptr + 2]) {
+                    throw new TomlError('multiline strings are not allowed in keys', {
+                        toml: str,
+                        ptr: ptr,
+                    });
+                }
+                let eos = getStringEnd(str, ptr);
+                if (eos < 0) {
+                    throw new TomlError('unfinished string encountered', {
+                        toml: str,
+                        ptr: ptr,
+                    });
+                }
+                dot = str.indexOf('.', eos);
+                let strEnd = str.slice(eos, dot < 0 || dot > endPtr ? endPtr : dot);
+                let newLine = indexOfNewline(strEnd);
+                if (newLine > -1) {
+                    throw new TomlError('newlines are not allowed in keys', {
+                        toml: str,
+                        ptr: ptr + dot + newLine,
+                    });
+                }
+                if (strEnd.trimStart()) {
+                    throw new TomlError('found extra tokens after the string part', {
+                        toml: str,
+                        ptr: eos,
+                    });
+                }
+                if (endPtr < eos) {
+                    endPtr = str.indexOf(end, eos);
+                    if (endPtr < 0) {
+                        throw new TomlError('incomplete key-value: cannot find end of key', {
+                            toml: str,
+                            ptr: ptr,
+                        });
+                    }
+                }
+                parsed.push(parseString(str, ptr, eos));
+            }
+            else {
+                // Normal raw key part consumption and validation
+                dot = str.indexOf('.', ptr);
+                let part = str.slice(ptr, dot < 0 || dot > endPtr ? endPtr : dot);
+                if (!KEY_PART_RE.test(part)) {
+                    throw new TomlError('only letter, numbers, dashes and underscores are allowed in keys', {
+                        toml: str,
+                        ptr: ptr,
+                    });
+                }
+                parsed.push(part.trimEnd());
+            }
+        }
+        // Until there's no more dot
+    } while (dot + 1 && dot < endPtr);
+    return [parsed, skipVoid(str, endPtr + 1, true, true)];
+}
+function parseInlineTable(str, ptr, depth, integersAsBigInt) {
+    let res = {};
+    let seen = new Set();
+    let c;
+    ptr++;
+    while ((c = str[ptr++]) !== '}' && c) {
+        if (c === ',') {
+            throw new TomlError('expected value, found comma', {
+                toml: str,
+                ptr: ptr - 1,
+            });
+        }
+        else if (c === '#')
+            ptr = skipComment(str, ptr);
+        else if (c !== ' ' && c !== '\t' && c !== '\n' && c !== '\r') {
+            let k;
+            let t = res;
+            let hasOwn = false;
+            let [key, keyEndPtr] = parseKey(str, ptr - 1);
+            for (let i = 0; i < key.length; i++) {
+                if (i)
+                    t = hasOwn ? t[k] : (t[k] = {});
+                k = key[i];
+                if ((hasOwn = Object.hasOwn(t, k)) && (typeof t[k] !== 'object' || seen.has(t[k]))) {
+                    throw new TomlError('trying to redefine an already defined value', {
+                        toml: str,
+                        ptr: ptr,
+                    });
+                }
+                if (!hasOwn && k === '__proto__') {
+                    Object.defineProperty(t, k, { enumerable: true, configurable: true, writable: true });
+                }
+            }
+            if (hasOwn) {
+                throw new TomlError('trying to redefine an already defined value', {
+                    toml: str,
+                    ptr: ptr,
+                });
+            }
+            let [value, valueEndPtr] = extractValue(str, keyEndPtr, '}', depth - 1, integersAsBigInt);
+            seen.add(value);
+            t[k] = value;
+            ptr = valueEndPtr;
+        }
+    }
+    if (!c) {
+        throw new TomlError('unfinished table encountered', {
+            toml: str,
+            ptr: ptr,
+        });
+    }
+    return [res, ptr];
+}
+function parseArray(str, ptr, depth, integersAsBigInt) {
+    let res = [];
+    let c;
+    ptr++;
+    while ((c = str[ptr++]) !== ']' && c) {
+        if (c === ',') {
+            throw new TomlError('expected value, found comma', {
+                toml: str,
+                ptr: ptr - 1,
+            });
+        }
+        else if (c === '#')
+            ptr = skipComment(str, ptr);
+        else if (c !== ' ' && c !== '\t' && c !== '\n' && c !== '\r') {
+            let e = extractValue(str, ptr - 1, ']', depth - 1, integersAsBigInt);
+            res.push(e[0]);
+            ptr = e[1];
+        }
+    }
+    if (!c) {
+        throw new TomlError('unfinished array encountered', {
+            toml: str,
+            ptr: ptr,
+        });
+    }
+    return [res, ptr];
+}
+
+;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/parse.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
+
+
+function peekTable(key, table, meta, type) {
+    let t = table;
+    let m = meta;
+    let k;
+    let hasOwn = false;
+    let state;
+    for (let i = 0; i < key.length; i++) {
+        if (i) {
+            t = hasOwn ? t[k] : (t[k] = {});
+            m = (state = m[k]).c;
+            if (type === 0 /* Type.DOTTED */ && (state.t === 1 /* Type.EXPLICIT */ || state.t === 2 /* Type.ARRAY */)) {
+                return null;
+            }
+            if (state.t === 2 /* Type.ARRAY */) {
+                let l = t.length - 1;
+                t = t[l];
+                m = m[l].c;
+            }
+        }
+        k = key[i];
+        if ((hasOwn = Object.hasOwn(t, k)) && m[k]?.t === 0 /* Type.DOTTED */ && m[k]?.d) {
+            return null;
+        }
+        if (!hasOwn) {
+            if (k === '__proto__') {
+                Object.defineProperty(t, k, { enumerable: true, configurable: true, writable: true });
+                Object.defineProperty(m, k, { enumerable: true, configurable: true, writable: true });
+            }
+            m[k] = {
+                t: i < key.length - 1 && type === 2 /* Type.ARRAY */
+                    ? 3 /* Type.ARRAY_DOTTED */
+                    : type,
+                d: false,
+                i: 0,
+                c: {},
+            };
+        }
+    }
+    state = m[k];
+    if (state.t !== type && !(type === 1 /* Type.EXPLICIT */ && state.t === 3 /* Type.ARRAY_DOTTED */)) {
+        // Bad key type!
+        return null;
+    }
+    if (type === 2 /* Type.ARRAY */) {
+        if (!state.d) {
+            state.d = true;
+            t[k] = [];
+        }
+        t[k].push(t = {});
+        state.c[state.i++] = (state = { t: 1 /* Type.EXPLICIT */, d: false, i: 0, c: {} });
+    }
+    if (state.d) {
+        // Redefining a table!
+        return null;
+    }
+    state.d = true;
+    if (type === 1 /* Type.EXPLICIT */) {
+        t = hasOwn ? t[k] : (t[k] = {});
+    }
+    else if (type === 0 /* Type.DOTTED */ && hasOwn) {
+        return null;
+    }
+    return [k, t, state.c];
+}
+function parse_parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
+    let res = {};
+    let meta = {};
+    let tbl = res;
+    let m = meta;
+    for (let ptr = skipVoid(toml, 0); ptr < toml.length;) {
+        if (toml[ptr] === '[') {
+            let isTableArray = toml[++ptr] === '[';
+            let k = parseKey(toml, ptr += +isTableArray, ']');
+            if (isTableArray) {
+                if (toml[k[1] - 1] !== ']') {
+                    throw new TomlError('expected end of table declaration', {
+                        toml: toml,
+                        ptr: k[1] - 1,
+                    });
+                }
+                k[1]++;
+            }
+            let p = peekTable(k[0], res, meta, isTableArray ? 2 /* Type.ARRAY */ : 1 /* Type.EXPLICIT */);
+            if (!p) {
+                throw new TomlError('trying to redefine an already defined table or value', {
+                    toml: toml,
+                    ptr: ptr,
+                });
+            }
+            m = p[2];
+            tbl = p[1];
+            ptr = k[1];
+        }
+        else {
+            let k = parseKey(toml, ptr);
+            let p = peekTable(k[0], tbl, m, 0 /* Type.DOTTED */);
+            if (!p) {
+                throw new TomlError('trying to redefine an already defined table or value', {
+                    toml: toml,
+                    ptr: ptr,
+                });
+            }
+            let v = extractValue(toml, k[1], void 0, maxDepth, integersAsBigInt);
+            p[1][p[0]] = v[0];
+            ptr = v[1];
+        }
+        ptr = skipVoid(toml, ptr, true);
+        if (toml[ptr] && toml[ptr] !== '\n' && toml[ptr] !== '\r') {
+            throw new TomlError('each key-value declaration must be followed by an end-of-line', {
+                toml: toml,
+                ptr: ptr
+            });
+        }
+        ptr = skipVoid(toml, ptr);
+    }
+    return res;
+}
+
+;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/stringify.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+let BARE_KEY = /^[a-z0-9-_]+$/i;
+function extendedTypeOf(obj) {
+    let type = typeof obj;
+    if (type === 'object') {
+        if (Array.isArray(obj))
+            return 'array';
+        if (obj instanceof Date)
+            return 'date';
+    }
+    return type;
+}
+function isArrayOfTables(obj) {
+    for (let i = 0; i < obj.length; i++) {
+        if (extendedTypeOf(obj[i]) !== 'object')
+            return false;
+    }
+    return obj.length != 0;
+}
+function formatString(s) {
+    return JSON.stringify(s).replace(/\x7f/g, '\\u007f');
+}
+function stringifyValue(val, type, depth, numberAsFloat) {
+    if (depth === 0) {
+        throw new Error('Could not stringify the object: maximum object depth exceeded');
+    }
+    if (type === 'number') {
+        if (isNaN(val))
+            return 'nan';
+        if (val === Infinity)
+            return 'inf';
+        if (val === -Infinity)
+            return '-inf';
+        if (numberAsFloat && Number.isInteger(val))
+            return val.toFixed(1);
+        return val.toString();
+    }
+    if (type === 'bigint' || type === 'boolean') {
+        return val.toString();
+    }
+    if (type === 'string') {
+        return formatString(val);
+    }
+    if (type === 'date') {
+        if (isNaN(val.getTime())) {
+            throw new TypeError('cannot serialize invalid date');
+        }
+        return val.toISOString();
+    }
+    if (type === 'object') {
+        return stringifyInlineTable(val, depth, numberAsFloat);
+    }
+    if (type === 'array') {
+        return stringifyArray(val, depth, numberAsFloat);
+    }
+}
+function stringifyInlineTable(obj, depth, numberAsFloat) {
+    let keys = Object.keys(obj);
+    if (keys.length === 0)
+        return '{}';
+    let res = '{ ';
+    for (let i = 0; i < keys.length; i++) {
+        let k = keys[i];
+        if (i)
+            res += ', ';
+        res += BARE_KEY.test(k) ? k : formatString(k);
+        res += ' = ';
+        res += stringifyValue(obj[k], extendedTypeOf(obj[k]), depth - 1, numberAsFloat);
+    }
+    return res + ' }';
+}
+function stringifyArray(array, depth, numberAsFloat) {
+    if (array.length === 0)
+        return '[]';
+    let res = '[ ';
+    for (let i = 0; i < array.length; i++) {
+        if (i)
+            res += ', ';
+        if (array[i] === null || array[i] === void 0) {
+            throw new TypeError('arrays cannot contain null or undefined values');
+        }
+        res += stringifyValue(array[i], extendedTypeOf(array[i]), depth - 1, numberAsFloat);
+    }
+    return res + ' ]';
+}
+function stringifyArrayTable(array, key, depth, numberAsFloat) {
+    if (depth === 0) {
+        throw new Error('Could not stringify the object: maximum object depth exceeded');
+    }
+    let res = '';
+    for (let i = 0; i < array.length; i++) {
+        res += `${res && '\n'}[[${key}]]\n`;
+        res += stringifyTable(0, array[i], key, depth, numberAsFloat);
+    }
+    return res;
+}
+function stringifyTable(tableKey, obj, prefix, depth, numberAsFloat) {
+    if (depth === 0) {
+        throw new Error('Could not stringify the object: maximum object depth exceeded');
+    }
+    let preamble = '';
+    let tables = '';
+    let keys = Object.keys(obj);
+    for (let i = 0; i < keys.length; i++) {
+        let k = keys[i];
+        if (obj[k] !== null && obj[k] !== void 0) {
+            let type = extendedTypeOf(obj[k]);
+            if (type === 'symbol' || type === 'function') {
+                throw new TypeError(`cannot serialize values of type '${type}'`);
+            }
+            let key = BARE_KEY.test(k) ? k : formatString(k);
+            if (type === 'array' && isArrayOfTables(obj[k])) {
+                tables += (tables && '\n') + stringifyArrayTable(obj[k], prefix ? `${prefix}.${key}` : key, depth - 1, numberAsFloat);
+            }
+            else if (type === 'object') {
+                let tblKey = prefix ? `${prefix}.${key}` : key;
+                tables += (tables && '\n') + stringifyTable(tblKey, obj[k], tblKey, depth - 1, numberAsFloat);
+            }
+            else {
+                preamble += key;
+                preamble += ' = ';
+                preamble += stringifyValue(obj[k], type, depth, numberAsFloat);
+                preamble += '\n';
+            }
+        }
+    }
+    if (tableKey && (preamble || !tables)) // Create table only if necessary
+        preamble = preamble ? `[${tableKey}]\n${preamble}` : `[${tableKey}]`;
+    return preamble && tables
+        ? `${preamble}\n${tables}`
+        : preamble || tables;
+}
+function stringify(obj, { maxDepth = 1000, numbersAsFloat = false } = {}) {
+    if (extendedTypeOf(obj) !== 'object') {
+        throw new TypeError('stringify can only be called with an object');
+    }
+    let str = stringifyTable(0, obj, '', maxDepth, numbersAsFloat);
+    if (str[str.length - 1] !== '\n')
+        return str + '\n';
+    return str;
+}
+
+;// CONCATENATED MODULE: ./node_modules/.pnpm/smol-toml@1.6.1/node_modules/smol-toml/dist/index.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
+
+
+/* harmony default export */ const dist = ({ parse: parse_parse, stringify: stringify, TomlDate: TomlDate, TomlError: TomlError });
+
+
+;// CONCATENATED MODULE: ./out/ecosystems/python.js
+
+
+
+
+
+/** Normalize PyPI package names per PEP 503: case-insensitive, [-_.] equivalent. */
+function normalizePypiName(name) {
+    return name.replace(/[-_.]+/g, "-").toLowerCase();
+}
+function detectFormat(file) {
+    const base = external_node_path_namespaceObject.basename(file);
+    if (base === "pylock.toml" || base.startsWith("pylock."))
+        return "pylock";
+    return "uv"; // uv.lock and *.py.lock (script lockfiles)
+}
+/** Parse uv.lock (TOML with [[package]] arrays) */
+function parseUvLock(content) {
+    const result = new Map();
+    try {
+        const data = parse_parse(content);
+        if (Array.isArray(data.package)) {
+            for (const pkg of data.package) {
+                if (!pkg.name || !pkg.version)
+                    continue;
+                // Skip local/editable/virtual packages (workspace deps)
+                const src = pkg.source;
+                if (src && (src.editable || src.directory || src.virtual))
+                    continue;
+                result.set(normalizePypiName(pkg.name), pkg.version);
+            }
+        }
+    }
+    catch (e) {
+        lib_core.debug(`Failed to parse uv.lock as TOML: ${e}`);
+    }
+    return result;
+}
+/** Parse pylock.toml (PEP 751 format with [[packages]] arrays) */
+function parsePylockToml(content) {
+    const result = new Map();
+    try {
+        const data = parse_parse(content);
+        if (Array.isArray(data.packages)) {
+            for (const pkg of data.packages) {
+                if (pkg.name && pkg.version) {
+                    result.set(normalizePypiName(pkg.name), pkg.version);
+                }
+            }
+        }
+    }
+    catch (e) {
+        lib_core.debug(`Failed to parse pylock.toml: ${e}`);
+    }
+    return result;
+}
+function parsePythonLock(content, format) {
+    switch (format) {
+        case "uv":
+            return parseUvLock(content);
+        case "pylock":
+            return parsePylockToml(content);
+    }
+}
+/** Compare HEAD and base lockfile to find new/changed packages. */
+function python_findChangedPackages(headContent, baseContent, file) {
+    const format = detectFormat(file);
+    const headPkgs = parsePythonLock(headContent, format);
+    let basePkgs = new Map();
+    if (baseContent) {
+        basePkgs = parsePythonLock(baseContent, format);
+    }
+    const deps = [];
+    for (const [name, version] of headPkgs) {
+        if (basePkgs.get(name) === version)
+            continue;
+        deps.push({ ecosystem: "python", name, version, file });
+    }
+    return deps;
+}
+const python_DEFAULT_LOCKFILES = ["uv.lock", "pylock.toml"];
+/** Check if a file path looks like a Python lockfile we handle. */
+function isPythonLockfile(file) {
+    const base = external_node_path_namespaceObject.basename(file);
+    if (python_DEFAULT_LOCKFILES.includes(base))
+        return true;
+    // uv lock --script creates *.py.lock adjacent to the script
+    if (base.endsWith(".py.lock"))
+        return true;
+    return false;
+}
+async function python_getChangedDeps(baseRef, lockfileInput) {
+    let lockfiles;
+    if (lockfileInput) {
+        const allLockfiles = new Set(await resolveFiles(lockfileInput));
+        const changedFiles = await gitDiffNameOnly(baseRef);
+        lockfiles = changedFiles.filter((f) => allLockfiles.has(f));
+    }
+    else {
+        // Auto-detect: find changed lockfiles (known names + *.py.lock pattern)
+        const changedFiles = await gitDiffNameOnly(baseRef);
+        lockfiles = changedFiles.filter((f) => isPythonLockfile(f));
+    }
+    if (lockfiles.length === 0) {
+        lib_core.info("python: no changed lockfiles");
+        return [];
+    }
+    const allDeps = [];
+    for (const file of lockfiles) {
+        const diff = await gitDiff(baseRef, file);
+        if (!diff)
+            continue;
+        // Read full HEAD and base content for proper parsing
+        let headContent;
+        try {
+            const fs = await Promise.resolve(/* import() */).then(__nccwpck_require__.t.bind(__nccwpck_require__, 1455, 19));
+            headContent = await fs.readFile(file, "utf8");
+        }
+        catch {
+            lib_core.info(`python: could not read ${file}`);
+            continue;
+        }
+        const baseContent = await gitShowFile(baseRef, file);
+        allDeps.push(...python_findChangedPackages(headContent, baseContent, file));
+    }
+    return allDeps;
+}
+async function python_getPublishDate(name, version, registries) {
+    return pypiPublishDate(name, version, registries);
+}
+//# sourceMappingURL=python.js.map
+// EXTERNAL MODULE: external "node:fs/promises"
+var promises_ = __nccwpck_require__(1455);
+// EXTERNAL MODULE: external "node:url"
+var external_node_url_ = __nccwpck_require__(3136);
+// EXTERNAL MODULE: ./node_modules/.pnpm/web-tree-sitter@0.24.7/node_modules/web-tree-sitter/tree-sitter.js
+var tree_sitter = __nccwpck_require__(5772);
+;// CONCATENATED MODULE: ./out/bazel.js
+
+
+
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore — web-tree-sitter 0.24.x uses `export =` which needs esModuleInterop
+
+const cwd = process.cwd();
+let parserPromise = null;
+async function getParser() {
+    if (!parserPromise) {
+        parserPromise = (async () => {
+            const thisDir = external_node_path_namespaceObject.dirname((0,external_node_url_.fileURLToPath)(import.meta.url));
+            // web-tree-sitter 0.24.x uses __dirname (CJS) but ncc bundles as ESM where
+            // __dirname doesn't exist. Provide it globally for the emscripten init code.
+            if (typeof globalThis.__dirname === "undefined") {
+                globalThis.__dirname = thisDir;
+            }
+            await tree_sitter.init();
+            const parser = new tree_sitter();
+            // In the ncc bundle, the WASM is copied to dist/ alongside index.js.
+            // In dev/test, resolve from node_modules.
+            let starlarkWasm = external_node_path_namespaceObject.resolve(thisDir, "tree-sitter-starlark.wasm");
+            try {
+                await promises_.access(starlarkWasm);
+            }
+            catch {
+                starlarkWasm = external_node_path_namespaceObject.resolve(thisDir, "..", "node_modules", "tree-sitter-starlark", "tree-sitter-starlark.wasm");
+            }
+            const lang = await tree_sitter.Language.load(starlarkWasm);
+            parser.setLanguage(lang);
+            return parser;
+        })();
+    }
+    return parserPromise;
+}
+async function parseStarlark(content) {
+    const parser = await getParser();
+    return parser.parse(content);
+}
+/** Walk tree to find all call expressions matching a function name */
+function findCallsByName(node, name) {
+    const results = [];
+    const walk = (n) => {
+        if (n.type === "call") {
+            const fn = n.childForFieldName("function");
+            if (fn && fn.text === name) {
+                results.push(n);
+            }
+        }
+        for (let i = 0; i < n.childCount; i++) {
+            walk(n.child(i));
+        }
+    };
+    walk(node);
+    return results;
+}
+/** Extract the value of a keyword argument from a call's argument_list */
+function getKeywordArg(callNode, key) {
+    const argList = callNode.childForFieldName("arguments");
+    if (!argList)
+        return null;
+    for (let i = 0; i < argList.childCount; i++) {
+        const child = argList.child(i);
+        if (child.type === "keyword_argument") {
+            const nameNode = child.childForFieldName("name");
+            const valueNode = child.childForFieldName("value");
+            if (nameNode && nameNode.text === key && valueNode) {
+                return valueNode;
+            }
+        }
+    }
+    return null;
+}
+/** Extract a plain string literal value (strip quotes).
+ * Returns null for prefixed strings (r"…", b"…", rb"…") and triple-quoted strings —
+ * the offset arithmetic assumes the opening char is a quote, not a prefix byte.
+ *
+ * NOTE: escape sequences (e.g. `\"`, `\\`) are NOT decoded — the raw backslash is
+ * preserved verbatim. Callers that rely on the returned value for path/URL matching
+ * may get incorrect results for literals containing escaped characters. */
+function extractString(node) {
+    if (node.type !== "string")
+        return null;
+    const text = node.text;
+    if (text.length < 2)
+        return null;
+    const open = text[0];
+    const close = text[text.length - 1];
+    if ((open !== '"' && open !== "'") || open !== close)
+        return null;
+    // Reject literals containing escape sequences — we don't decode them,
+    // and an escaped version string won't match any registry lookup.
+    // Fail-closed: return null so the caller skips this literal entirely.
+    const inner = text.slice(1, -1);
+    if (inner.includes("\\"))
+        return null;
+    return inner;
+}
+/** Extract a list of string literals */
+function extractStringList(node) {
+    if (node.type !== "list")
+        return [];
+    const results = [];
+    for (let i = 0; i < node.childCount; i++) {
+        const child = node.child(i);
+        if (child.type === "string") {
+            const val = extractString(child);
+            if (val !== null)
+                results.push(val);
+        }
+    }
+    return results;
+}
+/** Valid characters that may appear at a `%s` template boundary in a version string. */
+const PERCENT_SEPARATORS = new Set([".", ":", "-", "/", "+"]);
+/**
+ * Walk the top-level statements of a parsed MODULE.bazel and collect all
+ * simple string constant assignments: `IDENT = "literal"`.
+ * List/dict/expression values are ignored.
+ *
+ * A name assigned more than once is dropped from the map: rewrites to an
+ * ambiguous constant could corrupt the file if the two assignments have
+ * different values or point at different regions.
+ */
+function extractStringConstants(rootNode) {
+    const constants = new Map();
+    const reassigned = new Set(); // names seen more than once — excluded
+    for (let i = 0; i < rootNode.childCount; i++) {
+        const stmt = rootNode.child(i);
+        if (stmt.type !== "expression_statement")
+            continue;
+        const assign = stmt.child(0);
+        if (!assign || assign.type !== "assignment")
+            continue;
+        const leftNode = assign.childForFieldName("left");
+        const rightNode = assign.childForFieldName("right");
+        if (!leftNode || leftNode.type !== "identifier")
+            continue;
+        if (!rightNode || rightNode.type !== "string")
+            continue;
+        // Skip triple-quoted strings — extractString only strips one quote, yielding
+        // stray interior quotes rather than null. Prefix-byte strings (r"…", b"…") are
+        // caught downstream by extractString's text[0] check.
+        if (rightNode.text.startsWith('"""') || rightNode.text.startsWith("'''"))
+            continue;
+        const val = extractString(rightNode);
+        if (val === null)
+            continue;
+        const name = leftNode.text;
+        if (reassigned.has(name))
+            continue; // already known-ambiguous, skip
+        if (constants.has(name)) {
+            // Second assignment — mark ambiguous and remove from usable map.
+            constants.delete(name);
+            reassigned.add(name);
+            continue;
+        }
+        constants.set(name, {
+            value: val,
+            valueNodeStart: rightNode.startIndex + 1,
+            valueNodeEnd: rightNode.endIndex - 1,
+            assignmentEnd: stmt.endIndex,
+            quote: rightNode.text[0] ?? '"',
+        });
+    }
+    return constants;
+}
+/**
+ * If `node` is a `CONST.rpartition(SEP)[0]` subscript expression, parse and
+ * validate it, returning the constant entry and the resulting head value.
+ * Returns null for anything that doesn't match the supported shape.
+ *
+ * Accepted shape (verified via AST probe):
+ *   subscript
+ *     value: call
+ *       function: attribute  (object: identifier, attribute: "rpartition")
+ *       arguments: argument_list  (single string literal)
+ *     subscript: integer "0"
+ *
+ * Guards: attribute name must be "rpartition"; index must be 0; SEP must appear
+ * in the constant value (otherwise the head would be the full value, indistinguishable
+ * from a non-rpartition reference and potentially misleading for age-gating); forward
+ * references are rejected.
+ */
+function parseRpartitionHead(node, constants) {
+    if (node.type !== "subscript")
+        return null;
+    // subscript field must be integer "0"
+    const indexNode = node.childForFieldName("subscript");
+    if (!indexNode || indexNode.type !== "integer" || indexNode.text !== "0")
+        return null;
+    // value field must be a call
+    const callNode = node.childForFieldName("value");
+    if (!callNode || callNode.type !== "call")
+        return null;
+    // function field of the call must be an attribute
+    const attrNode = callNode.childForFieldName("function");
+    if (!attrNode || attrNode.type !== "attribute")
+        return null;
+    // attribute field must be "rpartition"
+    const methodNameNode = attrNode.childForFieldName("attribute");
+    if (!methodNameNode || methodNameNode.text !== "rpartition")
+        return null;
+    // object field must be an identifier referencing a known constant
+    const objNode = attrNode.childForFieldName("object");
+    if (!objNode || objNode.type !== "identifier")
+        return null;
+    const identName = objNode.text;
+    const entry = constants.get(identName);
+    if (!entry)
+        return null;
+    // Reject forward references: the constant must be assigned before this use site.
+    if (node.startIndex < entry.assignmentEnd)
+        return null;
+    // The argument list must contain exactly one string literal — the separator.
+    const argsNode = callNode.childForFieldName("arguments");
+    if (!argsNode || argsNode.type !== "argument_list")
+        return null;
+    if (argsNode.namedChildren.length !== 1)
+        return null;
+    const sepNode = argsNode.namedChildren[0];
+    if (sepNode.type !== "string")
+        return null;
+    const sep = extractString(sepNode);
+    if (sep === null || sep === "")
+        return null;
+    // Compute the head: everything before the last occurrence of SEP.
+    const lastIdx = entry.value.lastIndexOf(sep);
+    // If SEP is not found the head would equal the full value — that's
+    // indistinguishable from a bare const reference and almost certainly a mistake.
+    if (lastIdx < 0)
+        return null;
+    const head = entry.value.slice(0, lastIdx);
+    // Guard against an empty head (SEP at position 0).
+    if (!head)
+        return null;
+    return { identName, entry, head };
+}
+/**
+ * If `node` is a `"template %s" % IDENT` (or tuple or rpartition subscript)
+ * binary-operator, parse and validate it, returning the constant entry, template
+ * prefix/suffix, effective substituted value, and readOnly flag.
+ * Returns null for anything that doesn't match the supported form.
+ *
+ * Shared by resolveVersionExpr and resolveArtifactCoord to eliminate duplication
+ * and ensure both apply the same guards (including the triple-quote guard).
+ */
+function parsePercentInterpolation(node, constants) {
+    const opNode = node.childForFieldName("operator");
+    const leftNode = node.childForFieldName("left");
+    const rightNode = node.childForFieldName("right");
+    if (!opNode || opNode.type !== "%" || !leftNode || !rightNode)
+        return null;
+    if (leftNode.type !== "string")
+        return null;
+    // Reject triple-quoted template strings — extractString only strips one quote,
+    // yielding stray interior quotes rather than the template content.
+    if (leftNode.text.startsWith('"""') || leftNode.text.startsWith("'''"))
+        return null;
+    // RHS must be a single identifier, a single-element tuple, or an rpartition subscript.
+    // Resolve all three shapes in an IIFE so each branch can return early without
+    // initialising variables to null (which would trip the no-useless-assignment rule).
+    const rhs = (() => {
+        if (rightNode.type === "identifier") {
+            const ident = rightNode.text;
+            const e = constants.get(ident);
+            if (!e)
+                return null;
+            if (node.startIndex < e.assignmentEnd)
+                return null; // forward reference
+            return { identName: ident, entry: e, effectiveValue: e.value, readOnly: false };
+        }
+        if (rightNode.type === "tuple") {
+            const identChildren = rightNode.namedChildren.filter((c) => c.type === "identifier");
+            if (identChildren.length !== 1)
+                return null; // reject multi-identifier or empty tuple
+            const ident = identChildren[0].text;
+            const e = constants.get(ident);
+            if (!e)
+                return null;
+            if (node.startIndex < e.assignmentEnd)
+                return null; // forward reference
+            return { identName: ident, entry: e, effectiveValue: e.value, readOnly: false };
+        }
+        if (rightNode.type === "subscript") {
+            const parsed = parseRpartitionHead(rightNode, constants);
+            if (!parsed)
+                return null;
+            return { identName: parsed.identName, entry: parsed.entry, effectiveValue: parsed.head, readOnly: true };
+        }
+        return null;
+    })();
+    if (!rhs)
+        return null;
+    const { identName, entry, effectiveValue, readOnly } = rhs;
+    const template = extractString(leftNode);
+    if (template === null)
+        return null;
+    // Reject templates containing "%%" (escaped percent in Starlark/Python).
+    if (template.includes("%%"))
+        return null;
+    const pctParts = template.split("%s");
+    if (pctParts.length !== 2)
+        return null; // 0 or 2+ %s → skip
+    // Reject templates with other Python format conversions (e.g. "%s%d", "%s%r").
+    const otherConversions = /%-?\d*[diouxXeEfFgGrsa]/;
+    if (pctParts.some((p) => otherConversions.test(p)))
+        return null;
+    const [prefix, suffix] = pctParts;
+    // Fail-closed on any remaining bare/trailing `%` in prefix or suffix (e.g. "%s-100%",
+    // "%(name)s", "%*s"). After stripping %% escapes and the single %s, any remaining `%`
+    // is an unhandled Python format conversion that we cannot reason about — emit null so
+    // the constant is never updated from a template Python would reject at runtime.
+    if (prefix.includes("%") || suffix.includes("%"))
+        return null;
+    // Restrict interpolation to templates where the `%s` sits at a real version
+    // boundary (the documented `"4.%s"` / `"prefix:%s"` forms). Mid-token templates
+    // like `"1%s"` would produce semantically corrupt values (e.g. `"1" + "0.0"` →
+    // `"10.0"`) so we reject them rather than emit a confidently-wrong rewrite.
+    if (prefix !== "" && !PERCENT_SEPARATORS.has(prefix[prefix.length - 1]))
+        return null;
+    if (suffix !== "" && !PERCENT_SEPARATORS.has(suffix[0]))
+        return null;
+    return { identName, entry, prefix, suffix, effectiveValue, readOnly };
+}
+function resolveVersionExpr(node, constants) {
+    if (node.type === "string") {
+        // Triple-quoted strings: extractString only strips one quote, yielding stray interior
+        // quotes. Guard here since the inline-literal path bypasses extractStringConstants.
+        if (node.text.startsWith('"""') || node.text.startsWith("'''"))
+            return null;
+        const val = extractString(node);
+        if (val === null)
+            return null;
+        return {
+            value: val,
+            nodeStart: node.startIndex + 1,
+            nodeEnd: node.endIndex - 1,
+            templatePrefix: "",
+            templateSuffix: "",
+            quote: node.text[0] ?? '"',
+        };
+    }
+    if (node.type === "identifier") {
+        const entry = constants.get(node.text);
+        if (!entry)
+            return null;
+        // Reject forward references: the constant must be assigned before this use site.
+        if (node.startIndex < entry.assignmentEnd)
+            return null;
+        return {
+            value: entry.value,
+            nodeStart: entry.valueNodeStart,
+            nodeEnd: entry.valueNodeEnd,
+            templatePrefix: "",
+            templateSuffix: "",
+            constantName: node.text,
+            quote: entry.quote,
+        };
+    }
+    if (node.type === "subscript") {
+        // Handles `CONST.rpartition(SEP)[0]` — a lossy transform that cannot be
+        // inverted on write-back, so the ref is read-only (discovered but never rewritten).
+        const parsed = parseRpartitionHead(node, constants);
+        if (!parsed)
+            return null;
+        const { identName, entry, head } = parsed;
+        return {
+            value: head,
+            nodeStart: entry.valueNodeStart,
+            nodeEnd: entry.valueNodeEnd,
+            templatePrefix: "",
+            templateSuffix: "",
+            constantName: identName,
+            quote: entry.quote,
+            readOnly: true,
+        };
+    }
+    if (node.type === "binary_operator") {
+        const interp = parsePercentInterpolation(node, constants);
+        if (!interp)
+            return null;
+        const { identName, entry, prefix, suffix, effectiveValue, readOnly } = interp;
+        return {
+            value: prefix + effectiveValue + suffix,
+            nodeStart: entry.valueNodeStart,
+            nodeEnd: entry.valueNodeEnd,
+            templatePrefix: prefix,
+            templateSuffix: suffix,
+            constantName: identName,
+            quote: entry.quote,
+            ...(readOnly ? { readOnly: true } : {}),
+        };
+    }
+    return null;
+}
+/**
+ * Resolve a Starlark list element that is a Maven artifact coordinate string.
+ * Like resolveVersionExpr but for coord templates ("group:artifact:version" or
+ * "group:artifact:PREFIX%s" % CONST). Returns a MavenArtifact where versionRef
+ * points at the constant's value literal and templatePrefix/Suffix encode the
+ * fragment *within the version segment* of the coordinate (not the full coord prefix).
+ */
+function resolveArtifactCoord(node, constants) {
+    if (node.type === "string") {
+        const coord = extractString(node);
+        if (coord === null)
+            return null;
+        return { coord };
+    }
+    if (node.type === "binary_operator") {
+        const interp = parsePercentInterpolation(node, constants);
+        if (!interp)
+            return null;
+        const { identName, entry, prefix: leftPart, suffix: rightPart, effectiveValue, readOnly } = interp;
+        const coord = leftPart + effectiveValue + rightPart;
+        // The substituted value must not itself contain ":" — that would create extra segments in
+        // the coord and make the version segment ambiguous. For bare-constant/tuple RHS,
+        // effectiveValue === entry.value; for rpartition RHS, effectiveValue is the head (which
+        // may not contain ":" even if the full constant does). Checking effectiveValue is correct
+        // in all cases and avoids a false rejection when the rpartition head is colon-free.
+        if (effectiveValue.includes(":")) {
+            return { coord }; // no versionRef — discovered for age-gate but not rewritten
+        }
+        // Compute the prefix/suffix within the VERSION SEGMENT only.
+        // leftPart is e.g. "group:artifact:4." — everything after the last ":" is the version prefix.
+        const lastColonLeft = leftPart.lastIndexOf(":");
+        const versionPrefix = lastColonLeft >= 0 ? leftPart.slice(lastColonLeft + 1) : leftPart;
+        // rightPart is typically "" but may have ":classifier" etc. — stop at first ":"
+        const firstColonRight = rightPart.indexOf(":");
+        const versionSuffix = firstColonRight >= 0 ? rightPart.slice(0, firstColonRight) : rightPart;
+        return {
+            coord,
+            versionRef: {
+                // The full version segment = versionPrefix + effectiveValue + versionSuffix.
+                // For bare-constant/tuple RHS, effectiveValue === entry.value and this equals
+                // coord.split(":")[2] for the common "group:artifact:VERSION" form.
+                // For rpartition RHS, effectiveValue is the truncated head — the versionRef is
+                // readOnly and carries the effective (shorter) version for age-gating only.
+                value: versionPrefix + effectiveValue + versionSuffix,
+                nodeStart: entry.valueNodeStart,
+                nodeEnd: entry.valueNodeEnd,
+                templatePrefix: versionPrefix,
+                templateSuffix: versionSuffix,
+                constantName: identName,
+                quote: entry.quote,
+                ...(readOnly ? { readOnly: true } : {}),
+            },
+        };
+    }
+    return null;
+}
+/** Extract a list of Maven artifact coordinates, resolving constants and interpolations. */
+function extractArtifactList(node, constants) {
+    if (node.type !== "list")
+        return [];
+    const results = [];
+    for (let i = 0; i < node.childCount; i++) {
+        const child = node.child(i);
+        const artifact = resolveArtifactCoord(child, constants);
+        if (artifact !== null)
+            results.push(artifact);
+    }
+    return results;
+}
+/**
+ * Resolve a Bazel label to a filesystem path.
+ *   "//pkg:file"  → <workspaceRoot>/pkg/file
+ *   "//:file"     → <workspaceRoot>/file
+ *   ":file"       → <currentDir>/file
+ *   "file"        → <currentDir>/file
+ */
+function resolveBazelLabel(label, workspaceRoot, currentDir) {
+    if (label.startsWith("//")) {
+        // "//pkg:file" → "pkg/file", "//:file" → "file"
+        const stripped = label.slice(2);
+        const colonIdx = stripped.indexOf(":");
+        let relativePath;
+        if (colonIdx === -1) {
+            relativePath = stripped;
+        }
+        else if (colonIdx === 0) {
+            relativePath = stripped.slice(1);
+        }
+        else {
+            relativePath = stripped.slice(0, colonIdx) + "/" + stripped.slice(colonIdx + 1);
+        }
+        return external_node_path_namespaceObject.resolve(workspaceRoot, relativePath);
+    }
+    if (label.startsWith(":")) {
+        return external_node_path_namespaceObject.resolve(currentDir, label.slice(1));
+    }
+    return external_node_path_namespaceObject.resolve(currentDir, label);
+}
+/**
+ * Resolve all MODULE.bazel files by following include() statements recursively.
+ */
+async function resolveModuleFiles(rootPath) {
+    const visited = new Set();
+    const result = [];
+    const workspaceRoot = external_node_path_namespaceObject.resolve(external_node_path_namespaceObject.dirname(rootPath));
+    async function visit(filePath) {
+        const abs = external_node_path_namespaceObject.resolve(filePath);
+        if (visited.has(abs))
+            return;
+        visited.add(abs);
+        let content;
+        try {
+            content = await promises_.readFile(abs, "utf8");
+        }
+        catch {
+            return;
+        }
+        // Store as relative path to match git diff output
+        result.push(external_node_path_namespaceObject.relative(cwd, abs));
+        const tree = await parseStarlark(content);
+        const includeCalls = findCallsByName(tree.rootNode, "include");
+        for (const call of includeCalls) {
+            const argList = call.childForFieldName("arguments");
+            if (!argList)
+                continue;
+            for (let i = 0; i < argList.childCount; i++) {
+                const child = argList.child(i);
+                if (child.type === "string") {
+                    const includePath = extractString(child);
+                    if (!includePath)
+                        continue;
+                    const resolved = resolveBazelLabel(includePath, workspaceRoot, external_node_path_namespaceObject.dirname(abs));
+                    await visit(resolved);
+                }
+            }
+        }
+    }
+    await visit(rootPath);
+    return result;
+}
+/**
+ * Extract crate.spec() calls from Starlark content.
+ * Resolves constant variables and % interpolation in version= arguments.
+ */
+async function extractCrateSpecs(content) {
+    const tree = await parseStarlark(content);
+    const constants = extractStringConstants(tree.rootNode);
+    const calls = findCallsByName(tree.rootNode, "crate.spec");
+    const specs = [];
+    for (const call of calls) {
+        const pkgNode = getKeywordArg(call, "package");
+        const verNode = getKeywordArg(call, "version");
+        const gitNode = getKeywordArg(call, "git");
+        const pkg = pkgNode ? extractString(pkgNode) : null;
+        const versionRef = verNode ? resolveVersionExpr(verNode, constants) : null;
+        if (pkg && versionRef) {
+            const spec = {
+                package: pkg,
+                version: versionRef.value,
+                isGit: gitNode !== null,
+                versionNodeStart: versionRef.nodeStart,
+                versionNodeEnd: versionRef.nodeEnd,
+                versionRef,
+            };
+            specs.push(spec);
+        }
+    }
+    return specs;
+}
+/**
+ * Extract all override directives from MODULE.bazel content.
+ * Handles: git_override, archive_override, local_path_override,
+ * single_version_override, multiple_version_override
+ */
+async function extractOverrides(content) {
+    const tree = await parseStarlark(content);
+    const constants = extractStringConstants(tree.rootNode);
+    const overrides = new Map();
+    const OVERRIDE_TYPE_MAP = {
+        git_override: "git",
+        archive_override: "archive",
+        local_path_override: "local_path",
+        single_version_override: "single_version",
+        multiple_version_override: "multiple_version",
+    };
+    for (const fnName of Object.keys(OVERRIDE_TYPE_MAP)) {
+        const calls = findCallsByName(tree.rootNode, fnName);
+        for (const call of calls) {
+            const nameNode = getKeywordArg(call, "module_name");
+            const moduleName = nameNode ? extractString(nameNode) : null;
+            if (!moduleName)
+                continue;
+            const type = OVERRIDE_TYPE_MAP[fnName];
+            const override = { type, moduleName };
+            switch (fnName) {
+                case "git_override": {
+                    const remoteNode = getKeywordArg(call, "remote");
+                    const commitNode = getKeywordArg(call, "commit");
+                    const tagNode = getKeywordArg(call, "tag");
+                    const branchNode = getKeywordArg(call, "branch");
+                    override.remote = remoteNode ? extractString(remoteNode) ?? undefined : undefined;
+                    override.commit = commitNode ? extractString(commitNode) ?? undefined : undefined;
+                    override.tag = tagNode ? extractString(tagNode) ?? undefined : undefined;
+                    override.branch = branchNode ? extractString(branchNode) ?? undefined : undefined;
+                    break;
+                }
+                case "archive_override": {
+                    const urlsNode = getKeywordArg(call, "urls");
+                    override.urls = urlsNode ? extractStringList(urlsNode) : [];
+                    // Also handle single url= kwarg
+                    if (override.urls.length === 0) {
+                        const urlNode = getKeywordArg(call, "url");
+                        const url = urlNode ? extractString(urlNode) : null;
+                        if (url)
+                            override.urls = [url];
+                    }
+                    break;
+                }
+                case "single_version_override": {
+                    const verNode = getKeywordArg(call, "version");
+                    const regNode = getKeywordArg(call, "registry");
+                    const versionRef = verNode ? resolveVersionExpr(verNode, constants) : null;
+                    override.version = versionRef?.value;
+                    override.registry = regNode ? extractString(regNode) ?? undefined : undefined;
+                    if (versionRef) {
+                        override.versionNodeStart = versionRef.nodeStart;
+                        override.versionNodeEnd = versionRef.nodeEnd;
+                        override.versionRef = versionRef;
+                    }
+                    break;
+                }
+                case "multiple_version_override": {
+                    const versNode = getKeywordArg(call, "versions");
+                    const regNode = getKeywordArg(call, "registry");
+                    override.versions = versNode ? extractStringList(versNode) : [];
+                    override.registry = regNode ? extractString(regNode) ?? undefined : undefined;
+                    break;
+                }
+                // local_path_override — no extra fields needed, just the module name
+            }
+            overrides.set(moduleName, override);
+        }
+    }
+    return overrides;
+}
+async function extractMavenInstalls(content, workspaceRoot) {
+    const tree = await parseStarlark(content);
+    const constants = extractStringConstants(tree.rootNode);
+    const calls = findCallsByName(tree.rootNode, "maven.install");
+    const installs = [];
+    const wsRoot = workspaceRoot ?? cwd;
+    for (const call of calls) {
+        const nameNode = getKeywordArg(call, "name");
+        const lockNode = getKeywordArg(call, "lock_file");
+        const repoNode = getKeywordArg(call, "repositories");
+        const artNode = getKeywordArg(call, "artifacts");
+        const name = nameNode ? extractString(nameNode) : null;
+        const lockFile = lockNode ? extractString(lockNode) : null;
+        if (!lockFile)
+            continue;
+        const resolvedLockFile = external_node_path_namespaceObject.relative(cwd, resolveBazelLabel(lockFile, wsRoot, wsRoot));
+        installs.push({
+            name,
+            lockFile: resolvedLockFile,
+            repositories: repoNode ? extractStringList(repoNode) : [],
+            artifacts: artNode ? extractArtifactList(artNode, constants) : [],
+        });
+    }
+    return installs;
+}
+/**
+ * Extract standalone maven.artifact() calls from Starlark content.
+ * These are individual artifact specifications (not nested inside maven.install()
+ * artifacts= lists). Resolves constant variables in the version= argument.
+ */
+async function extractMavenArtifacts(content) {
+    const tree = await parseStarlark(content);
+    const constants = extractStringConstants(tree.rootNode);
+    const calls = findCallsByName(tree.rootNode, "maven.artifact");
+    const refs = [];
+    for (const call of calls) {
+        const groupNode = getKeywordArg(call, "group");
+        const artifactNode = getKeywordArg(call, "artifact");
+        const verNode = getKeywordArg(call, "version");
+        const group = groupNode ? extractString(groupNode) : null;
+        const artifact = artifactNode ? extractString(artifactNode) : null;
+        if (!group || !artifact || !verNode)
+            continue;
+        const versionRef = resolveVersionExpr(verNode, constants);
+        if (!versionRef)
+            continue;
+        refs.push({
+            group,
+            artifact,
+            version: versionRef.value,
+            versionRef,
+        });
+    }
+    return refs;
+}
+/**
+ * Extract bazel_dep() calls from MODULE.bazel content.
+ * Returns each dependency's name, version, and the tree-sitter UTF-16 code-unit
+ * offsets for the version string literal (quotes excluded) — used by the updater to
+ * rewrite versions in-place without re-parsing.
+ */
+async function extractBazelDeps(content) {
+    const tree = await parseStarlark(content);
+    const constants = extractStringConstants(tree.rootNode);
+    const calls = findCallsByName(tree.rootNode, "bazel_dep");
+    const deps = [];
+    for (const call of calls) {
+        const nameNode = getKeywordArg(call, "name");
+        const verNode = getKeywordArg(call, "version");
+        const name = nameNode ? extractString(nameNode) : null;
+        const versionRef = verNode ? resolveVersionExpr(verNode, constants) : null;
+        if (name && versionRef) {
+            deps.push({
+                name,
+                version: versionRef.value,
+                versionNodeStart: versionRef.nodeStart,
+                versionNodeEnd: versionRef.nodeEnd,
+                versionRef,
+            });
+        }
+    }
+    return deps;
+}
+/**
+ * Extract multitool.hub() calls from Starlark content and return lockfile paths.
+ */
+async function extractMultitoolHubs(content, workspaceRoot) {
+    const tree = await parseStarlark(content);
+    const calls = findCallsByName(tree.rootNode, "multitool.hub");
+    const lockfiles = [];
+    const wsRoot = workspaceRoot ?? cwd;
+    for (const call of calls) {
+        const lockNode = getKeywordArg(call, "lockfile");
+        const lockfile = lockNode ? extractString(lockNode) : null;
+        if (!lockfile)
+            continue;
+        const resolved = external_node_path_namespaceObject.relative(cwd, resolveBazelLabel(lockfile, wsRoot, wsRoot));
+        lockfiles.push(resolved);
+    }
+    return lockfiles;
+}
+//# sourceMappingURL=bazel.js.map
+;// CONCATENATED MODULE: ./out/ecosystems/rust.js
+
+
+
+
+
+
+function specKey(s) {
+    return `${s.package}@${s.version}`;
+}
+/**
+ * Build a map of crate name → resolved exact versions from MODULE.bazel.lock.
+ * Reads the crate_universe extension's generatedRepoSpecs and extracts the
+ * version from each crate's static.crates.io download URL.
+ */
+function parseCrateLockVersions(content) {
+    const result = new Map();
+    try {
+        const data = JSON.parse(content);
+        const moduleExtensions = data?.moduleExtensions;
+        if (!moduleExtensions || typeof moduleExtensions !== "object")
+            return result;
+        // Match the crate_universe extension key regardless of the +/~ canonical separator
+        // or the exact rules_rust module name (robust to forks and Bazel version changes).
+        const extKey = Object.keys(moduleExtensions).find((k) => /crate_universe[^%]*%crate$/.test(k));
+        if (!extKey)
+            return result;
+        const ext = moduleExtensions[extKey];
+        // Collect all eval results — crate_universe always uses "general" but handle
+        // future platform-split locks by iterating all sub-keys.
+        const evalResults = ext?.general
+            ? [ext.general]
+            : Object.values(ext ?? {});
+        for (const evalResult of evalResults) {
+            const repoSpecs = evalResult?.generatedRepoSpecs;
+            if (!repoSpecs || typeof repoSpecs !== "object")
+                continue;
+            for (const spec of Object.values(repoSpecs)) {
+                const urls = spec?.attributes;
+                const urlList = urls?.urls;
+                if (!Array.isArray(urlList) || urlList.length === 0)
+                    continue;
+                const url = urlList[0];
+                if (typeof url !== "string")
+                    continue;
+                // URL: https://static.crates.io/crates/<name>/<version>/download
+                // Using the URL (not the repo key) avoids the hyphen-in-name ambiguity.
+                const m = url.match(/\/crates\/([^/]+)\/([^/]+)\/download/);
+                if (!m)
+                    continue;
+                const [, name, version] = m;
+                const arr = result.get(name) ?? [];
+                arr.push(version);
+                result.set(name, arr);
+            }
+        }
+    }
+    catch (e) {
+        lib_core.debug(`rust: failed to parse MODULE.bazel.lock for crate versions: ${e}`);
+    }
+    return result;
+}
+/**
+ * Convert a Cargo version requirement to a form npm's semver package understands.
+ * Key differences handled:
+ * - Cargo uses ',' as an AND separator; npm semver uses a space.
+ * - A bare version ("1.2.3" with no operator) means caret (^) in Cargo but exact in npm semver.
+ */
+function cargoReqToNpmRange(req) {
+    // Replace Cargo AND separator
+    let r = req.replace(/,/g, " ").trim();
+    // Bare single-term numeric req (no operator, no wildcard) → treat as caret (Cargo semantics)
+    if (/^\d[^\s]*$/.test(r) && !r.includes("*") && !r.includes("x")) {
+        r = "^" + r;
+    }
+    return r;
+}
+/**
+ * Resolve a crate.spec range to the concrete version pinned in MODULE.bazel.lock.
+ * Falls back to the raw range on any resolution failure so that the version is
+ * never incorrectly changed (worst-case: registry lookup returns null → "unknown",
+ * same as before this fix).
+ */
+function resolveCrateVersion(name, range, lockVersions) {
+    const versions = lockVersions.get(name);
+    if (!versions || versions.length === 0)
+        return range;
+    const npmRange = cargoReqToNpmRange(range);
+    const best = node_modules_semver.maxSatisfying(versions, npmRange, { loose: true });
+    return best ?? range;
+}
+async function rust_getChangedDeps(baseRef, moduleBazelPath) {
+    const moduleFiles = await resolveModuleFiles(moduleBazelPath);
+    if (moduleFiles.length === 0) {
+        lib_core.info("rust: no MODULE.bazel files found");
+        return [];
+    }
+    const changedFiles = new Set(await gitDiffNameOnly(baseRef));
+    const relevantFiles = moduleFiles.filter((f) => changedFiles.has(f));
+    if (relevantFiles.length === 0) {
+        lib_core.info("rust: no MODULE.bazel files changed");
+        return [];
+    }
+    // Resolve crate.spec ranges to concrete versions using MODULE.bazel.lock at the workspace root.
+    const lockPath = moduleBazelPath + ".lock";
+    let lockVersions = new Map();
+    try {
+        const lockContent = await promises_.readFile(lockPath, "utf8");
+        lockVersions = parseCrateLockVersions(lockContent);
+    }
+    catch {
+        lib_core.debug(`rust: could not read MODULE.bazel.lock at ${lockPath}; version ranges will not be resolved`);
+    }
+    // Parse the base lockfile to skip crates whose resolved version was already on the base branch.
+    // This prevents false positives when a no-op range edit (e.g. ^0.13.5 → ~0.13.5) resolves to
+    // the same concrete version as before — the version was already vetted and shouldn't be re-checked.
+    const baseLockVersions = parseCrateLockVersions((await gitShowFile(baseRef, lockPath)) ?? "");
+    const allDeps = [];
+    for (const file of relevantFiles) {
+        // Parse HEAD version
+        let headContent;
+        try {
+            headContent = await promises_.readFile(file, "utf8");
+        }
+        catch {
+            continue;
+        }
+        const headSpecs = await extractCrateSpecs(headContent);
+        // Parse base version
+        const baseContent = await gitShowFile(baseRef, file);
+        const baseSpecs = baseContent ? await extractCrateSpecs(baseContent) : [];
+        const baseKeys = new Set(baseSpecs.map(specKey));
+        // Find new or changed crate specs
+        for (const spec of headSpecs) {
+            if (spec.isGit)
+                continue;
+            if (baseKeys.has(specKey(spec)))
+                continue;
+            const resolved = resolveCrateVersion(spec.package, spec.version, lockVersions);
+            // Skip if this exact concrete version was already present in the base lockfile —
+            // the PR didn't introduce it, so re-checking its age would be a false positive.
+            if (baseLockVersions.get(spec.package)?.includes(resolved))
+                continue;
+            allDeps.push({
+                ecosystem: "rust",
+                name: spec.package,
+                version: resolved,
+                file,
+            });
+        }
+    }
+    return allDeps;
+}
+async function rust_getPublishDate(name, version, registries) {
+    return cratesPublishDate(name, version, registries);
+}
+//# sourceMappingURL=rust.js.map
+;// CONCATENATED MODULE: ./out/ecosystems/java.js
+
+
+
+
+
+
+function parseArtifacts(json) {
+    try {
+        const data = JSON.parse(json);
+        const result = {};
+        if (data.artifacts) {
+            for (const [key, value] of Object.entries(data.artifacts)) {
+                const v = value?.version;
+                if (v)
+                    result[key] = v;
+            }
+        }
+        return result;
+    }
+    catch {
+        return {};
+    }
+}
+async function java_getChangedDeps(baseRef, moduleBazelPath) {
+    const moduleFiles = await resolveModuleFiles(moduleBazelPath);
+    const workspaceRoot = external_node_path_namespaceObject.resolve(external_node_path_namespaceObject.dirname(moduleBazelPath));
+    const allInstalls = [];
+    for (const file of moduleFiles) {
+        let content;
+        try {
+            content = await promises_.readFile(file, "utf8");
+        }
+        catch {
+            continue;
+        }
+        allInstalls.push(...(await extractMavenInstalls(content, workspaceRoot)));
+    }
+    if (allInstalls.length === 0) {
+        lib_core.info("java: no maven.install() blocks found");
+        return { deps: [], repositories: new Map() };
+    }
+    const allDeps = [];
+    // Map from "group:artifact" to repositories list for registry queries
+    const repoMap = new Map();
+    for (const install of allInstalls) {
+        const lockFile = install.lockFile;
+        let headJson;
+        try {
+            headJson = await promises_.readFile(lockFile, "utf8");
+        }
+        catch {
+            lib_core.info(`java: lock file ${lockFile} not found, skipping`);
+            continue;
+        }
+        const headArtifacts = parseArtifacts(headJson);
+        const baseJson = await gitShowFile(baseRef, lockFile);
+        const baseArtifacts = baseJson ? parseArtifacts(baseJson) : {};
+        for (const [key, version] of Object.entries(headArtifacts)) {
+            if (baseArtifacts[key] === version)
+                continue;
+            allDeps.push({
+                ecosystem: "java",
+                name: key,
+                version,
+                file: lockFile,
+            });
+            repoMap.set(key, install.repositories);
+        }
+    }
+    return { deps: allDeps, repositories: repoMap };
+}
+async function java_getPublishDate(name, version, repositories, registries) {
+    const parts = name.split(":");
+    if (parts.length !== 2)
+        return null;
+    return mavenPublishDate(parts[0], parts[1], version, repositories, registries);
+}
+//# sourceMappingURL=java.js.map
+;// CONCATENATED MODULE: ./out/ecosystems/bazel-module.js
+
+
+
+
+function parseModuleLock(content) {
+    const result = new Map();
+    try {
+        const data = JSON.parse(content);
+        // v3 format: moduleDepGraph with name/version entries
+        const graph = data.moduleDepGraph;
+        if (graph && typeof graph === "object") {
+            for (const [key, value] of Object.entries(graph)) {
+                if (key === "" || key === "<root>")
+                    continue;
+                const entry = value;
+                if (entry.name && entry.version) {
+                    result.set(entry.name, entry.version);
+                }
+            }
+            return result;
+        }
+        // v24+ format: modules with source.json in registryFileHashes
+        // are the resolved/selected modules
+        const rfh = data.registryFileHashes;
+        if (rfh && typeof rfh === "object") {
+            for (const url of Object.keys(rfh)) {
+                const match = url.match(/\/modules\/([^/]+)\/([^/]+)\/source\.json$/);
+                if (match) {
+                    result.set(match[1], match[2]);
+                }
+                else if (url.endsWith("source.json")) {
+                    lib_core.debug(`bazel: unexpected source.json URL format, skipping: ${url}`);
+                }
+            }
+        }
+    }
+    catch (e) {
+        lib_core.debug(`Failed to parse MODULE.bazel.lock: ${e}`);
+    }
+    return result;
+}
+async function bazel_module_getChangedDeps(baseRef, moduleBazelPath) {
+    const lockfilePath = moduleBazelPath + ".lock";
+    // Check if lockfile changed
+    const diff = await gitDiff(baseRef, lockfilePath);
+    if (!diff) {
+        lib_core.info("bazel: MODULE.bazel.lock not changed");
+        return { deps: [], overrides: new Map() };
+    }
+    // Parse HEAD lockfile
+    let headContent;
+    try {
+        headContent = await promises_.readFile(lockfilePath, "utf8");
+    }
+    catch {
+        lib_core.info(`bazel: could not read ${lockfilePath}`);
+        return { deps: [], overrides: new Map() };
+    }
+    const headModules = parseModuleLock(headContent);
+    const baseContent = await gitShowFile(baseRef, lockfilePath);
+    const baseModules = baseContent ? parseModuleLock(baseContent) : new Map();
+    // Collect overrides from all MODULE.bazel files
+    const allOverrides = new Map();
+    const moduleFiles = await resolveModuleFiles(moduleBazelPath);
+    for (const file of moduleFiles) {
+        let content;
+        try {
+            content = await promises_.readFile(file, "utf8");
+        }
+        catch {
+            continue;
+        }
+        const fileOverrides = await extractOverrides(content);
+        for (const [name, override] of fileOverrides) {
+            allOverrides.set(name, override);
+        }
+    }
+    // Find changed modules
+    const deps = [];
+    for (const [name, version] of headModules) {
+        if (baseModules.get(name) === version)
+            continue;
+        // Skip local_path_override modules
+        const override = allOverrides.get(name);
+        if (override?.type === "local_path") {
+            lib_core.info(`bazel: skipping ${name} (local_path_override)`);
+            continue;
+        }
+        deps.push({
+            ecosystem: "bazel",
+            name,
+            version,
+            file: lockfilePath,
+        });
+    }
+    return { deps, overrides: allOverrides };
+}
+//# sourceMappingURL=bazel-module.js.map
+;// CONCATENATED MODULE: ./out/ecosystems/actions.js
+
+
+
+
+const SHA_RE = /^[0-9a-f]{40}$/;
+const branchSkipLogged = new Set();
+// Cache ref → resolved commit SHA (null = resolution failed / branch). Shared across files in a run.
+const refShaCache = new Map();
+// Exported for test isolation only — clears module-level caches between test cases.
+function __resetCaches() {
+    refShaCache.clear();
+    branchSkipLogged.clear();
+}
+function isCommitSha(ref) {
+    return SHA_RE.test(ref);
+}
+/**
+ * Resolve a ref (SHA, tag, or branch) to its underlying commit SHA via the GitHub API.
+ * Returns the SHA, or null if resolution fails (rate-limited, private repo, branch, error).
+ * Caches results to avoid redundant API calls within a run.
+ */
+async function resolveRefToSha(owner, repo, ref, token) {
+    const cacheKey = `${owner}/${repo}@${ref}`;
+    const cached = refShaCache.get(cacheKey);
+    if (cached !== undefined)
+        return cached;
+    if (isCommitSha(ref)) {
+        refShaCache.set(cacheKey, ref);
+        return ref;
+    }
+    const result = await githubApiFetch(`https://api.github.com/repos/${owner}/${repo}/commits/${ref}`, token);
+    const sha = result.kind === "ok" && typeof result.data?.sha === "string"
+        ? result.data.sha
+        : null;
+    refShaCache.set(cacheKey, sha);
+    return sha;
+}
+/**
+ * Parse `uses:` directives from a workflow or composite action YAML file.
+ * Returns a map of "owner/repo@ref" (or "owner/repo/path@ref") → ActionRef.
+ * Delegates to parseActionRefsWithPositions (single parse grammar for both consumers).
+ */
+function parseActionRefs(content) {
+    const refs = new Map();
+    for (const r of parseActionRefsWithPositions(content)) {
+        refs.set(r.raw, { owner: r.owner, repo: r.repo, path: r.path, ref: r.ref, raw: r.raw });
+    }
+    return refs;
+}
+/**
+ * Parse `uses:` directives from a workflow or composite action YAML file,
+ * returning position info (byte offset and length of each match in the
+ * original source string, plus any trailing inline comment).
+ *
+ * The returned map is keyed by the raw `uses:` value (same as parseActionRefs).
+ */
+function parseActionRefsWithPositions(content) {
+    const refs = [];
+    // Filter out YAML comment lines before regex matching (same as parseActionRefs),
+    // but we operate on the original content for offset tracking.
+    // Build a per-line comment-mask: lines that are comment-only are skipped.
+    const lines = content.split("\n");
+    // We scan the original content directly, skipping comment lines by tracking
+    // which character ranges belong to comment-only lines.
+    const commentLineRanges = new Set(); // line indices that are comment-only
+    for (let i = 0; i < lines.length; i++) {
+        if (lines[i].trimStart().startsWith("#")) {
+            commentLineRanges.add(i);
+        }
+    }
+    // Pre-scan for `run:` block-scalar spans (YAML `|`/`>` block scalars after a `run:` key).
+    // Lines inside such spans contain arbitrary shell code which may include a literal "uses:"
+    // token that would pass the linePrefix whitespace guard — they must be excluded entirely.
+    // Algorithm: when a `run: |` or `run: >` is found at indentation N, mark all subsequent
+    // lines whose indentation is STRICTLY greater than N as block-scalar body lines.
+    // Blank lines inside a block scalar are left-unmarked (they can never match the `uses:` regex
+    // since the regex requires a non-whitespace value), so skipping them is harmless.
+    const runBlockScalarLines = new Set();
+    // Matches `run: |` or `run: >` in both mapping (`run: |`) and sequence (`- run: |`) forms.
+    // Group 1 captures everything before `run` (leading spaces + optional `- `) so blockIndent
+    // equals the column position of the `run` keyword — block scalar body must be indented
+    // strictly beyond that column.
+    const runBlockRe = /^([ \t]*(?:-[ \t]+)?)run\s*:[ \t]*[|>]/;
+    for (let i = 0; i < lines.length; i++) {
+        const m = runBlockRe.exec(lines[i]);
+        if (!m)
+            continue;
+        const blockIndent = m[1].length; // column of the `run` keyword
+        for (let j = i + 1; j < lines.length; j++) {
+            const jLine = lines[j];
+            const jTrimmed = jLine.trimStart();
+            if (jTrimmed === "")
+                continue; // blank lines: remain inside the block scalar, skip marking
+            const jIndent = jLine.length - jTrimmed.length;
+            if (jIndent > blockIndent) {
+                runBlockScalarLines.add(j);
+            }
+            else {
+                break; // dedent to ≤ blockIndent ends the block scalar
+            }
+        }
+    }
+    // Build line start offsets so we can map a match offset to a line index.
+    const lineStarts = [];
+    let pos = 0;
+    for (const line of lines) {
+        lineStarts.push(pos);
+        pos += line.length + 1; // +1 for '\n'
+    }
+    // Capture optional opening quote char (group 1), then the value (group 2).
+    const re = /\buses:\s*(['"]?)([^'"#\s]+)\1/g;
+    let match;
+    while ((match = re.exec(content)) !== null) {
+        // Binary search lineStarts to find which line this match falls on
+        const offset = match.index;
+        let lo = 0;
+        let hi = lineStarts.length - 1;
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (lineStarts[mid] <= offset)
+                lo = mid;
+            else
+                hi = mid - 1;
+        }
+        const lineIdx = lo;
+        // Skip if this line is a comment-only line
+        if (commentLineRanges.has(lineIdx))
+            continue;
+        // Skip lines that are inside a `run:` block scalar body — they contain arbitrary shell
+        // code whose `uses:` tokens are not YAML step directives. Without this guard, a shell
+        // script line like `    uses: fake/action@v1` would pass the linePrefix whitespace check
+        // and be mistakenly treated as a real action ref, causing a corrupting byte-offset rewrite.
+        if (runBlockScalarLines.has(lineIdx))
+            continue;
+        // Skip if `uses:` is not the first key-value token on the line (e.g. inside a run: shell string).
+        // The text from line start up to the `uses:` keyword must be only whitespace and list-bullet dashes.
+        const linePrefix = content.slice(lineStarts[lineIdx], match.index);
+        if (!/^[\s-]*$/.test(linePrefix))
+            continue;
+        const quoteChar = match[1] || null;
+        const raw = match[2];
+        // Skip local, docker, and any runtime-variable action refs.
+        // Any "$" in the ref (bash variable like "$ACTIONS_REF" or GHA expression
+        // like "${{ matrix.ref }}") means the value is not a literal and cannot be
+        // safely rewritten — the resolved value is unknown at parse time.
+        if (raw.startsWith("./") || raw.startsWith("docker://") || raw.includes("$"))
+            continue;
+        const atIdx = raw.lastIndexOf("@");
+        if (atIdx === -1)
+            continue;
+        const fullName = raw.slice(0, atIdx);
+        const ref = raw.slice(atIdx + 1);
+        // Parse owner/repo or owner/repo/path
+        const parts = fullName.split("/");
+        if (parts.length < 2)
+            continue;
+        const owner = parts[0];
+        const repo = parts[1];
+        const subpath = parts.slice(2).join("/");
+        // Scan for trailing inline comment on the same line, after the match ends.
+        // Capture leading whitespace too so trailingCommentLength includes it.
+        const matchEnd = match.index + match[0].length;
+        const lineEnd = lineStarts[lineIdx] + lines[lineIdx].length;
+        const afterMatch = content.slice(matchEnd, lineEnd);
+        const commentMatch = /^(\s*#[^\r\n]*)/.exec(afterMatch);
+        const trailingCommentLength = commentMatch ? commentMatch[1].length : 0;
+        const trailingComment = trailingCommentLength > 0 ? commentMatch[1].trimStart() : null;
+        const refWithPos = {
+            owner,
+            repo,
+            path: subpath,
+            ref,
+            raw,
+            matchOffset: match.index,
+            matchLength: match[0].length,
+            trailingComment,
+            trailingCommentLength,
+            quoteChar,
+        };
+        refs.push(refWithPos);
+    }
+    return refs;
+}
+/** Exported so the updater can reuse the same default glob list without duplicating it. */
+const DEFAULT_WORKFLOW_GLOBS = [
+    ".github/workflows/*.yml",
+    ".github/workflows/*.yaml",
+    ".github/actions/*/action.yml",
+    ".github/actions/*/action.yaml",
+    "action.yml",
+    "action.yaml",
+];
+async function actions_getChangedDeps(baseRef, workflowFilesInput, token = "") {
+    let files;
+    if (workflowFilesInput) {
+        const allFiles = new Set(await resolveFiles(workflowFilesInput));
+        const changedFiles = await gitDiffNameOnly(baseRef);
+        files = changedFiles.filter((f) => allFiles.has(f));
+    }
+    else {
+        // Auto-detect: find which default workflow files were changed
+        const changedFiles = new Set(await gitDiffNameOnly(baseRef));
+        files = [];
+        for (const pattern of DEFAULT_WORKFLOW_GLOBS) {
+            try {
+                const resolved = await resolveFiles(pattern);
+                for (const f of resolved) {
+                    if (changedFiles.has(f))
+                        files.push(f);
+                }
+            }
+            catch {
+                // pattern didn't match anything
+            }
+        }
+    }
+    if (files.length === 0) {
+        lib_core.info("actions: no changed workflow files");
+        return [];
+    }
+    const allDeps = [];
+    for (const file of files) {
+        const diff = await gitDiff(baseRef, file);
+        if (!diff)
+            continue;
+        let headContent;
+        try {
+            headContent = await promises_.readFile(file, "utf8");
+        }
+        catch {
+            lib_core.info(`actions: could not read ${file}`);
+            continue;
+        }
+        const baseContent = await gitShowFile(baseRef, file);
+        const headRefs = parseActionRefs(headContent);
+        const baseRefs = baseContent ? parseActionRefs(baseContent) : new Map();
+        // Group base refs by action name so we can compare commit SHAs when the ref string changes.
+        const baseByName = new Map();
+        for (const bRef of baseRefs.values()) {
+            const n = `${bRef.owner}/${bRef.repo}${bRef.path ? "/" + bRef.path : ""}`;
+            const arr = baseByName.get(n) ?? [];
+            arr.push(bRef);
+            baseByName.set(n, arr);
+        }
+        for (const [key, ref] of headRefs) {
+            // Skip if the exact ref string is unchanged from base
+            if (baseRefs.has(key))
+                continue;
+            const name = `${ref.owner}/${ref.repo}${ref.path ? "/" + ref.path : ""}`;
+            const sameNameBase = baseByName.get(name);
+            if (sameNameBase) {
+                // Base had this action with a different ref string — resolve both sides to commit SHAs.
+                // If the underlying commit is unchanged, the PR didn't actually change the action's code,
+                // so skip it. If resolution fails for either side, flag conservatively (never skip on doubt).
+                const headSha = await resolveRefToSha(ref.owner, ref.repo, ref.ref, token);
+                if (headSha !== null) {
+                    let sameCommit = false;
+                    for (const bRef of sameNameBase) {
+                        const baseSha = await resolveRefToSha(bRef.owner, bRef.repo, bRef.ref, token);
+                        if (baseSha === headSha) {
+                            sameCommit = true;
+                            break;
+                        }
+                    }
+                    if (sameCommit)
+                        continue;
+                }
+            }
+            allDeps.push({
+                ecosystem: "actions",
+                name,
+                version: ref.ref,
+                file,
+            });
+        }
+    }
+    return allDeps;
+}
+/**
+ * Query GitHub API to get the date associated with an action ref.
+ * - Commit SHA: get commit date
+ * - Tag: get tag/release date
+ * - Branch: return null (skip)
+ */
+async function actions_getPublishDate(name, ref, token) {
+    // Extract owner/repo from name (strip subpath if present)
+    const parts = name.split("/");
+    if (parts.length < 2)
+        return null;
+    const owner = parts[0];
+    const repo = parts[1];
+    if (isCommitSha(ref)) {
+        return getCommitDate(owner, repo, ref, token);
+    }
+    // Try as a tag first
+    const tagDate = await getTagDate(owner, repo, ref, token);
+    if (tagDate !== null)
+        return tagDate;
+    // Not a tag → assume branch → skip (dedup log)
+    const key = `${name}@${ref}`;
+    if (!branchSkipLogged.has(key)) {
+        branchSkipLogged.add(key);
+        lib_core.info(`actions: ${key} appears to be a branch, skipping`);
+    }
+    return null;
+}
+async function getCommitDate(owner, repo, sha, token) {
+    const result = await githubApiFetch(`https://api.github.com/repos/${owner}/${repo}/commits/${sha}`, token);
+    if (result.kind !== "ok")
+        return null;
+    const data = result.data;
+    const date = data?.commit?.committer?.date;
+    return date ? new Date(date) : null;
+}
+async function getTagDate(owner, repo, tag, token) {
+    // First check if this ref is a tag
+    const refResult = await githubApiFetch(`https://api.github.com/repos/${owner}/${repo}/git/ref/tags/${tag}`, token);
+    if (refResult.kind !== "ok")
+        return null;
+    const refData = refResult.data;
+    if (!refData.object)
+        return null;
+    // If it's an annotated tag, fetch the tag object for the tagger date
+    if (refData.object.type === "tag" && refData.object.url) {
+        const tagResult = await githubApiFetch(refData.object.url, token);
+        if (tagResult.kind === "ok") {
+            const tagData = tagResult.data;
+            if (tagData?.tagger?.date) {
+                return new Date(tagData.tagger.date);
+            }
+        }
+    }
+    // Lightweight tag or fallback — get the commit date
+    if (refData.object.sha) {
+        return getCommitDate(owner, repo, refData.object.sha, token);
+    }
+    return null;
+}
+//# sourceMappingURL=actions.js.map
+// EXTERNAL MODULE: ./node_modules/.pnpm/dockerfile-ast@0.7.1/node_modules/dockerfile-ast/lib/main.js
+var main = __nccwpck_require__(4908);
+;// CONCATENATED MODULE: ./out/ecosystems/image.js
+
+
+
+const mutableSkipLogged = new Set();
+/**
+ * OCI distribution reference grammar for repository paths (registry stripped).
+ * path-component = [a-z0-9]+ (separator [a-z0-9]+)*
+ * separator       = [._] | __ | -+
+ * repository      = path-component ('/' path-component)*
+ *
+ * This rejects placeholder tokens like __DIND_IMAGE__, {{image}}, %VAR%,
+ * uppercase names, and any other string that is not a legal image name.
+ */
+const REPOSITORY_RE = /^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*)*$/;
+/**
+ * Parse an OCI/Docker image reference string into its components.
+ *
+ * Grammar: [registry[:port]/]repository[:tag][@digest]
+ * Registry detection: first path segment is a host if it contains '.' or a
+ * numeric port suffix (':' + all-digits) or equals 'localhost'. Otherwise the
+ * image is on Docker Hub. Single-segment Docker Hub repos are normalized to
+ * library/<name> so API lookups work (e.g. "postgres" → "library/postgres").
+ * Returns null for references whose repository path is not a legal OCI name
+ * (e.g. placeholder tokens like __DIND_IMAGE__, uppercase refs, etc.).
+ */
+function parseImageRef(raw) {
+    const trimmed = raw.trim();
+    if (!trimmed)
+        return null;
+    // Split off digest (everything after the last '@').
+    // Only treat as a digest if it has the algorithm:hex form (e.g. sha256:...).
+    // Bare @tag typos like "nginx@latest" don't contain ':' and are left as-is
+    // (digest remains null, treated as mutable tag-only → unknown).
+    const atIdx = trimmed.lastIndexOf("@");
+    let digest = null;
+    let refPart;
+    if (atIdx !== -1) {
+        const candidate = trimmed.slice(atIdx + 1);
+        if (candidate.includes(":")) {
+            digest = candidate;
+            refPart = trimmed.slice(0, atIdx);
+        }
+        else {
+            refPart = trimmed;
+        }
+    }
+    else {
+        refPart = trimmed;
+    }
+    // Determine registry host vs repository+tag
+    let registry;
+    let repoAndTag;
+    const slashIdx = refPart.indexOf("/");
+    if (slashIdx !== -1) {
+        const firstSegment = refPart.slice(0, slashIdx);
+        // A segment is a registry host if it has '.', a numeric ':port', or is 'localhost'
+        const isRegistryHost = firstSegment.includes(".") ||
+            /:\d+$/.test(firstSegment) ||
+            firstSegment === "localhost";
+        if (isRegistryHost) {
+            registry = firstSegment;
+            repoAndTag = refPart.slice(slashIdx + 1);
+        }
+        else {
+            registry = "docker.io";
+            repoAndTag = refPart;
+        }
+    }
+    else {
+        // No slash — entire refPart is 'name' or 'name:tag' on Docker Hub
+        registry = "docker.io";
+        repoAndTag = refPart;
+    }
+    // Split tag off repoAndTag: last ':' in the final path segment (never in an
+    // intermediate segment since repo path segments cannot contain ':')
+    let repository;
+    let tag = null;
+    const lastSlash = repoAndTag.lastIndexOf("/");
+    const lastSegment = lastSlash !== -1 ? repoAndTag.slice(lastSlash + 1) : repoAndTag;
+    const colonIdx = lastSegment.lastIndexOf(":");
+    if (colonIdx !== -1) {
+        const tagCandidate = lastSegment.slice(colonIdx + 1);
+        if (tagCandidate) {
+            tag = tagCandidate;
+            repository =
+                lastSlash !== -1
+                    ? repoAndTag.slice(0, lastSlash + 1) +
+                        lastSegment.slice(0, colonIdx)
+                    : lastSegment.slice(0, colonIdx);
+        }
+        else {
+            repository = repoAndTag;
+        }
+    }
+    else {
+        repository = repoAndTag;
+    }
+    // Docker Hub single-segment repos need the 'library/' prefix for API calls
+    // e.g. "postgres" → "library/postgres", "coredns/coredns" stays as-is
+    if (registry === "docker.io" && !repository.includes("/")) {
+        repository = `library/${repository}`;
+    }
+    if (!REPOSITORY_RE.test(repository))
+        return null;
+    return { raw, registry, repository, tag, digest };
+}
+/** True for the two ecosystems whose versions are OCI image refs ("tag@digest"). */
+function isOciEcosystem(ecosystem) {
+    return ecosystem === "docker" || ecosystem === "kubernetes";
+}
+/**
+ * Return true when the dep's current version is an undigested (tag-only) OCI ref.
+ * This is the age-gate-bypass check — pinning a mutable tag to its current digest
+ * introduces no new content, so the age gate's purpose does not apply.
+ * Used in BOTH the verify action and the update CLI; defined here to avoid
+ * triple-duplication of the security-relevant `!current.includes("@")` predicate.
+ */
+function wasUnpinnedRef(dep) {
+    return !dep.current.includes("@");
+}
+/**
+ * Return the version portion to use for semver comparisons for a dep.
+ * For OCI ecosystems the version string is "tag@digest"; we compare by tag only.
+ * For all other ecosystems the version string is used directly.
+ */
+function currentTagOf(dep) {
+    return isOciEcosystem(dep.ecosystem) ? ociTagOf(dep.current) : dep.current;
+}
+/** Return the tag portion of an OCI version string ("tag@sha256:..." → "tag"). */
+function ociTagOf(imageRef) {
+    const idx = imageRef.indexOf("@");
+    return idx >= 0 ? imageRef.slice(0, idx) : imageRef;
+}
+/** Return the digest portion of an OCI version string, or null when absent. */
+function ociDigestOf(imageRef) {
+    const idx = imageRef.indexOf("@");
+    return idx >= 0 ? imageRef.slice(idx + 1) : null;
+}
+function makeName(ref) {
+    return `${ref.registry}/${ref.repository}`;
+}
+function makeVersion(ref) {
+    if (ref.digest && ref.tag)
+        return `${ref.tag}@${ref.digest}`;
+    if (ref.digest)
+        return ref.digest;
+    if (ref.tag)
+        return ref.tag;
+    return "latest";
+}
+/**
+ * Strip tag and digest from a raw image ref string, returning the bare registry/repo prefix.
+ * e.g. "registry.example.com/repo:tag@sha256:abc" → "registry.example.com/repo"
+ */
+function stripTagAndDigest(raw) {
+    let base = raw;
+    // Remove digest (@sha256:...) first
+    const digestAt = base.lastIndexOf("@");
+    if (digestAt !== -1)
+        base = base.slice(0, digestAt);
+    // Remove tag from last segment (last : in the last path component after the last /)
+    const lastSlash = base.lastIndexOf("/");
+    const lastSegment = lastSlash !== -1 ? base.slice(lastSlash + 1) : base;
+    const colonIdx = lastSegment.lastIndexOf(":");
+    if (colonIdx !== -1) {
+        base = base.slice(0, base.length - lastSegment.length + colonIdx);
+    }
+    return base;
+}
+/**
+ * Build a replacement image ref string that preserves the author's original
+ * registry/repo spelling from the raw ref, only updating the tag and digest.
+ * Used by the docker and kubernetes updaters for in-place rewrites.
+ */
+function buildReplacedImageRef(raw, newTag, newDigest) {
+    const base = stripTagAndDigest(raw);
+    if (newDigest)
+        return `${base}:${newTag}@${newDigest}`;
+    return `${base}:${newTag}`;
+}
+/**
+ * Resolved identity for base-vs-HEAD comparison: the concrete content a ref
+ * pins to, independent of cosmetic differences in the raw string.
+ * Digest-pinned images compare by `name@digest`, so a relabeled tag pointing at
+ * an already-vetted digest (or a registry-spelling change) is not re-flagged.
+ * Tag-only images compare by `name:tag` (the digest is unknown/mutable).
+ */
+function imageIdentity(ref) {
+    return ref.digest
+        ? `${makeName(ref)}@${ref.digest}`
+        : `${makeName(ref)}:${ref.tag ?? "latest"}`;
+}
+/**
+ * Get the publish date for an image reference.
+ * Only digest-pinned (@sha256:...) refs are queried — tag-only refs are
+ * mutable and cannot be reliably age-gated, so they return null (unknown).
+ *
+ * @param ref   Parsed image ref (may be undefined for lookup-miss cases).
+ * @param label Ecosystem label used in log messages (e.g. "kubernetes", "docker").
+ */
+async function getImagePublishDate(ref, label) {
+    if (!ref?.digest) {
+        const key = ref
+            ? `${makeName(ref)}:${ref.tag ?? "latest"}`
+            : "unknown";
+        const dedupKey = `${label}:${key}`;
+        if (!mutableSkipLogged.has(dedupKey)) {
+            mutableSkipLogged.add(dedupKey);
+            lib_core.info(`${label}: ${key} has no digest (mutable tag), skipping age check`);
+        }
+        return null;
+    }
+    return registry_fetchImagePublishDate(ref.registry, ref.repository, ref.digest, ref.tag);
+}
+/**
+ * Resolve an OCI image tag to its current digest, then fetch and compute its
+ * publish-date age — the full `ociDigestForTag → fetchImagePublishDate →
+ * computeAgeDays` sequence shared by the verify path (latest.ts docker/k8s
+ * case) and the update CLI (run.ts resolvePins).
+ *
+ * Returns { digest: null, publishDate: null, ageDays: null } when the digest
+ * cannot be resolved (private/unreachable registry) — always fail-closed.
+ */
+async function resolveImageDigestAndAge(registry, repository, tag, dockerhubMirror) {
+    const digest = await ociDigestForTag(registry, repository, tag, dockerhubMirror);
+    if (!digest)
+        return { digest: null, publishDate: null, ageDays: null };
+    const publishDate = await fetchImagePublishDate(registry, repository, digest, tag);
+    return { digest, publishDate, ageDays: computeAgeDays(publishDate) };
+}
+/**
+ * Given an already-resolved digest, fetch and compute its publish-date age.
+ * Used by run.ts resolvePins when the digest is already available (e.g. from
+ * the pre-resolved digest cache) so a second ociDigestForTag call is not needed.
+ * `fetchImagePublishDate → computeAgeDays` is the shared sub-sequence.
+ */
+async function fetchImageAgeFromDigest(registry, repository, digest, tag) {
+    const publishDate = await fetchImagePublishDate(registry, repository, digest, tag);
+    return { publishDate, ageDays: computeAgeDays(publishDate) };
+}
+//# sourceMappingURL=image.js.map
+;// CONCATENATED MODULE: ./out/ecosystems/docker.js
+
+
+
+
+
+
+/**
+ * Parse a Dockerfile (or Containerfile) content and return all external image
+ * references found in FROM, COPY --from=, and RUN --mount=...,from= directives.
+ *
+ * Delegates to parseDockerfileImagesWithPositions (single parse grammar for both
+ * the verify and update consumers). First occurrence per raw string wins.
+ */
+function parseDockerfileImages(content) {
+    const seen = new Set();
+    const results = [];
+    for (const { raw, ref, source } of parseDockerfileImagesWithPositions(content)) {
+        if (ref === null || seen.has(raw))
+            continue;
+        seen.add(raw);
+        results.push({ raw, ref, source });
+    }
+    return results;
+}
+/**
+ * Parse a Dockerfile/Containerfile and return all external image references
+ * with their source-level position info (line index and character offset).
+ *
+ * Uses the same filtering logic as parseDockerfileImages but additionally
+ * captures the exact position of the image ref string using dockerfile-ast's
+ * Range API, so callers can perform surgical in-place rewrites.
+ */
+function parseDockerfileImagesWithPositions(content) {
+    const dockerfile = main.DockerfileParser.parse(content);
+    const instructions = dockerfile.getInstructions();
+    // Collect all build-stage aliases (same logic as parseDockerfileImages)
+    const stageAliases = new Set();
+    for (const instruction of instructions) {
+        if (instruction instanceof main.From) {
+            const buildStage = instruction.getBuildStage();
+            if (buildStage != null) {
+                stageAliases.add(buildStage.toLowerCase());
+            }
+        }
+    }
+    const allRefs = [];
+    function emit(raw, source, lineIndex, lineOffset, lineLength, instrLineIndex, buildStage, instrEndLine, instrEndChar) {
+        const ref = parseImageRef(raw);
+        if (ref === null)
+            return;
+        allRefs.push({ raw, ref, source, lineIndex, lineOffset, lineLength, instrLineIndex, buildStage, instrEndLine, instrEndChar });
+    }
+    function processFromValue(value, source, lineIndex, lineOffset, lineLength, instrLineIndex, instrEndLine, instrEndChar) {
+        if (value == null || value === "")
+            return;
+        if (value.includes("$"))
+            return;
+        if (stageAliases.has(value.toLowerCase()))
+            return;
+        if (/^\d+$/.test(value))
+            return;
+        emit(value, source, lineIndex, lineOffset, lineLength, instrLineIndex, null, instrEndLine, instrEndChar);
+    }
+    for (const instruction of instructions) {
+        const instrLineIndex = instruction.getRange().start.line;
+        const instrEnd = instruction.getRange().end;
+        if (instruction instanceof main.From) {
+            const image = instruction.getImage();
+            if (image == null)
+                continue;
+            if (image.trim().toLowerCase() === "scratch")
+                continue;
+            if (image.includes("$"))
+                continue;
+            if (stageAliases.has(image.trim().toLowerCase()))
+                continue;
+            const buildStage = instruction.getBuildStage() ?? null;
+            const imgRange = instruction.getImageRange();
+            if (imgRange == null) {
+                // Fallback: use instruction range start as best approximation
+                const instRange = instruction.getRange();
+                emit(image, "from", instRange.start.line, instRange.start.character, image.length, instrLineIndex, buildStage, instrEnd.line, instrEnd.character);
+            }
+            else {
+                emit(image, "from", imgRange.start.line, imgRange.start.character, imgRange.end.character - imgRange.start.character, instrLineIndex, buildStage, instrEnd.line, instrEnd.character);
+            }
+            continue;
+        }
+        if (instruction instanceof main.Copy) {
+            const fromFlag = instruction
+                .getFlags()
+                .find((f) => f.getName() === "from");
+            if (fromFlag == null)
+                continue;
+            const value = fromFlag.getValue();
+            const valRange = fromFlag.getValueRange();
+            if (valRange != null) {
+                processFromValue(value, "copy-from", valRange.start.line, valRange.start.character, valRange.end.character - valRange.start.character, instrLineIndex, instrEnd.line, instrEnd.character);
+            }
+            else {
+                // Fallback: use flag range
+                const flagRange = fromFlag.getRange();
+                processFromValue(value, "copy-from", flagRange.start.line, flagRange.start.character + "--from=".length, value?.length ?? 0, instrLineIndex, instrEnd.line, instrEnd.character);
+            }
+            continue;
+        }
+        if (instruction instanceof main.Run) {
+            const mountFlags = instruction
+                .getFlags()
+                .filter((f) => f.getName() === "mount");
+            for (const mountFlag of mountFlags) {
+                const mountType = mountFlag.getOption("type")?.getValue() ?? null;
+                if (mountType != null && mountType !== "bind" && mountType !== "cache") {
+                    continue;
+                }
+                const fromOpt = mountFlag.getOption("from");
+                const fromValue = fromOpt?.getValue();
+                const valRange = fromOpt?.getValueRange ? fromOpt.getValueRange() : null;
+                if (valRange != null) {
+                    processFromValue(fromValue, "mount-from", valRange.start.line, valRange.start.character, valRange.end.character - valRange.start.character, instrLineIndex, instrEnd.line, instrEnd.character);
+                }
+                else if (fromValue != null) {
+                    // Fallback: best-effort position from mount flag range
+                    const mountRange = mountFlag.getRange();
+                    processFromValue(fromValue, "mount-from", mountRange.start.line, mountRange.start.character, fromValue.length, instrLineIndex, instrEnd.line, instrEnd.character);
+                }
+            }
+        }
+    }
+    return allRefs;
+}
+function isDockerfileName(filePath) {
+    const basename = filePath.includes("/")
+        ? filePath.slice(filePath.lastIndexOf("/") + 1)
+        : filePath;
+    const lower = basename.toLowerCase();
+    return lower === "dockerfile" || lower === "containerfile";
+}
+async function docker_getChangedDeps(baseRef, dockerfilesInput, dockerhubMirror) {
+    let files;
+    if (dockerfilesInput) {
+        const allFiles = new Set(await resolveFiles(dockerfilesInput));
+        const changedFiles = await gitDiffNameOnly(baseRef);
+        files = changedFiles.filter((f) => allFiles.has(f));
+    }
+    else {
+        // Auto-detect: any changed file whose basename looks like a Dockerfile
+        const changedFiles = await gitDiffNameOnly(baseRef);
+        files = changedFiles.filter(isDockerfileName);
+    }
+    if (files.length === 0) {
+        lib_core.info("docker: no changed Dockerfile/Containerfile files");
+        return { deps: [], imageRefs: new Map() };
+    }
+    const allDeps = [];
+    const imageRefs = new Map();
+    for (const file of files) {
+        const diff = await gitDiff(baseRef, file);
+        if (!diff)
+            continue;
+        let headContent;
+        try {
+            headContent = await promises_.readFile(file, "utf8");
+        }
+        catch {
+            lib_core.info(`docker: could not read ${file}`);
+            continue;
+        }
+        const headCandidates = parseDockerfileImages(headContent);
+        if (headCandidates.length === 0)
+            continue; // not a Dockerfile with FROM
+        const baseContent = await gitShowFile(baseRef, file);
+        const baseCandidates = baseContent
+            ? parseDockerfileImages(baseContent)
+            : [];
+        // Compare by resolved identity (digest), not raw string: a no-op relabel of a
+        // digest-pinned image already on base must not be re-flagged.
+        const baseIdentities = new Set(baseCandidates.map((c) => imageIdentity(c.ref)));
+        for (const candidate of headCandidates) {
+            if (baseIdentities.has(imageIdentity(candidate.ref)))
+                continue; // identity already on base
+            const { raw, ref, source } = candidate;
+            // For COPY --from and RUN --mount=from, require positive confirmation that
+            // the image exists before treating it as a real external image dependency.
+            // "unknown" (401/429/network error) is also treated as unconfirmed — these
+            // sources are ambiguous (build contexts, stage aliases, typos) and we
+            // prefer false-negatives over false-positives.
+            if (source === "copy-from" || source === "mount-from") {
+                const reference = ref.digest ?? ref.tag ?? "latest";
+                const exists = await imageExists(ref.registry, ref.repository, reference, dockerhubMirror);
+                if (exists !== "found") {
+                    lib_core.info(`docker: ${raw} not confirmed in registry (${exists}; build context, alias, or typo), skipping`);
+                    continue;
+                }
+            }
+            const name = makeName(ref);
+            const version = makeVersion(ref);
+            const key = `${name}@${version}`;
+            imageRefs.set(key, ref);
+            allDeps.push({
+                ecosystem: "docker",
+                name,
+                version,
+                file,
+            });
+        }
+    }
+    return { deps: allDeps, imageRefs };
+}
+/**
+ * Get the publish date for a Docker image reference.
+ * Only digest-pinned (@sha256:...) refs are queried — tag-only refs are
+ * mutable and cannot be reliably age-gated, so they return null (unknown).
+ */
+async function docker_getPublishDate(ref) {
+    return getImagePublishDate(ref, "docker");
+}
+//# sourceMappingURL=docker.js.map
+;// CONCATENATED MODULE: ./out/ecosystems/multitool.js
+
+
+
+
+
+
+function parseMultitoolLock(content) {
+    const result = new Map();
+    try {
+        const data = JSON.parse(content);
+        for (const [key, value] of Object.entries(data)) {
+            if (key.startsWith("$"))
+                continue;
+            const urls = (value?.binaries ?? [])
+                .map((b) => b?.url)
+                .filter(Boolean)
+                .sort()
+                .join("\n");
+            if (urls) {
+                result.set(key, urls);
+            }
+        }
+    }
+    catch (e) {
+        lib_core.debug(`Failed to parse multitool lockfile: ${e}`);
+    }
+    return result;
+}
+function findChangedTools(head, base, file) {
+    const deps = [];
+    for (const [name, url] of head) {
+        if (base.get(name) === url)
+            continue;
+        deps.push({
+            ecosystem: "multitool",
+            name,
+            version: url,
+            file,
+        });
+    }
+    return deps;
+}
+async function multitool_getChangedDeps(baseRef, moduleBazelPath) {
+    const moduleFiles = await resolveModuleFiles(moduleBazelPath);
+    const workspaceRoot = external_node_path_namespaceObject.resolve(external_node_path_namespaceObject.dirname(moduleBazelPath));
+    const lockfiles = [];
+    for (const file of moduleFiles) {
+        let content;
+        try {
+            content = await promises_.readFile(file, "utf8");
+        }
+        catch {
+            continue;
+        }
+        const hubs = await extractMultitoolHubs(content, workspaceRoot);
+        lockfiles.push(...hubs);
+    }
+    if (lockfiles.length === 0) {
+        lib_core.info("multitool: no lockfiles found");
+        return [];
+    }
+    const allDeps = [];
+    for (const file of lockfiles) {
+        const diff = await gitDiff(baseRef, file);
+        if (!diff) {
+            lib_core.info(`multitool: no changes in ${file}`);
+            continue;
+        }
+        let headContent;
+        try {
+            headContent = await promises_.readFile(file, "utf8");
+        }
+        catch {
+            lib_core.info(`multitool: could not read ${file}`);
+            continue;
+        }
+        const headTools = parseMultitoolLock(headContent);
+        const baseContent = await gitShowFile(baseRef, file);
+        const baseTools = baseContent ? parseMultitoolLock(baseContent) : new Map();
+        allDeps.push(...findChangedTools(headTools, baseTools, file));
+    }
+    return allDeps;
+}
+async function multitool_getPublishDate(url) {
+    return archiveDate(url);
+}
+//# sourceMappingURL=multitool.js.map
+;// CONCATENATED MODULE: ./out/ecosystems/kubernetes.js
+
+
+
+
+
+/** Recursively walk a parsed YAML value and collect container image strings. */
+function extractImages(obj, out) {
+    if (!obj || typeof obj !== "object")
+        return;
+    if (Array.isArray(obj)) {
+        for (const item of obj)
+            extractImages(item, out);
+        return;
+    }
+    const rec = obj;
+    for (const key of Object.keys(rec)) {
+        if (key === "containers" ||
+            key === "initContainers" ||
+            key === "ephemeralContainers") {
+            const arr = rec[key];
+            if (Array.isArray(arr)) {
+                for (const container of arr) {
+                    if (container &&
+                        typeof container === "object" &&
+                        !Array.isArray(container)) {
+                        const imageStr = container.image;
+                        if (typeof imageStr === "string") {
+                            const ref = parseImageRef(imageStr);
+                            if (ref)
+                                out.set(imageStr, ref);
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            extractImages(rec[key], out);
+        }
+    }
+}
+/**
+ * Parse a rendered Kubernetes manifest (possibly multi-document YAML with '---'
+ * separators) and return a map of raw image strings to parsed refs.
+ *
+ * Works across all workload kinds by recursively finding containers/
+ * initContainers/ephemeralContainers arrays anywhere in the document tree —
+ * handles Deployment, StatefulSet, DaemonSet, Job, CronJob (nested), Pod,
+ * and CRDs like Argo Rollouts without hard-coding kinds.
+ */
+function parseManifestImages(content) {
+    const refs = new Map();
+    try {
+        jsYaml.loadAll(content, (doc) => {
+            try {
+                extractImages(doc, refs);
+            }
+            catch {
+                // skip individual malformed documents
+            }
+        });
+    }
+    catch {
+        // invalid YAML — return whatever was collected before the error
+    }
+    return refs;
+}
+const CONTAINER_LIST_KEY_RE = /^(\s*)(?:-\s*)?(?:containers|initContainers|ephemeralContainers):\s*(?:#.*)?$/;
+/**
+ * Width of the YAML list-item prefix on a line that starts a container item.
+ * YAML allows "- " followed by any number of spaces (e.g. "-   name:" uses 4 chars).
+ * We derive the width from the actual source line so `itemFieldIndent` is always correct
+ * regardless of the formatter used to produce the manifest.
+ */
+function listItemPrefixWidth(line, dashIndent) {
+    // Match "-" followed by one or more spaces starting at dashIndent.
+    const match = /^-(\s+)/.exec(line.slice(dashIndent));
+    // Must have at least one space (required by YAML spec), but be precise about how many.
+    return match ? 1 + match[1].length : 2; // 2 is the absolute minimum fallback
+}
+/**
+ * Determine, per source line, whether that line lies inside the YAML scope of a
+ * `containers` / `initContainers` / `ephemeralContainers` list, and if so at
+ * what container-list indent level and what the direct-field indent is.
+ *
+ * A container-list key at indent K opens a block whose members are either:
+ *   - dash-aligned: list items `- name:` sit at the *same* indent K, with their
+ *     fields (e.g. `image:`) deeper (the style emitted by `helm template`/`kubectl`); or
+ *   - dash-indented: list items sit deeper than K.
+ * The scope therefore stays open until a line dedents strictly below K, or a line
+ * at exactly K that is NOT a list item (a sibling mapping key ends the list).
+ *
+ * In addition to the container-scope flag, this function tracks `itemFieldIndent`:
+ * the expected indent of direct mapping keys in the current container item.
+ * It is set eagerly when the first container item is seen, derived from the actual
+ * list-item prefix width on that source line (`dashIndent + prefixWidth`), so the
+ * depth guard in `parseManifestImagesWithPositions` always has a correct ceiling —
+ * even when the container item's first child is a sub-list (e.g. `- env:` before
+ * any scalar `name:`/`image:`). Without eager initialization, the guard would fall
+ * back to `containerIndent + 4`, which can equal a sub-list entry's indent and
+ * mis-accept an env-value `image:` field as a legitimate container image.
+ */
+function computeContainerScopeLines(lines) {
+    const result = Array.from({ length: lines.length }, () => ({ containerIndent: -1, itemFieldIndent: -1 }));
+    // Stack of currently-open container-list scopes with per-item tracking.
+    let containerScopes = [];
+    // Block-scalar tracking: >= 0 means we're inside a YAML block scalar (| or >)
+    // whose key was at this indent level. Lines with indent > blockScalarKeyIndent
+    // are block-scalar content and must be skipped — they may contain YAML-like text
+    // (embedded manifests in ConfigMaps, etc.) that is opaque string data, not live YAML.
+    // Reset on '---' or when indent dedents back to or past the key level.
+    let blockScalarKeyIndent = -1;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        // Blank / comment-only lines don't affect scope or block-scalar state.
+        if (/^\s*(#.*)?$/.test(line))
+            continue;
+        const indentMatch = /^(\s*)/.exec(line);
+        const indent = indentMatch ? indentMatch[1].length : 0;
+        // A document separator resets all scope and block-scalar state.
+        if (/^---(\s.*)?$/.test(line)) {
+            containerScopes = [];
+            blockScalarKeyIndent = -1;
+            continue;
+        }
+        // If inside a block scalar, skip lines that are still part of it.
+        if (blockScalarKeyIndent >= 0) {
+            if (indent > blockScalarKeyIndent) {
+                continue; // still block-scalar content — never a container key or image ref
+            }
+            // Dedented back to or past the key level — block scalar ends.
+            blockScalarKeyIndent = -1;
+        }
+        // Is this line a YAML list item (starts with a dash after its indent)?
+        const isListItem = line.charAt(indent) === "-";
+        // Pop any container scopes we've dedented out of. A dash-aligned list item at
+        // exactly the key's indent is still part of the list (keep); a plain mapping
+        // key at that indent is a sibling that ends the list (pop).
+        containerScopes = containerScopes.filter((s) => indent > s.indent || (indent === s.indent && isListItem));
+        // Update per-item tracking for the innermost scope.
+        const top = containerScopes[containerScopes.length - 1];
+        if (top) {
+            if (isListItem) {
+                if (top.itemDashIndent === -1) {
+                    // First container item in this scope — record where its dashes live and
+                    // eagerly set itemFieldIndent from the actual prefix width on this source line.
+                    // YAML allows "- " followed by any number of spaces (e.g. "-   name:" uses a
+                    // 4-char prefix), so direct container fields start at dashIndent+prefixWidth,
+                    // not the hard-coded dashIndent+2. Setting this eagerly avoids the
+                    // `containerIndent+4` fallback below, which can equal a sub-list entry's
+                    // actual indent and mis-accept it when the container item's first child is a
+                    // sub-list (e.g. `- env:` before any scalar `name:`/`image:`).
+                    const prefixWidth = listItemPrefixWidth(line, indent);
+                    top.itemDashIndent = indent;
+                    top.itemFieldIndent = indent + prefixWidth;
+                }
+                else if (indent === top.itemDashIndent) {
+                    // Next container item at the same dash-level — reset field tracking using
+                    // the actual prefix width of this item's line.
+                    const prefixWidth = listItemPrefixWidth(line, indent);
+                    top.itemFieldIndent = indent + prefixWidth;
+                }
+                // A list item deeper than itemDashIndent is inside a sub-list of the container
+                // (e.g. an env[] entry). It does NOT reset the container item's field tracking.
+            }
+            // No need to update itemFieldIndent from non-dash keys: it is set eagerly above.
+        }
+        // Record per-line info (after updating tracking so this line gets its own state).
+        result[i] = top
+            ? { containerIndent: top.indent, itemFieldIndent: top.itemFieldIndent }
+            : { containerIndent: -1, itemFieldIndent: -1 };
+        // After recording scope for this line, check whether it opens a new container list.
+        if (CONTAINER_LIST_KEY_RE.test(line)) {
+            containerScopes.push({ indent, itemDashIndent: -1, itemFieldIndent: -1 });
+        }
+        // Detect a block-scalar value indicator (| or >) on a mapping key line.
+        // Any subsequent lines indented deeper than this key are block-scalar content
+        // that must not be interpreted as live YAML structure.
+        // Regex matches block-scalar indicators with optional chomping/indentation hints
+        // in either order: "key: |2+" and "key: |+2" are both valid YAML.
+        if (/:\s*[|>](?:[-+]?\d*|\d*[-+]?)\s*(#.*)?$/.test(line)) {
+            blockScalarKeyIndent = indent;
+        }
+    }
+    return result;
+}
+/**
+ * Parse a rendered Kubernetes manifest and return all container image strings
+ * with their source-level position info (line index and character offset within
+ * that line where the image value starts).
+ *
+ * After parsing YAML to collect the canonical container-image set, the raw
+ * content is scanned line-by-line to locate each `image: <value>` occurrence.
+ * Matched lines are additionally required to fall inside a container-list scope
+ * so that an unrelated `image:` key (e.g. a CRD `spec.image`) whose value
+ * coincides with a real container image is never returned.
+ */
+function parseManifestImagesWithPositions(content, sourceFile) {
+    // First use the existing YAML parser to get the canonical set of image strings.
+    const imageMap = parseManifestImages(content);
+    if (imageMap.size === 0)
+        return [];
+    const results = [];
+    const lines = content.split("\n");
+    const containerScopeData = computeContainerScopeLines(lines);
+    // For each line, check if it matches `image: <value>` (with optional quotes).
+    for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+        const { containerIndent, itemFieldIndent } = containerScopeData[lineIdx];
+        if (containerIndent === -1)
+            continue; // reject non-container `image:` keys
+        const line = lines[lineIdx];
+        // Match: optional leading whitespace, optional "- " list prefix, then "image:",
+        // optional whitespace, then the image value (optionally quoted).
+        const lineMatch = /^(\s*(?:-\s*)?image:\s*)(['"]?)([^'"#\s]+)\2/.exec(line);
+        if (!lineMatch)
+            continue;
+        const imageValue = lineMatch[3];
+        if (!imageMap.has(imageValue))
+            continue;
+        // Depth guard: reject `image:` keys that are not a direct field of the container
+        // list item. `itemFieldIndent` is set eagerly to `itemDashIndent + prefixWidth` when
+        // a container item is first seen (so it is never -1 by the time any image key
+        // could appear under it), giving a correct ceiling that rejects sub-list entries
+        // like `env[]` items whose `image:` keys land at a deeper indent. Falls back to
+        // `containerIndent + 4` only before any container item has been seen in this scope
+        // (i.e. `itemFieldIndent` is still -1), which covers the `- image: foo` dash-inline
+        // style where itemFieldIndent is set on the same line.
+        //
+        // LIMITATION: The image: field is identified by indentation depth alone. An image: key
+        // at exactly itemFieldIndent is accepted regardless of its enclosing key path — e.g. a
+        // nested map that happens to indent at the same level as a container field. Safety rests
+        // on imageMap.has(value) (populated by the semantic YAML parse) agreeing with indentation.
+        // Flow-style YAML and anchors are unaffected (they produce no imageMap entries).
+        const lineIndent = /^(\s*)/.exec(line)?.[1].length ?? 0;
+        const maxImageIndent = itemFieldIndent >= 0 ? itemFieldIndent : containerIndent + 4;
+        if (lineIndent > maxImageIndent)
+            continue;
+        // valueOffset = length of the "image: " prefix + optional opening quote
+        const valueOffset = lineMatch[1].length + lineMatch[2].length;
+        const valueLength = imageValue.length;
+        const ref = imageMap.get(imageValue) ?? null;
+        results.push({
+            raw: imageValue,
+            ref,
+            lineIndex: lineIdx,
+            valueOffset,
+            valueLength,
+        });
+    }
+    // Warn when the YAML parser found images that the line-scan couldn't locate.
+    // This happens for flow-style YAML (containers: [{image: …}]) and YAML anchors/aliases
+    // — the age-gate (YAML-based) sees them but the updater position parser does not.
+    // The result is a silent no-op write; the warning lets the user know.
+    // Note: results.length counts per-line entries, NOT per-unique-image; a single image
+    // used in both initContainers and containers produces two entries but one Map key.
+    // Drive the warning off the set of *distinct* images found, not raw entry count.
+    const located = new Set(results.map((r) => r.raw));
+    const missing = [...imageMap.keys()].filter((raw) => !located.has(raw));
+    if (missing.length > 0) {
+        core.warning(`kubernetes${sourceFile ? ` (${sourceFile})` : ""}: ` +
+            `${missing.length} image(s) found by YAML parser but could not be located in the ` +
+            `source text (likely flow-style YAML or anchor/alias): ${missing.join(", ")}. ` +
+            `These images are age-gated but cannot be updated in-place.`);
+    }
+    return results;
+}
+async function kubernetes_getChangedDeps(baseRef, kubernetesFilesInput) {
+    let files;
+    if (kubernetesFilesInput) {
+        const allFiles = new Set(await resolveFiles(kubernetesFilesInput));
+        const changedFiles = await gitDiffNameOnly(baseRef);
+        files = changedFiles.filter((f) => allFiles.has(f));
+    }
+    else {
+        // Auto-detect: any changed .yaml/.yml file that contains workload manifests
+        const changedFiles = await gitDiffNameOnly(baseRef);
+        files = changedFiles.filter((f) => f.endsWith(".yaml") || f.endsWith(".yml"));
+    }
+    if (files.length === 0) {
+        lib_core.info("kubernetes: no changed YAML files");
+        return { deps: [], imageRefs: new Map() };
+    }
+    const allDeps = [];
+    const imageRefs = new Map();
+    for (const file of files) {
+        const diff = await gitDiff(baseRef, file);
+        if (!diff)
+            continue;
+        let headContent;
+        try {
+            headContent = await promises_.readFile(file, "utf8");
+        }
+        catch {
+            lib_core.info(`kubernetes: could not read ${file}`);
+            continue;
+        }
+        const headRefs = parseManifestImages(headContent);
+        if (headRefs.size === 0)
+            continue; // not a manifest with containers
+        const baseContent = await gitShowFile(baseRef, file);
+        const baseRefs = baseContent
+            ? parseManifestImages(baseContent)
+            : new Map();
+        // No imageExists gate here: k8s manifest `image:` fields are unambiguous real
+        // image references (unlike docker COPY --from which can be a build-context alias).
+        // parseImageRef already drops invalid names (placeholders, uppercase, etc.).
+        //
+        // Compare by resolved identity (digest), not the raw manifest string: a
+        // no-op relabel of an image whose digest is already on base must not be
+        // re-flagged, since that exact content was already vetted on the base branch.
+        const baseIdentities = new Set();
+        for (const bRef of baseRefs.values())
+            baseIdentities.add(imageIdentity(bRef));
+        for (const ref of headRefs.values()) {
+            if (baseIdentities.has(imageIdentity(ref)))
+                continue; // identity already on base
+            const name = makeName(ref);
+            const version = makeVersion(ref);
+            imageRefs.set(`${name}@${version}`, ref);
+            allDeps.push({
+                ecosystem: "kubernetes",
+                name,
+                version,
+                file,
+            });
+        }
+    }
+    return { deps: allDeps, imageRefs };
+}
+/**
+ * Get the publish date for an image reference.
+ * Only digest-pinned (@sha256:...) refs are queried — tag-only refs are
+ * mutable and cannot be reliably age-gated, so they return null (unknown).
+ */
+async function kubernetes_getPublishDate(ref) {
+    return getImagePublishDate(ref, "kubernetes");
+}
+//# sourceMappingURL=kubernetes.js.map
+;// CONCATENATED MODULE: ./out/age.js
+const DAY_MS = 24 * 60 * 60 * 1000;
+/**
+ * Compute the age of a publish date in whole days from now.
+ * Returns null if publishDate is null or an invalid Date.
+ */
+function age_computeAgeDays(publishDate) {
+    if (!publishDate || isNaN(publishDate.getTime()))
+        return null;
+    return Math.floor((Date.now() - publishDate.getTime()) / DAY_MS);
+}
+/**
+ * Single shared age-gate predicate used by BOTH the verify action and the
+ * update CLI. Fail-closed: a null age (unconfirmable publish date) is treated
+ * as NOT meeting the gate, so neither path can promote an unverifiable version.
+ */
+function meetsMinAge(ageDays, minAgeDays) {
+    return ageDays !== null && ageDays >= minAgeDays;
+}
+//# sourceMappingURL=age.js.map
+;// CONCATENATED MODULE: ./out/concurrency.js
+
+/**
+ * Run tasks in groups of `batchSize` concurrently via Promise.allSettled.
+ * Rejections are logged via `logger` (so transient failures are visible) but do
+ * NOT throw — each task is expected to record its own result via closure.
+ *
+ * @param logger Optional callback for failure messages; defaults to `core.warning`.
+ */
+async function runBatched(tasks, batchSize, logger) {
+    const log = logger ?? ((msg) => lib_core.warning(msg));
+    // Guard against batchSize <= 0: i += 0 would infinite-loop; i += negative would underflow.
+    const size = Number.isInteger(batchSize) && batchSize > 0 ? batchSize : 1;
+    for (let i = 0; i < tasks.length; i += size) {
+        const batch = tasks.slice(i, i + size);
+        const settled = await Promise.allSettled(batch.map((t) => t()));
+        for (const s of settled) {
+            if (s.status === "rejected") {
+                const reason = s.reason instanceof Error ? s.reason.message : String(s.reason);
+                log(`[lisan] batched task failed: ${reason}`);
+            }
+        }
+    }
+}
+//# sourceMappingURL=concurrency.js.map
+// EXTERNAL MODULE: external "node:zlib"
+var external_node_zlib_ = __nccwpck_require__(8522);
+;// CONCATENATED MODULE: external "node:stream/promises"
+const external_node_stream_promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:stream/promises");
+// EXTERNAL MODULE: external "node:stream"
+var external_node_stream_ = __nccwpck_require__(7075);
+// EXTERNAL MODULE: ./node_modules/.pnpm/spdx-correct@3.2.0/node_modules/spdx-correct/index.js
+var spdx_correct = __nccwpck_require__(6820);
+// EXTERNAL MODULE: ./node_modules/.pnpm/spdx-satisfies@6.0.0/node_modules/spdx-satisfies/index.js
+var spdx_satisfies = __nccwpck_require__(3509);
+// EXTERNAL MODULE: ./node_modules/.pnpm/spdx-expression-parse@4.0.0/node_modules/spdx-expression-parse/index.js
+var spdx_expression_parse = __nccwpck_require__(5887);
 ;// CONCATENATED MODULE: ./node_modules/.pnpm/spdx-osi@3.0.0/node_modules/spdx-osi/index.json
 const spdx_osi_namespaceObject = /*#__PURE__*/JSON.parse('["0BSD","AAL","AFL-1.1","AFL-1.2","AFL-2.0","AFL-2.1","AFL-3.0","AGPL-3.0","AGPL-3.0-only","AGPL-3.0-or-later","APL-1.0","APSL-1.0","APSL-1.1","APSL-1.2","APSL-2.0","Apache-1.1","Apache-2.0","Artistic-1.0","Artistic-1.0-Perl","Artistic-1.0-cl8","Artistic-2.0","BSD-2-Clause","BSD-2-Clause-Patent","BSD-3-Clause","BSL-1.0","CATOSL-1.1","CDDL-1.0","CECILL-2.1","CNRI-Python","CPAL-1.0","CPL-1.0","CUA-OPL-1.0","ECL-1.0","ECL-2.0","EFL-1.0","EFL-2.0","EPL-1.0","EPL-2.0","EUDatagrid","EUPL-1.1","EUPL-1.2","Entessa","Fair","Frameworx-1.0","GPL-2.0","GPL-2.0+","GPL-2.0-only","GPL-2.0-or-later","GPL-3.0","GPL-3.0+","GPL-3.0-only","GPL-3.0-or-later","GPL-3.0-with-GCC-exception","HPND","IPA","IPL-1.0","ISC","Intel","LGPL-2.0","LGPL-2.0+","LGPL-2.0-only","LGPL-2.0-or-later","LGPL-2.1","LGPL-2.1+","LGPL-2.1-only","LGPL-2.1-or-later","LGPL-3.0","LGPL-3.0+","LGPL-3.0-only","LGPL-3.0-or-later","LPL-1.0","LPL-1.02","LPPL-1.3c","LiLiQ-P-1.1","LiLiQ-R-1.1","LiLiQ-Rplus-1.1","MIT","MIT-0","MPL-1.0","MPL-1.1","MPL-2.0","MPL-2.0-no-copyleft-exception","MS-PL","MS-RL","MirOS","Motosoto","Multics","NASA-1.3","NCSA","NGPL","NPOSL-3.0","NTP","Naumen","Nokia","OCLC-2.0","OFL-1.1","OGTSL","OSET-PL-2.1","OSL-1.0","OSL-2.0","OSL-2.1","OSL-3.0","PHP-3.0","PostgreSQL","Python-2.0","QPL-1.0","RPL-1.1","RPL-1.5","RPSL-1.0","RSCPL","SISSL","SPL-1.0","SimPL-2.0","Sleepycat","UPL-1.0","VSL-1.0","W3C","Watcom-1.0","Xnet","ZPL-2.0","Zlib"]');
 ;// CONCATENATED MODULE: ./out/spdx-license-texts.json
@@ -94578,8 +95395,25 @@ var tar_stream = __nccwpck_require__(3761);
 
 
 
+
+
+/**
+ * Thrown by license sub-fetchers when a registry call fails transiently
+ * (HTTP 429 / 5xx / network timeout) to distinguish "license unavailable due
+ * to registry error" from "no license declared" (null return).
+ *
+ * applyLicensePolicy catches this and marks the candidate's new-license fetch
+ * as failed so --license-policy=block can fail closed instead of promoting an
+ * update whose license cannot be confirmed.
+ */
+class LicenseFetchError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = "LicenseFetchError";
+    }
+}
 /** Quote a string for YAML if needed, using js-yaml's serializer. */
-function license_yamlQuote(s) {
+function yamlQuote(s) {
     return jsYaml.dump(s, { flowLevel: 0 }).trimEnd();
 }
 /** Show a diff wrapped in a named group. */
@@ -94808,11 +95642,6 @@ function normalizeLicense(raw) {
         return "ZPL-2.0";
     if (lower === "zpl 2.1")
         return "ZPL-2.1";
-    // EDL (Eclipse Distribution License) — BSD-3-Clause
-    if (lower === "edl 1.0" || lower === "eclipse distribution license 1.0"
-        || lower === "eclipse distribution license - v 1.0"
-        || lower === "eclipse distribution license v. 1.0")
-        return "BSD-3-Clause";
     // GPL w/ Classpath Exception variants (common in Jakarta/javax POMs)
     if (((lower.includes("gpl") || lower.includes("general public license")) && lower.includes("classpath"))
         || lower === "gpl2 w/ cpe" || lower === "gplv2+ce") {
@@ -95041,6 +95870,92 @@ function isCompatibleWith(depLicense, targetLicense) {
     }
     return false;
 }
+// Numeric restrictiveness levels used by isLicenseMoreRestrictiveThan.
+// Lower = more permissive. "unknown" is absent (handled by callers as fail-open).
+const RESTRICTIVENESS_LEVEL = {
+    permissive: 0,
+    "apache-2.0": 1,
+    "lgpl-2.0": 2, "lgpl-2.1": 2, "lgpl-3.0": 2,
+    "mpl-2.0": 2, "epl-1.0": 2, "epl-2.0": 2, "cddl-1.0": 2,
+    "gpl-2.0-only": 3, "gpl-2.0-or-later": 3,
+    "gpl-3.0-only": 3, "gpl-3.0-or-later": 3,
+    "agpl-3.0": 4,
+};
+/**
+ * Compute the effective restrictiveness level of a potentially compound SPDX
+ * expression.
+ *   - `A OR B`  → most-permissive (minimum) level: the user can choose the least
+ *                 restrictive alternative, so the combined requirement is the lowest.
+ *   - `A AND B` → most-restrictive (maximum) level: both licenses must be honored,
+ *                 so the combined requirement is the highest.
+ *   - `A WITH X` → treated as the base identifier `A` (exception clauses don't
+ *                  change the fundamental restriction category).
+ *
+ * SPDX operator precedence: AND binds tighter than OR (SPDX 2.x spec §10).
+ * We therefore split on OR first (lowest precedence, outermost), then on AND
+ * within each OR-clause (higher precedence, inner), then strip WITH at the leaf.
+ *
+ * Returns `undefined` when any component maps to "unknown", preserving the
+ * existing fail-open contract for unrecognized licenses.
+ *
+ * Note: parenthesized sub-expressions (e.g. `(A OR B) AND C`) are not parsed;
+ * they will contain residual `(`/`)` chars and typically categorize as "unknown",
+ * which is fail-open (safe). Simple non-nested compound expressions are handled.
+ */
+function licenseLevelOrd(spdx) {
+    // OR has lower precedence than AND — split OR first (outermost operator).
+    // `A OR B AND C` ≡ `A OR (B AND C)` per SPDX spec.
+    if (spdx.includes(" OR ")) {
+        const parts = spdx.split(" OR ").map((s) => s.trim());
+        const levels = parts.map(licenseLevelOrd);
+        if (levels.some((l) => l === undefined))
+            return undefined;
+        return Math.min(...levels);
+    }
+    // AND has higher precedence than OR — split next.
+    if (spdx.includes(" AND ")) {
+        const parts = spdx.split(" AND ").map((s) => s.trim());
+        const levels = parts.map(licenseLevelOrd);
+        if (levels.some((l) => l === undefined))
+            return undefined;
+        return Math.max(...levels);
+    }
+    // WITH clause at the leaf level: evaluate the base license only.
+    const withIdx = spdx.indexOf(" WITH ");
+    if (withIdx !== -1)
+        return licenseLevelOrd(spdx.slice(0, withIdx).trim());
+    return RESTRICTIVENESS_LEVEL[categorize(spdx)];
+}
+/**
+ * Returns true when `newLicense` is strictly MORE restrictive than `currentLicense`
+ * (e.g. newLicense=GPL-3.0-only, currentLicense=MIT → true; new→MIT, current→GPL → false).
+ * Returns false (fail-open) when either license maps to "unknown".
+ * Handles compound SPDX expressions (OR/AND/WITH): OR takes the most-permissive
+ * level, AND takes the most-restrictive, WITH evaluates the base license.
+ * Use this instead of isCompatibleWith when ordering permissiveness, not checking mixing.
+ */
+function isLicenseMoreRestrictiveThan(newLicense, currentLicense) {
+    const newLevel = licenseLevelOrd(newLicense);
+    const curLevel = licenseLevelOrd(currentLicense);
+    if (newLevel === undefined || curLevel === undefined)
+        return false;
+    return newLevel > curLevel;
+}
+/**
+ * Normalize a raw registry license string to a corrected SPDX identifier.
+ * Returns null on null/empty input or if normalization throws.
+ */
+function normalizeSpdxId(raw) {
+    if (!raw)
+        return null;
+    try {
+        const n = normalizeLicense(raw);
+        return spdxCorrect(n) ?? n;
+    }
+    catch {
+        return null;
+    }
+}
 function fallbackCheck(depLicense, targetLicense) {
     // Try spdx-satisfies
     try {
@@ -95159,6 +96074,69 @@ function isLicenseCompatible(license, targetLicenses) {
     }
 }
 /**
+ * Classify a single SPDX license identifier as permissive, copyleft, or unknown.
+ * Used by licenseLevelFromNode for AST-based compound expression evaluation.
+ */
+function classifySingleLicense(id) {
+    if (PERMISSIVE.has(id))
+        return "permissive";
+    const upper = id.toUpperCase();
+    if (upper.startsWith("GPL-") || upper.startsWith("AGPL-") ||
+        upper.startsWith("LGPL-") || upper.startsWith("MPL-") ||
+        upper.startsWith("EPL-") || upper.startsWith("CDDL-") ||
+        upper.startsWith("EUPL-") || upper.startsWith("OSL-") ||
+        upper.startsWith("RPSL-") || upper.startsWith("SISSL"))
+        return "copyleft";
+    // Apache-2.0 is permissive-leaning but treat as permissive for level purposes
+    if (upper === "APACHE-2.0")
+        return "permissive";
+    if (upper === "BSL-1.0" || upper === "ARTISTIC-2.0" || upper === "ZPL-2.0" || upper === "ZPL-2.1")
+        return "permissive";
+    return "unknown";
+}
+/**
+ * Walk an spdx-expression-parse AST node and return the most restrictive
+ * license level for the expression:
+ *   OR  → most permissive wins (any permissive branch → permissive)
+ *   AND → most restrictive wins (any copyleft branch → copyleft)
+ */
+function licenseLevelFromNode(node) {
+    if ("license" in node) {
+        return classifySingleLicense(node.license);
+    }
+    const left = licenseLevelFromNode(node.left);
+    const right = licenseLevelFromNode(node.right);
+    if (node.conjunction === "or") {
+        // OR: most permissive wins
+        if (left === "permissive" || right === "permissive")
+            return "permissive";
+        if (left === "copyleft" || right === "copyleft")
+            return "copyleft";
+        return "unknown";
+    }
+    // AND: most restrictive wins
+    if (left === "copyleft" || right === "copyleft")
+        return "copyleft";
+    if (left === "permissive" || right === "permissive")
+        return "permissive";
+    return "unknown";
+}
+/**
+ * Return a coarse license level for a compound SPDX expression.
+ * Parses the full AST (handles parentheses, AND, OR) via spdx-expression-parse.
+ * Returns "permissive", "copyleft", or "unknown".
+ */
+function licenseLevel(expr) {
+    try {
+        const corrected = spdxCorrect(expr) ?? expr;
+        const parsed = spdxParse(corrected);
+        return licenseLevelFromNode(parsed);
+    }
+    catch {
+        return "unknown";
+    }
+}
+/**
  * Fetch the license for an npm package from the registry.
  */
 /**
@@ -95174,10 +96152,12 @@ function isNonStandardLicense(license) {
 }
 async function fetchNpmLicense(name, version, registries, githubToken = "", licenseHeuristics = true) {
     try {
-        const resp = await fetch(`${registries.npm}/${name}/${version}`);
-        if (!resp.ok)
+        const result = await http_fetchWithRetry(`${registries.npm}/${name}/${version}`);
+        if (result.kind === "not_found")
             return null;
-        const data = (await resp.json());
+        if (result.kind !== "ok")
+            throw new LicenseFetchError(`npm registry ${result.kind} for ${name}@${version}`);
+        const data = result.data;
         const rawLicense = data.license ?? null;
         if (rawLicense && !isNonStandardLicense(rawLicense))
             return rawLicense;
@@ -95197,7 +96177,9 @@ async function fetchNpmLicense(name, version, registries, githubToken = "", lice
         // Return original non-standard string as last resort (e.g., "SEE LICENSE IN ...")
         return rawLicense;
     }
-    catch {
+    catch (err) {
+        if (err instanceof LicenseFetchError)
+            throw err;
         return null;
     }
 }
@@ -95207,7 +96189,7 @@ async function fetchNpmLicense(name, version, registries, githubToken = "", lice
  */
 async function extractLicenseFromTarball(tarballUrl) {
     try {
-        const resp = await fetch(tarballUrl);
+        const resp = await fetch(tarballUrl, { signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
         if (!resp.ok || !resp.body)
             return null;
         const extract = tar_stream.extract();
@@ -95256,7 +96238,7 @@ async function extractLicenseFromTarball(tarballUrl) {
  */
 async function extractLicenseFromSdist(sdistUrl) {
     try {
-        const resp = await fetch(sdistUrl);
+        const resp = await fetch(sdistUrl, { signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
         if (!resp.ok || !resp.body)
             return null;
         const extract = tar_stream.extract();
@@ -95323,10 +96305,12 @@ async function extractLicenseFromSdist(sdistUrl) {
  */
 async function fetchPypiLicense(name, version, registries, githubToken = "", licenseHeuristics = true) {
     try {
-        const resp = await fetch(`${registries.pypi}/pypi/${name}/${version}/json`);
-        if (!resp.ok)
+        const result = await http_fetchWithRetry(`${registries.pypi}/pypi/${name}/${version}/json`);
+        if (result.kind === "not_found")
             return null;
-        const data = (await resp.json());
+        if (result.kind !== "ok")
+            throw new LicenseFetchError(`PyPI registry ${result.kind} for ${name}@${version}`);
+        const data = result.data;
         // PEP 639: try license_expression first (new standard field)
         if (data.info?.license_expression && data.info.license_expression !== "UNKNOWN") {
             return data.info.license_expression;
@@ -95374,7 +96358,9 @@ async function fetchPypiLicense(name, version, registries, githubToken = "", lic
         }
         return null;
     }
-    catch {
+    catch (err) {
+        if (err instanceof LicenseFetchError)
+            throw err;
         return null;
     }
 }
@@ -95387,34 +96373,45 @@ async function fetchCrateLicense(name, version, registries) {
     const headers = { "User-Agent": "lisan-al-gaib-action" };
     // Try exact version first
     try {
-        const resp = await fetch(`${registries.crates}/api/v1/crates/${name}/${version}`, { headers });
-        if (resp.ok) {
-            const data = (await resp.json());
-            if (data.version?.license)
-                return data.version.license;
+        const result = await http_fetchWithRetry(`${registries.crates}/api/v1/crates/${name}/${version}`, headers);
+        if (result.kind === "ok" && result.data.version?.license) {
+            return result.data.version.license;
         }
+        if (result.kind === "rate_limited" || result.kind === "error") {
+            throw new LicenseFetchError(`crates.io ${result.kind} for ${name}@${version}`);
+        }
+        // not_found or ok-but-no-license: fall through to crate-level lookup
     }
-    catch {
+    catch (err) {
+        if (err instanceof LicenseFetchError)
+            throw err;
         // fall through
     }
     // Fall back to crate-level metadata (latest version's license)
     try {
-        const resp = await fetch(`${registries.crates}/api/v1/crates/${name}`, { headers });
-        if (!resp.ok)
+        const result = await http_fetchWithRetry(`${registries.crates}/api/v1/crates/${name}`, headers);
+        if (result.kind === "not_found")
             return null;
-        const data = (await resp.json());
-        if (data.versions?.length && data.versions[0].license) {
-            return data.versions[0].license;
-        }
+        if (result.kind !== "ok")
+            throw new LicenseFetchError(`crates.io ${result.kind} for ${name}`);
+        const versions = result.data.versions;
+        if (versions?.length && versions[0].license)
+            return versions[0].license;
         return null;
     }
-    catch {
+    catch (err) {
+        if (err instanceof LicenseFetchError)
+            throw err;
         return null;
     }
 }
-const xmlParser = new XMLParser();
+// parseTagValue/parseAttributeValue disabled so numeric-looking license/version
+// text is preserved verbatim as strings rather than coerced to numbers.
+const xmlParser = new XMLParser({ parseTagValue: false, parseAttributeValue: false, processEntities: false });
 /**
  * Fetch POM XML from Maven repositories.
+ * Uses AbortSignal.timeout to enforce the shared fetch timeout, matching the
+ * behavior of the JSON-fetching helpers (fetchJson/fetchWithRetry).
  */
 async function fetchPom(groupId, artifactId, version, repositories) {
     const groupPath = groupId.replace(/\./g, "/");
@@ -95422,13 +96419,17 @@ async function fetchPom(groupId, artifactId, version, repositories) {
         const base = repo.replace(/\/$/, "");
         const pomUrl = `${base}/${groupPath}/${artifactId}/${version}/${artifactId}-${version}.pom`;
         try {
-            const resp = await fetch(pomUrl);
+            const resp = await fetch(pomUrl, { signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
+            if (resp.status === 404 || resp.status === 410)
+                continue; // not in this repo, try next
             if (!resp.ok)
-                continue;
+                throw new LicenseFetchError(`Maven HTTP ${resp.status} for ${pomUrl}`);
             const text = await resp.text();
             return xmlParser.parse(text);
         }
-        catch {
+        catch (err) {
+            if (err instanceof LicenseFetchError)
+                throw err;
             continue;
         }
     }
@@ -95535,6 +96536,7 @@ async function batchFetchGitHubLicenses(repos, token) {
                     "User-Agent": "lisan-al-gaib-action",
                 },
                 body: JSON.stringify({ query }),
+                signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
             });
             if (!resp.ok)
                 continue;
@@ -95571,7 +96573,7 @@ async function fetchGitHubRepoLicense(name, token, licenseHeuristics = true) {
         headers.Authorization = `Bearer ${token}`;
     }
     try {
-        const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/license`, { headers });
+        const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/license`, { headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
         if (!resp.ok)
             return null;
         const data = (await resp.json());
@@ -95601,9 +96603,11 @@ async function fetchBcrLicense(name, version, bcrUrl, githubToken = "", licenseH
     const bcrGitHub = "https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main";
     try {
         const url = `${bcrGitHub}/modules/${encodeURIComponent(name)}/metadata.json`;
-        const resp = await fetch(url);
+        const resp = await fetch(url, { signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
+        if (resp.status === 404 || resp.status === 410)
+            return null; // module not in BCR
         if (!resp.ok)
-            return null;
+            throw new LicenseFetchError(`BCR HTTP ${resp.status} for ${name}`);
         const data = (await resp.json());
         if (data.licenses?.length)
             return data.licenses[0];
@@ -95625,7 +96629,7 @@ async function fetchBcrLicense(name, version, bcrUrl, githubToken = "", licenseH
         // Try source.json for this version — may have a GitHub URL
         try {
             const sourceUrl = `${bcrGitHub}/modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/source.json`;
-            const sourceResp = await fetch(sourceUrl);
+            const sourceResp = await fetch(sourceUrl, { signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
             if (sourceResp.ok) {
                 const sourceData = (await sourceResp.json());
                 if (sourceData.url) {
@@ -95643,7 +96647,9 @@ async function fetchBcrLicense(name, version, bcrUrl, githubToken = "", licenseH
         }
         return null;
     }
-    catch {
+    catch (err) {
+        if (err instanceof LicenseFetchError)
+            throw err;
         return null;
     }
 }
@@ -95660,7 +96666,7 @@ async function fetchMultitoolLicense(url, githubToken, licenseHeuristics = true)
     }
     // Follow redirects (HEAD request) to check if final URL is on github.com
     try {
-        const resp = await fetch(url, { method: "HEAD", redirect: "follow" });
+        const resp = await fetch(url, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
         const finalUrl = resp.url;
         const redirectMatch = finalUrl.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\//);
         if (redirectMatch) {
@@ -95762,14 +96768,15 @@ async function checkLicenses(results, targetLicenseMap, registries, javaRepoMap,
         seen.add(cacheKey);
         toFetch.push({ dep, cacheKey });
     }
-    for (let i = 0; i < toFetch.length; i += 10) {
-        const batch = toFetch.slice(i, i + 10);
-        const settled = await Promise.allSettled(batch.map(({ dep }) => fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics, kubernetesImageRefs, dockerImageRefs)));
-        batch.forEach(({ cacheKey }, idx) => {
-            const result = settled[idx];
-            licenseCache.set(cacheKey, result.status === "fulfilled" ? result.value : null);
-        });
-    }
+    const LICENSE_FETCH_CONCURRENCY = 10;
+    await runBatched(toFetch.map(({ dep, cacheKey }) => async () => {
+        try {
+            licenseCache.set(cacheKey, await fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics, kubernetesImageRefs, dockerImageRefs));
+        }
+        catch {
+            licenseCache.set(cacheKey, null);
+        }
+    }), LICENSE_FETCH_CONCURRENCY);
     // Process results
     const licenseResults = [];
     for (const { dep } of depsToCheck) {
@@ -95828,14 +96835,10 @@ function buildOverridesYaml(violations, unknowns) {
     return overrides;
 }
 /**
- * Show a colored git diff of the workflow file with license-overrides added.
- * Writes the suggestion to the file, runs git diff --color, then restores it.
- */
-/**
- * Find the insertion point in the workflow file for license-overrides.
+ * Find the insertion point in the workflow file for an input block under the action's `with:`.
  * Returns the line index to insert at, or -1 if not found.
  */
-function findOverrideInsertIdx(allLines) {
+function findWorkflowInsertIdx(allLines) {
     const actionPattern = /uses:.*lisan-al-gaib/;
     const actionLineIdx = allLines.findIndex((l) => actionPattern.test(l));
     if (actionLineIdx === -1)
@@ -95867,7 +96870,7 @@ function buildOverrideBlock(overrides) {
     for (const [eco, pkgs] of overrides) {
         lines.push(`${indent}${eco}:`);
         for (const [name, license] of pkgs) {
-            lines.push(`${indent}  ${license_yamlQuote(name)}: ${license_yamlQuote(license)}`);
+            lines.push(`${indent}  ${yamlQuote(name)}: ${yamlQuote(license)}`);
         }
     }
     return lines.join("\n");
@@ -95921,7 +96924,7 @@ async function showOverrideDiff(violations, unknowns, licenseHeuristics = true, 
                     newLines.push(`${indent}${eco}:`);
                 }
                 for (const [name, license] of newPkgs) {
-                    newLines.push(`${indent}  ${license_yamlQuote(name)}: ${license_yamlQuote(license)}`);
+                    newLines.push(`${indent}  ${yamlQuote(name)}: ${yamlQuote(license)}`);
                 }
             }
             if (newLines.length === 0)
@@ -95931,7 +96934,7 @@ async function showOverrideDiff(violations, unknowns, licenseHeuristics = true, 
             await showGroupedDiff(workflowFile, original, modified.join("\n"), groupName);
         }
         else {
-            const insertIdx = findOverrideInsertIdx(allLines);
+            const insertIdx = findWorkflowInsertIdx(allLines);
             if (insertIdx === -1)
                 return;
             const block = buildOverrideBlock(theOverrides);
@@ -95984,6 +96987,945 @@ async function emitLicenseAnnotations(licenseResults, checkResults, licenseHeuri
     return violations;
 }
 //# sourceMappingURL=license.js.map
+;// CONCATENATED MODULE: ./out/report.js
+
+
+
+
+
+
+
+
+
+
+function getBranding() {
+    try {
+        const owner = github.context.repo.owner;
+        if (owner === "runloopai")
+            return "";
+    }
+    catch {
+        // GITHUB_REPOSITORY not set (e.g., local/test)
+    }
+    return "\n\n---\nMade with 💚 by [Runloop AI](https://runloop.ai)\n";
+}
+function determineStatus(ageDays, minAgeDays, warnAgeDays) {
+    if (!meetsMinAge(ageDays, minAgeDays))
+        return ageDays === null ? "unknown" : "fail";
+    // meetsMinAge returning true guarantees ageDays !== null; narrow explicitly.
+    if (ageDays !== null && ageDays < warnAgeDays)
+        return "warn";
+    return "pass";
+}
+// ── Helpers ──────────────────────────────────────────────────────────
+/** Quote a string for YAML if needed, using js-yaml's serializer. */
+function report_yamlQuote(s) {
+    return jsYaml.dump(s, { flowLevel: 0 }).trimEnd();
+}
+// ── Age-gate remediation via git diff ──────────────────────────────────
+/**
+ * Write a modified file, run `git diff -u --color`, then restore the original.
+ * Returns true if a diff was shown.
+ */
+/** Show a diff wrapped in a named group. */
+async function showGroupDiff(filePath, original, modified, groupName) {
+    if (original === modified)
+        return false;
+    try {
+        lib_core.startGroup(groupName);
+        await promises_.writeFile(filePath, modified, "utf8");
+        await lib_exec.exec("git", ["diff", "-u", "--color", filePath], { silent: false });
+        lib_core.endGroup();
+        return true;
+    }
+    finally {
+        await promises_.writeFile(filePath, original, "utf8");
+    }
+}
+async function showDiff(filePath, original, modified) {
+    if (original === modified)
+        return false;
+    const isNew = original === null;
+    try {
+        await promises_.writeFile(filePath, modified, "utf8");
+        if (isNew) {
+            // Intent-to-add so git diff can see the new file
+            await lib_exec.exec("git", ["add", "-N", filePath], { silent: true });
+        }
+        await lib_exec.exec("git", ["diff", "-u", "--color", filePath], { silent: false });
+        return true;
+    }
+    finally {
+        if (isNew) {
+            await lib_exec.exec("git", ["reset", filePath], { silent: true });
+            await promises_.unlink(filePath).catch(() => { });
+        }
+        else {
+            await promises_.writeFile(filePath, original, "utf8");
+        }
+    }
+}
+/**
+ * Get the installed version of a CLI tool, or null if not found.
+ */
+async function getToolVersion(tool) {
+    try {
+        let stdout = "";
+        await lib_exec.exec(tool, ["--version"], {
+            listeners: { stdout: (data) => (stdout += data.toString()) },
+            silent: true,
+        });
+        const match = stdout.match(/(\d+\.\d+(?:\.\d+)?)/);
+        return match ? match[1] : null;
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Compare two semver-ish version strings (major.minor or major.minor.patch).
+ * Returns true if `actual` >= `required`.
+ */
+function versionAtLeast(actual, required) {
+    const a = actual.split(".").map(Number);
+    const r = required.split(".").map(Number);
+    for (let i = 0; i < r.length; i++) {
+        const av = a[i] ?? 0;
+        const rv = r[i] ?? 0;
+        if (isNaN(av) || isNaN(rv))
+            return false;
+        if (av > rv)
+            return true;
+        if (av < rv)
+            return false;
+    }
+    return true;
+}
+/**
+ * Return a friendly duration string for uv exclude-newer (e.g. "14 days").
+ */
+function excludeNewerDuration(minAgeDays) {
+    return `${minAgeDays} days`;
+}
+/**
+ * Parse an existing exclude-newer value into a number of days.
+ * Handles: "14 days", "P14D", and RFC 3339 timestamps.
+ * Returns null if unparseable.
+ */
+function parseExcludeNewerDays(value) {
+    // Friendly: "14 days"
+    const friendlyMatch = value.match(/^(\d+)\s*days?$/i);
+    if (friendlyMatch)
+        return parseInt(friendlyMatch[1], 10);
+    // ISO 8601 duration: "P14D"
+    const isoMatch = value.match(/^P(\d+)D$/i);
+    if (isoMatch)
+        return parseInt(isoMatch[1], 10);
+    // RFC 3339 timestamp: compute days from now
+    const ts = Date.parse(value);
+    if (!isNaN(ts))
+        return Math.floor((Date.now() - ts) / 86_400_000);
+    return null;
+}
+/**
+ * Resolve the uv config file for a workspace root directory.
+ * If uv.toml exists, use it (higher precedence per uv docs).
+ * Otherwise use pyproject.toml — even if it lacks [tool.uv] (we'll suggest adding it).
+ * Returns null only if neither file exists.
+ */
+async function resolveUvConfig(dir) {
+    // Try uv.toml first (higher precedence)
+    const uvTomlPath = external_node_path_namespaceObject.join(dir, "uv.toml");
+    try {
+        const content = await promises_.readFile(uvTomlPath, "utf8");
+        const data = parse_parse(content);
+        return { file: uvTomlPath, content, uvConfig: data, isUvToml: true };
+    }
+    catch { /* not found or parse error */ }
+    // Fall back to pyproject.toml
+    const pyprojectPath = external_node_path_namespaceObject.join(dir, "pyproject.toml");
+    try {
+        const content = await promises_.readFile(pyprojectPath, "utf8");
+        const data = parse_parse(content);
+        const toolUv = data.tool?.uv;
+        return { file: pyprojectPath, content, uvConfig: toolUv ?? null, isUvToml: false };
+    }
+    catch { /* not found or parse error */ }
+    return null;
+}
+/**
+ * Check a uv config file: if it's missing exclude-newer or its value is
+ * more recent than the cutoff, suggest adding/updating it.
+ */
+async function suggestUvExcludeNewer(dir, minAgeDays) {
+    const cfg = await resolveUvConfig(dir);
+    if (!cfg)
+        return false;
+    const { file, content, uvConfig, isUvToml } = cfg;
+    const duration = excludeNewerDuration(minAgeDays);
+    const existing = uvConfig?.["exclude-newer"];
+    if (existing) {
+        const existingDays = parseExcludeNewerDays(existing);
+        if (existingDays !== null && existingDays >= minAgeDays)
+            return false; // already strict enough
+    }
+    const lines = content.split("\n");
+    let modified;
+    if (existing) {
+        const idx = lines.findIndex((l) => l.trimStart().startsWith("exclude-newer") && !l.trimStart().startsWith("exclude-newer-package"));
+        if (idx === -1)
+            return false;
+        const indent = lines[idx].match(/^(\s*)/)?.[1] ?? "";
+        lines[idx] = `${indent}exclude-newer = "${duration}"`;
+        modified = lines.join("\n");
+    }
+    else if (isUvToml) {
+        // uv.toml — insert after leading comments
+        let insertIdx = 0;
+        while (insertIdx < lines.length && (lines[insertIdx].startsWith("#") || lines[insertIdx].trim() === "")) {
+            insertIdx++;
+        }
+        lines.splice(insertIdx, 0, `exclude-newer = "${duration}"`);
+        modified = lines.join("\n");
+    }
+    else {
+        // pyproject.toml — insert after [tool.uv], or add the section if missing
+        const uvIdx = lines.findIndex((l) => l.trim() === "[tool.uv]");
+        if (uvIdx !== -1) {
+            lines.splice(uvIdx + 1, 0, `exclude-newer = "${duration}"`);
+        }
+        else {
+            // Append [tool.uv] section at the end
+            lines.push("", "[tool.uv]", `exclude-newer = "${duration}"`);
+        }
+        modified = lines.join("\n");
+    }
+    return showDiff(file, content, modified);
+}
+/**
+ * Suggest pnpm minimumReleaseAge in pnpm-workspace.yaml.
+ * Uses yaml.load to parse; targeted line edit for writing.
+ */
+async function suggestPnpmAge(minAgeDays) {
+    const ver = await getToolVersion("pnpm");
+    if (ver && !versionAtLeast(ver, "10.16")) {
+        lib_core.info(`pnpm ${ver} does not support minimumReleaseAge (requires >= 10.16)`);
+        return false;
+    }
+    const file = "pnpm-workspace.yaml";
+    let content;
+    try {
+        content = await promises_.readFile(file, "utf8");
+    }
+    catch {
+        return false;
+    }
+    const targetMinutes = minAgeDays * 24 * 60;
+    let data;
+    try {
+        data = jsYaml.load(content) ?? {};
+    }
+    catch {
+        return false;
+    }
+    const existing = data.minimumReleaseAge;
+    if (existing !== undefined && existing >= targetMinutes)
+        return false;
+    const setting = `minimumReleaseAge: ${targetMinutes}  # ${minAgeDays} days, in minutes`;
+    const lines = content.split("\n");
+    let modified;
+    if (existing !== undefined) {
+        const idx = lines.findIndex((l) => l.trimStart().startsWith("minimumReleaseAge"));
+        if (idx === -1)
+            return false;
+        lines[idx] = setting;
+        modified = lines.join("\n");
+    }
+    else {
+        modified = content.trimEnd() + "\n" + setting + "\n";
+    }
+    return showDiff(file, content, modified);
+}
+/**
+ * Suggest yarn npmMinimalAgeGate in .yarnrc.yml.
+ * Uses yaml.load to parse; targeted line edit for writing.
+ */
+async function suggestYarnAge(minAgeDays) {
+    const ver = await getToolVersion("yarn");
+    if (ver && !versionAtLeast(ver, "4.10")) {
+        lib_core.info(`yarn ${ver} does not support npmMinimalAgeGate (requires >= 4.10)`);
+        return false;
+    }
+    const file = ".yarnrc.yml";
+    let content;
+    try {
+        content = await promises_.readFile(file, "utf8");
+    }
+    catch {
+        return false;
+    }
+    let data;
+    try {
+        data = jsYaml.load(content) ?? {};
+    }
+    catch {
+        return false;
+    }
+    const existing = data.npmMinimalAgeGate;
+    if (existing) {
+        const days = parseInt(existing, 10);
+        if (!isNaN(days) && days >= minAgeDays)
+            return false;
+    }
+    const setting = `npmMinimalAgeGate: "${minAgeDays}d"`;
+    const lines = content.split("\n");
+    let modified;
+    if (existing) {
+        const idx = lines.findIndex((l) => l.trimStart().startsWith("npmMinimalAgeGate"));
+        if (idx === -1)
+            return false;
+        lines[idx] = setting;
+        modified = lines.join("\n");
+    }
+    else {
+        modified = content.trimEnd() + "\n" + setting + "\n";
+    }
+    return showDiff(file, content, modified);
+}
+/**
+ * Suggest bun minimumReleaseAge in bunfig.toml.
+ * Uses smol-toml to parse; targeted line edit for writing.
+ */
+async function suggestBunAge(minAgeDays) {
+    const ver = await getToolVersion("bun");
+    if (ver && !versionAtLeast(ver, "1.3")) {
+        lib_core.info(`bun ${ver} does not support minimumReleaseAge (requires >= 1.3)`);
+        return false;
+    }
+    const file = "bunfig.toml";
+    let content;
+    try {
+        content = await promises_.readFile(file, "utf8");
+    }
+    catch {
+        return false;
+    }
+    const targetSeconds = minAgeDays * 86_400;
+    let data;
+    try {
+        data = parse_parse(content);
+    }
+    catch {
+        return false;
+    }
+    const install = data.install;
+    const existing = install?.minimumReleaseAge;
+    if (existing !== undefined && existing >= targetSeconds)
+        return false;
+    const setting = `minimumReleaseAge = ${targetSeconds}  # ${minAgeDays} days, in seconds`;
+    const lines = content.split("\n");
+    let modified;
+    if (existing !== undefined) {
+        const idx = lines.findIndex((l) => l.trimStart().startsWith("minimumReleaseAge"));
+        if (idx === -1)
+            return false;
+        lines[idx] = setting;
+        modified = lines.join("\n");
+    }
+    else if (lines.some((l) => l.trim() === "[install]")) {
+        const idx = lines.findIndex((l) => l.trim() === "[install]");
+        lines.splice(idx + 1, 0, setting);
+        modified = lines.join("\n");
+    }
+    else {
+        modified = content.trimEnd() + "\n[install]\n" + setting + "\n";
+    }
+    return showDiff(file, content, modified);
+}
+/**
+ * Suggest npm min-release-age in .npmrc.
+ * Requires npm >= 11.10.
+ */
+async function suggestNpmAge(minAgeDays) {
+    const ver = await getToolVersion("npm");
+    if (ver && !versionAtLeast(ver, "11.10")) {
+        lib_core.info(`npm ${ver} does not support min-release-age (requires >= 11.10)`);
+        return false;
+    }
+    const file = ".npmrc";
+    let content;
+    try {
+        content = await promises_.readFile(file, "utf8");
+    }
+    catch {
+        content = "";
+    }
+    // npm min-release-age unit is days
+    const lines = content.split("\n");
+    const existingIdx = lines.findIndex((l) => l.trimStart().startsWith("min-release-age"));
+    if (existingIdx !== -1) {
+        const existingVal = parseInt(lines[existingIdx].split("=")[1]?.trim() ?? "0", 10);
+        if (existingVal >= minAgeDays)
+            return false;
+        lines[existingIdx] = `min-release-age=${minAgeDays}`;
+    }
+    else {
+        lines.push(`min-release-age=${minAgeDays}`);
+    }
+    const modified = lines.join("\n");
+    if (content === "") {
+        // File didn't exist — write it, diff, then remove
+        try {
+            await promises_.writeFile(file, modified, "utf8");
+            await lib_exec.exec("git", ["diff", "-u", "--color", "--no-index", "/dev/null", file], { silent: false, ignoreReturnCode: true });
+            return true;
+        }
+        finally {
+            await promises_.unlink(file).catch(() => { });
+        }
+    }
+    return showDiff(file, content, modified);
+}
+/**
+ * Suggest per-package age exclusions for uv.
+ * Adds `exclude-newer-package` entries to the workspace root config
+ * (uv.toml or pyproject.toml [tool.uv]).
+ */
+async function suggestUvPackageExclusions(failedPkgs, workspaceDirs) {
+    if (failedPkgs.length === 0)
+        return;
+    for (const dir of workspaceDirs) {
+        const cfg = await resolveUvConfig(dir);
+        if (!cfg)
+            continue;
+        const { file, content, isUvToml } = cfg;
+        const lines = content.split("\n");
+        const newEntries = failedPkgs.map((pkg) => `"${pkg}" = false`).join(", ");
+        const setting = `exclude-newer-package = { ${newEntries} }`;
+        // Check if exclude-newer-package already exists
+        const existingIdx = lines.findIndex((l) => l.trimStart().startsWith("exclude-newer-package"));
+        if (existingIdx !== -1)
+            continue;
+        // Insert after exclude-newer line, or after [tool.uv] header (pyproject), or at top (uv.toml)
+        const enIdx = lines.findIndex((l) => {
+            const t = l.trimStart();
+            return t.startsWith("exclude-newer") && !t.startsWith("exclude-newer-package");
+        });
+        let insertIdx;
+        if (enIdx !== -1) {
+            insertIdx = enIdx + 1;
+        }
+        else if (!isUvToml) {
+            let uvIdx = lines.findIndex((l) => l.trim() === "[tool.uv]");
+            if (uvIdx === -1) {
+                // Add [tool.uv] section at the end
+                lines.push("", "[tool.uv]");
+                uvIdx = lines.length - 1;
+            }
+            insertIdx = uvIdx + 1;
+        }
+        else {
+            // uv.toml — insert after comments
+            insertIdx = 0;
+            while (insertIdx < lines.length && (lines[insertIdx].startsWith("#") || lines[insertIdx].trim() === "")) {
+                insertIdx++;
+            }
+        }
+        lines.splice(insertIdx, 0, setting);
+        await showDiff(file, content, lines.join("\n"));
+    }
+}
+/**
+ * Suggest per-package exclusions for pnpm in pnpm-workspace.yaml.
+ */
+async function suggestPnpmPackageExclusions(failedPkgs) {
+    if (failedPkgs.length === 0)
+        return;
+    const file = "pnpm-workspace.yaml";
+    let content;
+    try {
+        content = await promises_.readFile(file, "utf8");
+    }
+    catch {
+        return;
+    }
+    if (content.includes("minimumReleaseAgeExclude"))
+        return;
+    const entries = failedPkgs.map((pkg) => `  - "${pkg}"`).join("\n");
+    const modified = content.trimEnd() + "\nminimumReleaseAgeExclude:\n" + entries + "\n";
+    await showDiff(file, content, modified);
+}
+/**
+ * Suggest per-package exclusions for yarn in .yarnrc.yml.
+ * Uses npmPreapprovedPackages which exempts from all package gates including npmMinimalAgeGate.
+ */
+async function suggestYarnPackageExclusions(failedPkgs) {
+    if (failedPkgs.length === 0)
+        return;
+    const file = ".yarnrc.yml";
+    let content;
+    try {
+        content = await promises_.readFile(file, "utf8");
+    }
+    catch {
+        return;
+    }
+    if (content.includes("npmPreapprovedPackages"))
+        return;
+    const entries = failedPkgs.map((pkg) => `  - "${pkg}"`).join("\n");
+    const modified = content.trimEnd() + "\nnpmPreapprovedPackages:\n" + entries + "\n";
+    await showDiff(file, content, modified);
+}
+/**
+ * Suggest per-package exclusions for bun in bunfig.toml.
+ */
+async function suggestBunPackageExclusions(failedPkgs) {
+    if (failedPkgs.length === 0)
+        return;
+    const file = "bunfig.toml";
+    let content;
+    try {
+        content = await promises_.readFile(file, "utf8");
+    }
+    catch {
+        return;
+    }
+    if (content.includes("minimumReleaseAgeExcludes"))
+        return;
+    const entries = failedPkgs.map((pkg) => `"${pkg}"`).join(", ");
+    const lines = content.split("\n");
+    const installIdx = lines.findIndex((l) => l.trim() === "[install]");
+    if (installIdx !== -1) {
+        lines.splice(installIdx + 1, 0, `minimumReleaseAgeExcludes = [${entries}]`);
+    }
+    else {
+        lines.push("[install]", `minimumReleaseAgeExcludes = [${entries}]`);
+    }
+    await showDiff(file, content, lines.join("\n"));
+}
+/**
+ * Suggest adding age-overrides to the workflow file for failed/warned packages.
+ */
+async function suggestAgeOverrides(results) {
+    if (!process.env.GITHUB_ACTIONS)
+        return;
+    // Collect only failed packages (not warn — those comply with min-age-days)
+    const overrides = new Map();
+    for (const r of results) {
+        if (r.status !== "fail")
+            continue;
+        const set = overrides.get(r.dep.ecosystem) ?? new Set();
+        set.add(r.dep.name);
+        overrides.set(r.dep.ecosystem, set);
+    }
+    if (overrides.size === 0)
+        return;
+    const workflowFile = getWorkflowFile();
+    if (!workflowFile)
+        return;
+    let original;
+    try {
+        original = await promises_.readFile(workflowFile, "utf8");
+    }
+    catch {
+        return;
+    }
+    const allLines = original.split("\n");
+    const indent = "            "; // 12 spaces
+    if (original.includes("age-overrides:")) {
+        // Find the age-overrides block and append new entries
+        const aoIdx = allLines.findIndex((l) => /^\s*age-overrides:/.test(l));
+        if (aoIdx === -1)
+            return;
+        // Find the end of the age-overrides YAML literal block
+        // It's a `|` block — find where indentation drops back
+        const aoIndent = allLines[aoIdx].match(/^(\s*)/)?.[1]?.length ?? 0;
+        let endIdx = aoIdx + 1;
+        while (endIdx < allLines.length) {
+            const line = allLines[endIdx];
+            if (line.trim() === "") {
+                endIdx++;
+                continue;
+            }
+            const lineIndent = line.match(/^(\s*)/)?.[1]?.length ?? 0;
+            if (lineIndent <= aoIndent)
+                break;
+            endIdx++;
+        }
+        // Parse existing entries to avoid duplicates
+        const existingContent = allLines.slice(aoIdx + 1, endIdx).join("\n");
+        const newLines = [];
+        for (const [eco, pkgs] of overrides) {
+            const newPkgs = [...pkgs].filter((name) => !existingContent.includes(name));
+            if (newPkgs.length === 0)
+                continue;
+            if (!existingContent.includes(`${eco}:`)) {
+                newLines.push(`${indent}${eco}:`);
+            }
+            for (const name of newPkgs) {
+                newLines.push(`${indent}  - ${report_yamlQuote(name)}`);
+            }
+        }
+        if (newLines.length === 0)
+            return;
+        // Insert new entries at the end of the block, before existing ecosystem sections
+        // or at the end of the block content
+        const modified = [...allLines];
+        modified.splice(endIdx, 0, ...newLines);
+        await showGroupDiff(workflowFile, original, modified.join("\n"), "Suggested: add entries to age-overrides");
+    }
+    else {
+        const insertIdx = findWorkflowInsertIdx(allLines);
+        if (insertIdx === -1)
+            return;
+        const blockLines = [`${indent.slice(2)}age-overrides: |`];
+        for (const [eco, pkgs] of overrides) {
+            blockLines.push(`${indent}${eco}:`);
+            for (const name of pkgs) {
+                blockLines.push(`${indent}  - ${report_yamlQuote(name)}`);
+            }
+        }
+        allLines.splice(insertIdx, 0, blockLines.join("\n"));
+        await showGroupDiff(workflowFile, original, allLines.join("\n"), "Suggested: add age-overrides to your workflow");
+    }
+}
+/**
+ * Detect which lockfiles are present and suggest the appropriate
+ * package-manager-level age gate setting as a colored git diff.
+ */
+async function showAgeGateDiffs(results, ecosystems, minAgeDays) {
+    // Collect unique workspace root dirs from python lockfile paths (uv.lock dir = workspace root)
+    const pythonWorkspaceDirs = new Set();
+    for (const r of results) {
+        if (r.dep.ecosystem === "python") {
+            pythonWorkspaceDirs.add(external_node_path_namespaceObject.dirname(r.dep.file));
+        }
+    }
+    // Section 1: Age gate number settings (exclude-newer, minimumReleaseAge, etc.)
+    const hasPythonDirs = ecosystems.has("python") && pythonWorkspaceDirs.size > 0;
+    const npmLockfiles = ecosystems.has("npm")
+        ? new Set(results.filter((r) => r.dep.ecosystem === "npm").map((r) => external_node_path_namespaceObject.basename(r.dep.file)))
+        : new Set();
+    const hasNpmLockfiles = npmLockfiles.size > 0;
+    if (hasPythonDirs || hasNpmLockfiles) {
+        lib_core.startGroup("Suggested: add package manager age gate settings");
+        if (hasPythonDirs) {
+            for (const dir of pythonWorkspaceDirs) {
+                await suggestUvExcludeNewer(dir, minAgeDays);
+            }
+        }
+        if (hasNpmLockfiles) {
+            if (npmLockfiles.has("package-lock.json"))
+                await suggestNpmAge(minAgeDays);
+            if (npmLockfiles.has("pnpm-lock.yaml"))
+                await suggestPnpmAge(minAgeDays);
+            if (npmLockfiles.has("yarn.lock"))
+                await suggestYarnAge(minAgeDays);
+            if (npmLockfiles.has("bun.lock") || npmLockfiles.has("bun.lockb"))
+                await suggestBunAge(minAgeDays);
+        }
+        lib_core.endGroup();
+    }
+    // Section 2: Per-package exclusions (only for packages that FAIL, not warn)
+    // Group failed packages by (ecosystem, workspace dir), deduplicated
+    const failedPython = new Map(); // dir → set of pkg names
+    const failedNpmNames = new Set();
+    for (const r of results) {
+        if (r.status !== "fail")
+            continue;
+        if (r.dep.ecosystem === "python") {
+            const dir = external_node_path_namespaceObject.dirname(r.dep.file);
+            const set = failedPython.get(dir) ?? new Set();
+            set.add(r.dep.name);
+            failedPython.set(dir, set);
+        }
+        else if (r.dep.ecosystem === "npm") {
+            failedNpmNames.add(r.dep.name);
+        }
+    }
+    let shownExclusions = false;
+    const startExclGroup = () => {
+        if (!shownExclusions) {
+            lib_core.startGroup("Suggested: add per-package age gate exclusions");
+            shownExclusions = true;
+        }
+    };
+    if (ecosystems.has("python")) {
+        for (const [dir, pkgs] of failedPython) {
+            startExclGroup();
+            await suggestUvPackageExclusions([...pkgs], new Set([dir]));
+        }
+    }
+    if (ecosystems.has("npm") && failedNpmNames.size > 0) {
+        const lockfiles = new Set(results.map((r) => external_node_path_namespaceObject.basename(r.dep.file)));
+        const failedNpm = [...failedNpmNames];
+        if (lockfiles.has("pnpm-lock.yaml")) {
+            startExclGroup();
+            await suggestPnpmPackageExclusions(failedNpm);
+        }
+        if (lockfiles.has("yarn.lock")) {
+            startExclGroup();
+            await suggestYarnPackageExclusions(failedNpm);
+        }
+        if (lockfiles.has("bun.lock") || lockfiles.has("bun.lockb")) {
+            startExclGroup();
+            await suggestBunPackageExclusions(failedNpm);
+        }
+    }
+    if (shownExclusions)
+        lib_core.endGroup();
+}
+function dedupeResults(results) {
+    const seen = new Set();
+    const out = [];
+    for (const r of results) {
+        const key = `${r.dep.ecosystem}:${r.dep.name}@${r.dep.version}`;
+        if (seen.has(key))
+            continue;
+        seen.add(key);
+        out.push(r);
+    }
+    return out;
+}
+async function emitAnnotations(results, ecosystems, minAgeDays) {
+    for (const { dep, ageDays, status } of results) {
+        if (status === "fail") {
+            lib_core.error(`${dep.name}@${dep.version} published ${ageDays}d ago, minimum is ${minAgeDays}d`, { file: dep.file });
+        }
+        else if (status === "warn") {
+            lib_core.warning(`${dep.name}@${dep.version} published ${ageDays}d ago`, { file: dep.file });
+        }
+    }
+    await showAgeGateDiffs(results, new Set(ecosystems), minAgeDays);
+    await suggestAgeOverrides(results);
+}
+const STATUS_ORDER = {
+    fail: 0,
+    warn: 1,
+    unknown: 2,
+    pass: 3,
+};
+/**
+ * Compare two version strings with semver awareness.
+ * Falls back to lexicographic comparison for non-semver versions.
+ */
+function compareVersions(a, b) {
+    const sa = node_modules_semver.coerce(a);
+    const sb = node_modules_semver.coerce(b);
+    if (sa && sb)
+        return node_modules_semver.compare(sa, sb);
+    return a.localeCompare(b);
+}
+/**
+ * Sort age results: fail/warn by increasing age then (ecosystem, name, version);
+ * unknown/pass by (ecosystem, name, version) only.
+ */
+function sortedByStatus(results) {
+    return [...results].sort((a, b) => {
+        // Primary: status order
+        const statusDiff = STATUS_ORDER[a.status] - STATUS_ORDER[b.status];
+        if (statusDiff !== 0)
+            return statusDiff;
+        // For fail/warn: sort by increasing age first
+        if (a.status === "fail" || a.status === "warn") {
+            const ageA = a.ageDays ?? Infinity;
+            const ageB = b.ageDays ?? Infinity;
+            if (ageA !== ageB)
+                return ageA - ageB;
+        }
+        // Then ecosystem, name, version
+        const ecoDiff = a.dep.ecosystem.localeCompare(b.dep.ecosystem);
+        if (ecoDiff !== 0)
+            return ecoDiff;
+        const nameDiff = a.dep.name.localeCompare(b.dep.name);
+        if (nameDiff !== 0)
+            return nameDiff;
+        return compareVersions(a.dep.version, b.dep.version);
+    });
+}
+const LICENSE_STATUS_ORDER = {
+    incompatible: 0, // fail
+    unknown: 1, // unknown
+    compatible: 2, // pass
+};
+function licenseStatusKey(lr) {
+    if (lr.compatible === false)
+        return LICENSE_STATUS_ORDER.incompatible;
+    if (lr.compatible === null)
+        return LICENSE_STATUS_ORDER.unknown;
+    return LICENSE_STATUS_ORDER.compatible;
+}
+/**
+ * Sort license results: incompatible first, then unknown, then compatible.
+ * Within each group, sort by (ecosystem, license, name, version).
+ */
+function sortedLicenseResults(results) {
+    return [...results].sort((a, b) => {
+        const statusDiff = licenseStatusKey(a) - licenseStatusKey(b);
+        if (statusDiff !== 0)
+            return statusDiff;
+        const ecoDiff = a.ecosystem.localeCompare(b.ecosystem);
+        if (ecoDiff !== 0)
+            return ecoDiff;
+        const licA = a.spdx ?? a.license ?? "";
+        const licB = b.spdx ?? b.license ?? "";
+        const licDiff = licA.localeCompare(licB);
+        if (licDiff !== 0)
+            return licDiff;
+        const nameDiff = a.name.localeCompare(b.name);
+        if (nameDiff !== 0)
+            return nameDiff;
+        return compareVersions(a.version, b.version);
+    });
+}
+async function writeSummary(results, minAgeDays, warnAgeDays, licenseResults = []) {
+    if (results.length === 0 && licenseResults.length === 0) {
+        lib_core.summary.addRaw("No dependency changes detected.");
+        const branding = getBranding();
+        if (branding)
+            lib_core.summary.addRaw(branding);
+        await lib_core.summary.write();
+        return;
+    }
+    const statusIcon = {
+        pass: "✅",
+        warn: "⚠️",
+        fail: "❌",
+        unknown: "❓",
+    };
+    lib_core.summary.addHeading("Lisan al-Gaib", 2);
+    lib_core.summary.addRaw(`Minimum age: *${minAgeDays}d* | Warning threshold: *${warnAgeDays}d*\n\n`);
+    lib_core.summary.addTable([
+        [
+            { data: "Ecosystem", header: true },
+            { data: "Package", header: true },
+            { data: "Version", header: true },
+            { data: "Age (days)", header: true },
+            { data: "Status", header: true },
+        ],
+        ...sortedByStatus(results).map((r) => [
+            r.dep.ecosystem,
+            r.dep.name,
+            r.dep.version,
+            r.ageDays !== null ? String(r.ageDays) : "?",
+            `${statusIcon[r.status]} ${r.status.toUpperCase()}`,
+        ]),
+    ]);
+    // License compliance table
+    if (licenseResults.length > 0) {
+        lib_core.summary.addHeading("License Compliance", 2);
+        lib_core.summary.addTable([
+            [
+                { data: "Ecosystem", header: true },
+                { data: "Package", header: true },
+                { data: "Version", header: true },
+                { data: "License", header: true },
+                { data: "Status", header: true },
+            ],
+            ...sortedLicenseResults(licenseResults).map((lr) => [
+                lr.ecosystem,
+                lr.name,
+                lr.version,
+                lr.spdx ?? lr.license ?? "?",
+                lr.compatible === true
+                    ? "✅ OK"
+                    : lr.compatible === false
+                        ? "❌ INCOMPATIBLE"
+                        : "❓ UNKNOWN",
+            ]),
+        ]);
+    }
+    const branding = getBranding();
+    if (branding)
+        lib_core.summary.addRaw(branding);
+    await lib_core.summary.write();
+}
+function reportTotals(results) {
+    const checked = results.filter((r) => r.status !== "unknown").length;
+    const failures = results.filter((r) => r.status === "fail").length;
+    const warnings = results.filter((r) => r.status === "warn").length;
+    return { checked, failures, warnings };
+}
+//# sourceMappingURL=report.js.map
+;// CONCATENATED MODULE: ./out/update/ecosystem-registry.js
+/**
+ * Ecosystem registry — pure metadata, no heavy imports.
+ *
+ * This is the single source of truth for which ecosystems the updater supports
+ * and their structural metadata. The actual updater implementations live in
+ * src/update/ecosystems/*.ts and are imported only from run.ts (which owns the
+ * dispatch switch statements).
+ */
+const ECOSYSTEM_REGISTRY = {
+    actions: { isStarlark: false },
+    docker: { isStarlark: false },
+    kubernetes: { isStarlark: false },
+    rust: { isStarlark: true },
+    java: { isStarlark: true },
+    bazel: { isStarlark: true },
+};
+const SUPPORTED_ECOSYSTEMS = new Set(Object.keys(ECOSYSTEM_REGISTRY));
+//# sourceMappingURL=ecosystem-registry.js.map
+;// CONCATENATED MODULE: ./out/update/ecosystems.js
+/**
+ * Ecosystems supported by the update CLI. Kept in a leaf module so the verify
+ * action can import this set without pulling in the rest of the updater.
+ *
+ * Re-exported from ecosystem-registry.ts, which is the single source of truth.
+ */
+
+//# sourceMappingURL=ecosystems.js.map
+;// CONCATENATED MODULE: ./out/update/cache-key.js
+/**
+ * Stable cache-key for a (ecosystem, name, current) tuple.
+ *
+ * Uses ||| as separator because it cannot appear in any ecosystem name,
+ * OCI image name (which may contain ":" and "@"), version string, or SHA.
+ * Using ":" or "@" as a separator would produce collisions for OCI images
+ * whose versions are of the form "tag@sha256:…".
+ *
+ * This module has NO imports so it can be safely imported from both
+ * src/main.ts (action bundle) and src/update/run.ts (CLI bundle)
+ * without dragging clack or other CLI-only deps into the action bundle.
+ */
+function resolveCacheKey(ecosystem, name, current) {
+    return `${ecosystem}|||${name}|||${current}`;
+}
+//# sourceMappingURL=cache-key.js.map
+;// CONCATENATED MODULE: ./out/update/resolve.js
+
+
+/** Maximum number of concurrent registry/network tasks per batch. */
+const RESOLVE_CONCURRENCY = 8;
+/**
+ * Deduplicate deps by cache key, then batch-resolve each unique dep using `resolveOne`.
+ * Returns a Map<cacheKey, T | null> where null means resolution threw.
+ * Concurrency-bounded by `runBatched`.
+ *
+ * This module is intentionally a leaf (imports only `runBatched`) so it can be
+ * imported from `src/main.ts` without pulling in the clack TUI or any updater
+ * ecosystem module into the action bundle.
+ */
+async function dedupeAndResolve(deps, keyOf, resolveOne, concurrency) {
+    const unique = new Map();
+    for (const dep of deps) {
+        const key = keyOf(dep);
+        if (!unique.has(key))
+            unique.set(key, dep);
+    }
+    const result = new Map();
+    await runBatched([...unique.entries()].map(([key, dep]) => async () => {
+        try {
+            result.set(key, await resolveOne(dep));
+        }
+        catch (err) {
+            lib_core.info(`[lisan] resolve failed for ${key}: ${err instanceof Error ? err.message : String(err)}`);
+            result.set(key, null);
+        }
+    }), concurrency);
+    return result;
+}
+//# sourceMappingURL=resolve.js.map
 ;// CONCATENATED MODULE: ./out/main.js
 
 
@@ -96004,26 +97946,10 @@ async function emitLicenseAnnotations(licenseResults, checkResults, licenseHeuri
 
 
 
-const DAY_MS = 86_400_000;
-/**
- * Parse GITHUB_WORKFLOW_REF to extract the workflow file path.
- * Format: {owner}/{repo}/{path}@{ref}
- * We strip {owner}/{repo}/ prefix and @{ref} suffix.
- */
-function getWorkflowFilePath() {
-    const workflowRef = process.env.GITHUB_WORKFLOW_REF;
-    if (!workflowRef)
-        return null;
-    const repo = github.context.repo;
-    const prefix = `${repo.owner}/${repo.repo}/`;
-    if (!workflowRef.startsWith(prefix))
-        return null;
-    const rest = workflowRef.slice(prefix.length);
-    const atIdx = rest.lastIndexOf("@");
-    if (atIdx === -1)
-        return null;
-    return rest.slice(0, atIdx);
-}
+
+
+
+
 /**
  * Check if the workflow file that triggered this run was newly added.
  * If so, return an empty-tree ref to force checking all packages.
@@ -96031,7 +97957,7 @@ function getWorkflowFilePath() {
 async function resolveEffectiveBaseRef(baseRef, checkAllOnNewWorkflow) {
     if (!checkAllOnNewWorkflow)
         return baseRef;
-    const workflowPath = getWorkflowFilePath();
+    const workflowPath = getWorkflowFile();
     if (!workflowPath)
         return baseRef;
     lib_core.info(`Workflow file: ${workflowPath}`);
@@ -96043,6 +97969,7 @@ async function resolveEffectiveBaseRef(baseRef, checkAllOnNewWorkflow) {
     // Empty tree SHA — forces diffing everything
     return EMPTY_TREE;
 }
+// ECOSYSTEM_SYNC: keep in sync with ECOSYSTEM_DISPATCH in src/update/run.ts and resolveLatest switch in src/update/latest.ts
 async function lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs, dockerImageRefs) {
     switch (dep.ecosystem) {
         case "npm":
@@ -96081,7 +98008,7 @@ async function lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kuber
         }
         case "actions": {
             const publishDate = await actions_getPublishDate(dep.name, dep.version, inputs.githubToken);
-            const isSha = /^[0-9a-f]{40}$/.test(dep.version);
+            const isSha = isCommitSha(dep.version);
             if (publishDate === null && !isSha) {
                 const actionOwner = dep.name.split("/")[0];
                 let contextOwner = "";
@@ -96122,6 +98049,12 @@ async function lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kuber
             return null;
     }
 }
+// Compile-time exhaustiveness guard: every ecosystem key in the updater ECOSYSTEM_REGISTRY
+// must have an explicit `case` in the lookupPublishDate switch above. If a new ecosystem is
+// added to ECOSYSTEM_REGISTRY without a corresponding case here, the Exclude below becomes
+// non-never and TypeScript flags this line as a type error.
+// When adding a new ecosystem: (1) add the case, (2) extend the union here.
+null;
 async function run() {
     const inputs = getInputs();
     const rawBaseRef = resolveBaseRef(inputs.baseRef);
@@ -96174,49 +98107,65 @@ async function run() {
     for (const eco of inputs.ecosystems) {
         lib_core.startGroup(`=== ${eco} ===`);
         let deps;
-        switch (eco) {
-            case "npm":
-                deps = await getChangedDeps(baseRef, inputs.nodeLockfiles);
-                break;
-            case "python":
-                deps = await python_getChangedDeps(baseRef, inputs.pythonLockfiles);
-                break;
-            case "rust":
-                deps = await rust_getChangedDeps(baseRef, inputs.moduleBazel);
-                break;
-            case "java": {
-                const result = await java_getChangedDeps(baseRef, inputs.moduleBazel);
-                deps = result.deps;
-                javaRepoMap = result.repositories;
-                break;
+        try {
+            switch (eco) {
+                case "npm":
+                    deps = await getChangedDeps(baseRef, inputs.nodeLockfiles);
+                    break;
+                case "python":
+                    deps = await python_getChangedDeps(baseRef, inputs.pythonLockfiles);
+                    break;
+                case "rust":
+                    deps = await rust_getChangedDeps(baseRef, inputs.moduleBazel);
+                    break;
+                case "java": {
+                    const result = await java_getChangedDeps(baseRef, inputs.moduleBazel);
+                    deps = result.deps;
+                    javaRepoMap = result.repositories;
+                    break;
+                }
+                case "bazel": {
+                    const result = await bazel_module_getChangedDeps(baseRef, inputs.moduleBazel);
+                    deps = result.deps;
+                    bazelOverrides = result.overrides;
+                    break;
+                }
+                case "actions":
+                    deps = await actions_getChangedDeps(baseRef, inputs.workflowFiles, inputs.githubToken);
+                    break;
+                case "multitool":
+                    deps = await multitool_getChangedDeps(baseRef, inputs.moduleBazel);
+                    break;
+                case "kubernetes": {
+                    const result = await kubernetes_getChangedDeps(baseRef, inputs.kubernetesFiles);
+                    deps = result.deps;
+                    kubernetesImageRefs = result.imageRefs;
+                    break;
+                }
+                case "docker": {
+                    const result = await docker_getChangedDeps(baseRef, inputs.dockerfiles, inputs.dockerhubMirror);
+                    deps = result.deps;
+                    dockerImageRefs = result.imageRefs;
+                    break;
+                }
+                default:
+                    lib_core.setFailed(`Unknown ecosystem: ${eco}`);
+                    lib_core.endGroup();
+                    // continue to remaining ecosystems rather than aborting the entire run —
+                    // other ecosystems should still be checked even if one is unknown/misspelled.
+                    continue;
             }
-            case "bazel": {
-                const result = await bazel_module_getChangedDeps(baseRef, inputs.moduleBazel);
-                deps = result.deps;
-                bazelOverrides = result.overrides;
-                break;
-            }
-            case "actions":
-                deps = await actions_getChangedDeps(baseRef, inputs.workflowFiles, inputs.githubToken);
-                break;
-            case "multitool":
-                deps = await multitool_getChangedDeps(baseRef, inputs.moduleBazel);
-                break;
-            case "kubernetes": {
-                const result = await kubernetes_getChangedDeps(baseRef, inputs.kubernetesFiles);
-                deps = result.deps;
-                kubernetesImageRefs = result.imageRefs;
-                break;
-            }
-            case "docker": {
-                const result = await docker_getChangedDeps(baseRef, inputs.dockerfiles, inputs.dockerhubMirror);
-                deps = result.deps;
-                dockerImageRefs = result.imageRefs;
-                break;
-            }
-            default:
-                lib_core.setFailed(`Unknown ecosystem: ${eco}`);
-                return;
+        }
+        catch (err) {
+            // A getChangedDeps failure must NOT silently pass (fail-open). Marking the
+            // action failed ensures the PR is blocked while still letting the remaining
+            // ecosystems run. A transient error (registry outage, WASM load failure,
+            // malformed lockfile) skipping one ecosystem would allow new packages in that
+            // ecosystem to bypass the age gate entirely.
+            lib_core.setFailed(`${eco}: getChangedDeps failed — cannot safely check this ecosystem: ` +
+                `${err instanceof Error ? err.message : String(err)}`);
+            lib_core.endGroup();
+            continue;
         }
         if (deps.length === 0) {
             lib_core.info(`No new/changed packages in ${eco}`);
@@ -96232,36 +98181,19 @@ async function run() {
             }
             return true;
         });
-        // Deduplicate by cache key, then fetch in parallel
-        const uniqueDeps = new Map();
-        for (const dep of filteredDeps) {
-            const cacheKey = `${dep.ecosystem}:${dep.name}@${dep.version}`;
-            if (!publishDateCache.has(cacheKey) && !uniqueDeps.has(cacheKey)) {
-                uniqueDeps.set(cacheKey, dep);
-            }
-        }
-        const entries = [...uniqueDeps.entries()];
-        // Fetch in batches of 10 to avoid rate limiting
-        for (let i = 0; i < entries.length; i += 10) {
-            const batch = entries.slice(i, i + 10);
-            const results = await Promise.allSettled(batch.map(([, dep]) => lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs, dockerImageRefs)));
-            batch.forEach(([key], idx) => {
-                const r = results[idx];
-                if (r.status === "fulfilled") {
-                    publishDateCache.set(key, r.value);
-                }
-                else {
-                    lib_core.warning(`Registry lookup failed for ${key}: ${r.reason}`);
-                    publishDateCache.set(key, null);
-                }
-            });
+        // Deduplicate by cache key and resolve publish dates with bounded concurrency.
+        // Skip deps already in the cache (from a previous ecosystem iteration).
+        // dedupeAndResolve returns null for failed resolutions — stored as null in cache
+        // to record "lookup was attempted but failed" (avoids re-fetching on future iterations).
+        const depsForLookup = filteredDeps.filter((dep) => !publishDateCache.has(resolveCacheKey(dep.ecosystem, dep.name, dep.version)));
+        const lookupResults = await dedupeAndResolve(depsForLookup, (dep) => resolveCacheKey(dep.ecosystem, dep.name, dep.version), (dep) => lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs, dockerImageRefs), RESOLVE_CONCURRENCY);
+        for (const [key, value] of lookupResults) {
+            publishDateCache.set(key, value);
         }
         for (const dep of filteredDeps) {
-            const cacheKey = `${dep.ecosystem}:${dep.name}@${dep.version}`;
+            const cacheKey = resolveCacheKey(dep.ecosystem, dep.name, dep.version);
             const publishDate = publishDateCache.get(cacheKey) ?? null;
-            const ageDays = publishDate !== null
-                ? Math.floor((Date.now() - publishDate.getTime()) / DAY_MS)
-                : null;
+            const ageDays = age_computeAgeDays(publishDate);
             const status = determineStatus(ageDays, inputs.minAgeDays, inputs.warnAgeDays);
             allResults.push({ dep, publishDate, ageDays, status });
         }
@@ -96320,10 +98252,46 @@ async function run() {
             if (licenseViolations > 0) {
                 parts.push(`${licenseViolations} package(s) have incompatible licenses`);
             }
+            if (failures > 0) {
+                // Suggest the update CLI for ecosystems it supports (direct deps only).
+                // npm/python/multitool are excluded — the update CLI does not yet support them.
+                // Bazel deps governed by git/archive/local_path/multiple_version overrides are
+                // also excluded — the updater can only bump bazel_dep()s with a BCR version.
+                const failingByEco = new Map();
+                for (const r of allResults) {
+                    if (r.status !== "fail" || !SUPPORTED_ECOSYSTEMS.has(r.dep.ecosystem))
+                        continue;
+                    if (r.dep.ecosystem === "bazel") {
+                        const override = bazelOverrides.get(r.dep.name);
+                        if (override && override.type !== "single_version")
+                            continue;
+                    }
+                    const pkgs = failingByEco.get(r.dep.ecosystem) ?? [];
+                    if (!pkgs.includes(r.dep.name))
+                        pkgs.push(r.dep.name);
+                    failingByEco.set(r.dep.ecosystem, pkgs);
+                }
+                if (failingByEco.size > 0) {
+                    const ecosystemArg = [...failingByEco.keys()].join(",");
+                    // Note: the `update` CLI updates ALL age-failing deps in those ecosystems,
+                    // not a filtered subset — per-package filtering is not supported in v1.
+                    parts.push(`To update these packages interactively, run: npx -p github:runloopai/lisan-al-gaib-action update ${ecosystemArg} --min-age ${inputs.minAgeDays}` +
+                        ` (add --allow-downgrade only to search for older versions that meet the age gate instead)`);
+                }
+            }
             if (inputs.bypassKeyword) {
-                parts.push(isPrEvent()
+                // Three-way hint that matches the actual bypass paths in bypass.ts:
+                //   PR events       → PR label only (commit message is contributor-editable)
+                //   push events     → commit message (HEAD commit, authored by pusher) OR PR label
+                //   unattended runs → PR label only (commit-message bypass disabled on schedule/
+                //                     workflow_dispatch/etc. to prevent a pre-planted keyword from
+                //                     silently bypassing every future unattended run)
+                const bypassHint = isPrEvent()
                     ? `To bypass, add "${inputs.bypassKeyword}" as a PR label`
-                    : `To bypass, add "${inputs.bypassKeyword}" on its own line in the HEAD commit message, or add it as a label on the associated PR`);
+                    : INTERACTIVE_PUSH_EVENTS.has(github.context.eventName)
+                        ? `To bypass, add "${inputs.bypassKeyword}" on its own line in the HEAD commit message, or add it as a label on the associated PR`
+                        : `To bypass, add "${inputs.bypassKeyword}" as a label on the associated PR (commit-message bypass is disabled on unattended events)`;
+                parts.push(bypassHint);
             }
             lib_core.setFailed(parts.join(". "));
         }
