@@ -188,13 +188,57 @@ describe("createApiDiffSource — compareCommits error handling", () => {
   });
 });
 
+describe("createApiDiffSource — M5 truncation guard", () => {
+  it("throws when compareCommits returns 300 or more files (GitHub file-list cap reached)", async () => {
+    // GitHub caps the compareCommits `files` array at ~300 entries. If we reach that
+    // boundary, the list is truncated and silently dropping files would cause packages
+    // to be skipped for age-gating. The implementation throws so callers can degrade
+    // to check-all rather than silently under-check.
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ filename: `a${i}.ts`, status: "modified" }));
+    const page2 = Array.from({ length: 100 }, (_, i) => ({ filename: `b${i}.ts`, status: "modified" }));
+    const page3 = Array.from({ length: 100 }, (_, i) => ({ filename: `c${i}.ts`, status: "modified" }));
+    const mockCompare = vi.fn()
+      .mockResolvedValueOnce({ data: { files: page1 } })
+      .mockResolvedValueOnce({ data: { files: page2 } })
+      .mockResolvedValueOnce({ data: { files: page3 } });
+
+    const source = createApiDiffSource({
+      octokit: { rest: { repos: { compareCommits: mockCompare, getContent: vi.fn() } } } as any,
+      owner: "o", repo: "r", baseSha: "b", headSha: "h",
+    });
+
+    await expect(source.diffNameOnly()).rejects.toThrow(/truncated/);
+  });
+
+  it("does not throw when exactly 299 files are returned across pages", async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ filename: `a${i}.ts`, status: "modified" }));
+    const page2 = Array.from({ length: 100 }, (_, i) => ({ filename: `b${i}.ts`, status: "modified" }));
+    const page3 = Array.from({ length: 99 },  (_, i) => ({ filename: `c${i}.ts`, status: "modified" }));
+    const mockCompare = vi.fn()
+      .mockResolvedValueOnce({ data: { files: page1 } })
+      .mockResolvedValueOnce({ data: { files: page2 } })
+      .mockResolvedValueOnce({ data: { files: page3 } }); // <100 → last page, stop
+
+    const source = createApiDiffSource({
+      octokit: { rest: { repos: { compareCommits: mockCompare, getContent: vi.fn() } } } as any,
+      owner: "o", repo: "r", baseSha: "b", headSha: "h",
+    });
+
+    const files = await source.diffNameOnly();
+    expect(files).toHaveLength(299);
+  });
+});
+
 describe("createApiDiffSource — showFile error handling", () => {
-  it("returns null when getContent throws a non-404 error such as a rate limit", async () => {
+  it("propagates non-404 errors (e.g. rate limit 403) so callers can fail-closed", async () => {
+    // Swallowing a 403/429/5xx would silently skip existence checks that are
+    // transient failures — the caller must see the error to decide whether to
+    // degrade to check-all.
     const source = makeSource({
       getContentImpl: async () => {
         throw Object.assign(new Error("Forbidden"), { status: 403 });
       },
     });
-    expect(await source.showFile("locked.ts")).toBeNull();
+    await expect(source.showFile("locked.ts")).rejects.toThrow("Forbidden");
   });
 });
