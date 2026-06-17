@@ -463,17 +463,23 @@ async function run(): Promise<void> {
         }
       }
       if (inputs.bypassKeyword) {
-        // Three-way hint that matches the actual bypass paths in bypass.ts:
+        // Four-way hint that matches the actual bypass paths in bypass.ts:
         //   PR events       → PR label only (commit message is contributor-editable)
         //   push events     → commit message (HEAD commit, authored by pusher) OR PR label
-        //   unattended runs → PR label only (commit-message bypass disabled on schedule/
-        //                     workflow_dispatch/etc. to prevent a pre-planted keyword from
-        //                     silently bypassing every future unattended run)
+        //   merge_group     → PR label only, but checkBypass looks up the label via
+        //                     listPullRequestsAssociatedWithCommit on the merge-queue commit
+        //                     SHA, which usually has no associated PR — the label must be
+        //                     applied to the source PR before it enters the queue.
+        //   other unattended runs → PR label only (commit-message bypass disabled on
+        //                     schedule/workflow_dispatch/etc. to prevent a pre-planted
+        //                     keyword from silently bypassing every future unattended run)
         const bypassHint = isPrEvent()
           ? `To bypass, add "${inputs.bypassKeyword}" as a PR label`
           : INTERACTIVE_PUSH_EVENTS.has(github.context.eventName)
             ? `To bypass, add "${inputs.bypassKeyword}" on its own line in the HEAD commit message, or add it as a label on the associated PR`
-            : `To bypass, add "${inputs.bypassKeyword}" as a label on the associated PR (commit-message bypass is disabled on unattended events)`;
+            : github.context.eventName === "merge_group"
+              ? `To bypass, add "${inputs.bypassKeyword}" as a label on the PR before it enters the merge queue — the merge-queue commit itself usually has no associated PR to label`
+              : `To bypass, add "${inputs.bypassKeyword}" as a label on the associated PR (commit-message bypass is disabled on unattended events)`;
         parts.push(bypassHint);
       }
       core.setFailed(parts.join(". "));

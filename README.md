@@ -56,7 +56,7 @@ You can always override with the `base-ref` input.
 | `dockerfiles` | No | auto-detect | Newline-separated glob patterns for Dockerfile/Containerfile paths (for docker ecosystem). Auto-detect matches any changed file whose basename is exactly `Dockerfile` or `Containerfile` (case-insensitive). Use this input for non-standard names (`myapp.Dockerfile`, `Dockerfile.prod`, etc.). |
 | `dockerhub-mirror` | No | `""` | Docker Hub mirror hostname (e.g. `mirror.gcr.io`) to use as a fallback when the primary Docker Hub check is rate-limited (HTTP 429) while resolving `COPY --from` / `RUN --mount=from` references. |
 | `strict-third-party` | No | `false` | Fail (instead of warn) on archive overrides without `Last-Modified` and third-party branch-pinned actions |
-| `bypass-keyword` | No | `""` | If set, failures are downgraded to warnings when this exact string is used as a bypass (PR label on `pull_request` events; HEAD commit message or associated-PR label on push/other events) |
+| `bypass-keyword` | No | `""` | If set, failures are downgraded to warnings when this exact string is used as a bypass (PR label on `pull_request` events; HEAD commit message or associated-PR label on `push` events; PR label only on unattended events — commit-message bypass is disabled for `schedule`/`workflow_dispatch`/`workflow_run`) |
 | `check-all-on-new-workflow` | No | `true` | Check all packages (not just changed) when the workflow file is newly added |
 | `github-token` | No | `${{ github.token }}` | GitHub token for API queries (actions and bazel ecosystems) |
 | `npm-registry-url` | No | `https://registry.npmjs.org` | npm registry URL |
@@ -372,7 +372,7 @@ on:
     types: [opened, reopened, synchronize, labeled, unlabeled]
 ```
 
-**On all other events** (`push`, `schedule`, `workflow_dispatch`, etc.) — include the keyword on its own line in the HEAD commit message:
+**On `push` events** — include the keyword on its own line in the HEAD commit message:
 
 ```
 This commit updates lodash to fix CVE-2025-XXXX.
@@ -381,6 +381,8 @@ DEPENDENCY-AGE-BYPASS
 ```
 
 Or add it as a label on any PR associated with the HEAD commit.
+
+**On unattended events** (`schedule`, `workflow_dispatch`, `workflow_run`) — commit-message bypass is **disabled**. A pre-planted keyword in a commit message would silently skip every future unattended run, so the action ignores it. Only a PR label associated with the HEAD commit is accepted on these events.
 
 The action will still report the failures as warnings but will not fail the check.
 
