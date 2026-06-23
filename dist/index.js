@@ -86156,11 +86156,14 @@ function getInputs() {
         .filter(Boolean);
     const parsedMin = parseInt(lib_core.getInput("min-age-days") || String(DEFAULT_MIN_AGE_DAYS), 10);
     const minAgeDaysRaw = isNaN(parsedMin) ? DEFAULT_MIN_AGE_DAYS : parsedMin;
+    // Fail closed rather than silently clamp: min-age-days is the core security control this
+    // action exists to enforce, so a negative value (typo, or an attacker-controlled workflow
+    // input) must not be quietly downgraded to "gate disabled" — the run should stop and force
+    // the value to be fixed explicitly (use 0 to disable the age gate on purpose).
     if (minAgeDaysRaw < 0) {
-        lib_core.warning(`min-age-days (${minAgeDaysRaw}) is negative — clamping to 0. ` +
-            "Set to 0 explicitly to disable the age gate.");
+        throw new Error(`min-age-days (${minAgeDaysRaw}) is negative. Set it to 0 explicitly to disable the age gate.`);
     }
-    const minAgeDays = Math.max(0, minAgeDaysRaw);
+    const minAgeDays = minAgeDaysRaw;
     const parsedWarn = parseInt(lib_core.getInput("warn-age-days") || "21", 10);
     const warnAgeDaysRaw = isNaN(parsedWarn) ? 21 : parsedWarn;
     if (warnAgeDaysRaw < 0) {
@@ -86357,8 +86360,11 @@ function resolveBaseRef(inputBaseRef) {
             // Accept: 7-64 hex chars (commit SHA), or a branch/tag name composed of
             // alphanumeric, dot, underscore, hyphen, and slash. Reject a leading `-`
             // (option injection) and any other characters outside this charset.
+            // `..` is excluded from a plain charset check — the charset above allows `.`
+            // for legitimate refs like "release/1.0", but a `..` segment (e.g. "main/../../other")
+            // is a path-traversal-style ref that could resolve outside the intended branch/tag.
             const SAFE_REF_RE = /^(?:[0-9a-f]{7,64}|[a-zA-Z0-9][a-zA-Z0-9_./-]*)$/;
-            if (trimmed && !trimmed.startsWith("-") && SAFE_REF_RE.test(trimmed)) {
+            if (trimmed && !trimmed.startsWith("-") && !trimmed.includes("..") && SAFE_REF_RE.test(trimmed)) {
                 lib_core.info(`Auto-detected base ref from release target: ${trimmed}`);
                 return trimmed;
             }
@@ -90437,7 +90443,7 @@ class XMLParser {
     }
 }
 // EXTERNAL MODULE: ./node_modules/.pnpm/semver@7.7.4/node_modules/semver/index.js
-var node_modules_semver = __nccwpck_require__(9419);
+var semver = __nccwpck_require__(9419);
 ;// CONCATENATED MODULE: ./out/http.js
 /** Shared HTTP fetch helpers with a discriminated result type. */
 /** Per-attempt request timeout in milliseconds. */
@@ -90463,8 +90469,11 @@ function parseRetryAfter(value) {
     // exponential backoff instead.
     if (/^\d+$/.test(trimmed)) {
         const seconds = Number(trimmed);
-        if (!(seconds > 0))
-            return undefined; // /^\d+$/ already excludes NaN/Infinity; this guards seconds===0
+        // /^\d+$/ excludes NaN, but a long enough digit string (>308 digits) still
+        // overflows to Infinity — reject explicitly rather than relying on the
+        // Math.min clamp below to absorb it silently.
+        if (!Number.isFinite(seconds) || !(seconds > 0))
+            return undefined; // also guards seconds===0
         return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
     }
     // HTTP-date form
@@ -90489,6 +90498,12 @@ function parseRetryAfter(value) {
  *   - 5xx server errors: retry up to maxRetries with exponential backoff + ±25% jitter.
  *   - Network/timeout errors (no HTTP status): retry at most once (maxNetworkRetries=1)
  *     to recover from transient blips without masking persistent failures.
+ *
+ * Exported for callers that need the raw response (headers, custom status-code
+ * classification) beyond what fetchWithRetry/fetchTextWithRetry/fetchHeadWithRetry expose —
+ * e.g. OCI registry manifest/blob fetches, which need both a parsed JSON body and response
+ * headers together. Such callers supply their own `singleAttempt` classifier and get the same
+ * retry/backoff/jitter policy as the built-in helpers, so that policy cannot drift between them.
  */
 async function retryWithBackoff(singleAttempt, opts = {}) {
     const maxRetries = opts.maxRetries ?? 3;
@@ -90615,7 +90630,7 @@ async function http_fetchTextWithRetry(url, headers, opts = {}) {
  *   rate_limited → 429 (retried with Retry-After backoff)
  *   error     → other 4xx, 5xx (retried on 5xx), or network failure
  */
-async function fetchHeadWithRetry(url, headers, opts = {}) {
+async function http_fetchHeadWithRetry(url, headers, opts = {}) {
     return retryWithBackoff(async () => {
         try {
             const resp = await fetch(url, { method: "HEAD", headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
@@ -90649,6 +90664,16 @@ const MAVEN_CENTRAL_PREFIXES = [
 // Warn at most once per process run so we don't spam repeated messages.
 let _warnedRateLimit = false;
 let _warnedUnauth = false;
+// Keyed by npm registry URL: warn at most once per registry, not once per package — a
+// mirror that omits "versions" from every packument would otherwise emit this warning
+// on every changed npm dep in a lockfile diff, which is noisy and conflates an
+// informational mirror-shape fact with a security alert.
+const _warnedNpmNoVersionsField = new Set();
+// Keyed by the raw (pre-resolution) repo URL string: warn at most once per configured
+// repo, not once per artifact lookup — a non-HTTPS repo listed in maven.install()
+// repositories is checked for every changed Maven dep in a diff, which would otherwise
+// spam this warning once per artifact.
+const _warnedNonHttpsMavenRepo = new Set();
 /**
  * Fetch a GitHub REST API URL, classifying the response so callers can
  * distinguish rate-limiting/auth failures from genuine 404s.
@@ -90716,6 +90741,8 @@ async function githubApiFetch(url, token) {
 function _resetGitHubWarningFlags() {
     _warnedRateLimit = false;
     _warnedUnauth = false;
+    _warnedNpmNoVersionsField.clear();
+    _warnedNonHttpsMavenRepo.clear();
 }
 /**
  * Replace Maven Central URLs with the configured registry URL.
@@ -90780,7 +90807,7 @@ async function mavenPublishDate(group, artifact, version, repositories, registri
         if (base === null)
             continue; // skip non-HTTPS repos silently
         const pomUrl = `${base}/${groupPath}/${artifact}/${version}/${artifact}-${version}.pom`;
-        const result = await fetchHeadWithRetry(pomUrl);
+        const result = await http_fetchHeadWithRetry(pomUrl);
         if (result.kind === "ok") {
             const lastModified = result.data.headers.get("Last-Modified");
             if (lastModified)
@@ -90802,7 +90829,10 @@ async function mavenPublishDate(group, artifact, version, repositories, registri
     // Fall back to Maven Central search API
     const result = await http_fetchWithRetry(`https://search.maven.org/solrsearch/select?q=g:${encodeURIComponent(group)}+AND+a:${encodeURIComponent(artifact)}+AND+v:${encodeURIComponent(version)}&rows=1&wt=json`);
     const ts = result.kind === "ok" ? result.data.response?.docs?.[0]?.timestamp : undefined;
-    if (ts != null) {
+    // The `timestamp` field is declared as `number` above, but the response is untrusted JSON —
+    // guard against a hostile/malformed mirror substituting a string (e.g. a short numeric
+    // string that Date() would parse as a year rather than epoch-ms).
+    if (typeof ts === "number") {
         // Verify the POM exists before trusting the search API's timestamp —
         // search index can list versions whose POM has since been deleted.
         const pomExists = await mavenArtifactExists(group, artifact, version, repositories, registries);
@@ -90827,7 +90857,7 @@ async function mavenArtifactExists(group, artifact, version, repositories, regis
         if (base === null)
             continue; // skip non-HTTPS repos silently
         const pomUrl = `${base}/${groupPath}/${artifact}/${version}/${artifact}-${version}.pom`;
-        const result = await fetchHeadWithRetry(pomUrl);
+        const result = await http_fetchHeadWithRetry(pomUrl);
         if (result.kind === "ok")
             return true;
         if (result.kind === "not_found")
@@ -90889,7 +90919,7 @@ async function bcrPublishDate(name, version, token, bcrUrl) {
                 }
                 else {
                     // Non-GitHub archive: try Last-Modified header via the shared retry layer.
-                    const archiveResult = await fetchHeadWithRetry(archiveUrl);
+                    const archiveResult = await http_fetchHeadWithRetry(archiveUrl);
                     if (archiveResult.kind === "ok") {
                         const lastModified = archiveResult.data.headers.get("Last-Modified");
                         if (lastModified)
@@ -90929,7 +90959,7 @@ async function gitCommitDate(remote, ref, token) {
  * Get Last-Modified date from an archive URL via HEAD request.
  */
 async function archiveDate(url) {
-    const result = await fetchHeadWithRetry(url);
+    const result = await http_fetchHeadWithRetry(url);
     if (result.kind !== "ok")
         return null;
     const lastModified = result.data.headers.get("Last-Modified");
@@ -90979,16 +91009,13 @@ function encodeOciReference(ref) {
 }
 // ─── OCI / Docker registry helpers ──────────────────────────────────────────
 //
-// These helpers use bare `fetch()` rather than the `fetchWithRetry` layer from
-// http.ts. This is intentional — every path returns null / "unknown" on any
-// non-2xx response, which is fail-closed (a transient 429 or 5xx produces an
-// unresolvable digest/date, causing the dep to be skipped rather than promoted).
-// The cost is availability: Docker Hub anonymous rate-limits cause spurious
-// skips that a retry would often recover. If this becomes a significant
-// operational pain point, thread these through fetchWithRetry; for now the
-// fail-closed behaviour is the right tradeoff for this security-sensitive tool.
-// Compare: githubApiFetch is similarly retry-less and documented at the top of
-// that function for the same reason.
+// These helpers route body-reading GET/HEAD requests through fetchWithRetry /
+// fetchHeadWithRetry / retryWithBackoff (the same retry/backoff/classification layer
+// used elsewhere in this file), so a transient 429/503 from a registry is retried rather
+// than being indistinguishable from "tag absent" — which would otherwise produce a
+// spurious "unknown" (verify) or silently drop an available upgrade (update). Every path
+// still fails closed on exhausted retries / genuine errors: null / "unknown", causing the
+// dep to be skipped rather than promoted.
 /**
  * Obtain an anonymous OCI bearer token for the given registry and repository
  * using the WWW-Authenticate challenge flow. Returns null if the registry
@@ -90997,14 +91024,31 @@ function encodeOciReference(ref) {
  */
 async function getOciToken(host, repository) {
     try {
-        const pingResp = await fetch(`https://${host}/v2/`, {
-            signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS),
+        // 200 and 401 are both terminal (expected) outcomes — never retried, matching the
+        // original behaviour. Only 429/5xx (transient) are retried; any other status or a
+        // thrown network error is treated as private/unreachable, same as before.
+        const pingResult = await retryWithBackoff(async () => {
+            try {
+                const resp = await fetch(`https://${host}/v2/`, {
+                    signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS),
+                });
+                if (resp.status === 200 || resp.status === 401) {
+                    return { kind: "ok", data: { status: resp.status, wwwAuth: resp.headers.get("www-authenticate") ?? "" } };
+                }
+                if (resp.status === 429) {
+                    return { kind: "rate_limited", retryAfterMs: parseRetryAfter(resp.headers.get("Retry-After")) };
+                }
+                return { kind: "error", status: resp.status, message: `HTTP ${resp.status}` };
+            }
+            catch (err) {
+                return { kind: "error", message: err instanceof Error ? err.message : String(err) };
+            }
         });
-        if (pingResp.status === 200)
+        if (pingResult.kind !== "ok")
+            return null; // private, unreachable, or retries exhausted
+        if (pingResult.data.status === 200)
             return null; // no auth needed
-        if (pingResp.status !== 401)
-            return null; // private or unreachable
-        const wwwAuth = pingResp.headers.get("www-authenticate") ?? "";
+        const wwwAuth = pingResult.data.wwwAuth;
         const realmMatch = wwwAuth.match(/realm="([^"]+)"/);
         if (!realmMatch)
             return null;
@@ -91038,21 +91082,35 @@ async function fetchOciManifest(host, repository, reference, token) {
     const headers = { Accept: MANIFEST_ACCEPT };
     if (token)
         headers.Authorization = `Bearer ${token}`;
-    try {
-        const safeRef = encodeOciReference(reference);
-        if (safeRef === null)
-            return null; // invalid digest format — bail
-        const resp = await fetch(`https://${host}/v2/${repository}/manifests/${safeRef}`, { headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
-        if (!resp.ok)
-            return null;
-        const contentType = resp.headers.get("content-type") ?? "";
-        const lastModified = resp.headers.get("last-modified");
-        const body = (await resp.json());
-        return { contentType, body, lastModified };
-    }
-    catch {
-        return null;
-    }
+    const safeRef = encodeOciReference(reference);
+    if (safeRef === null)
+        return null; // invalid digest format — bail
+    const result = await retryWithBackoff(async () => {
+        try {
+            const resp = await fetch(`https://${host}/v2/${repository}/manifests/${safeRef}`, { headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
+            if (resp.ok) {
+                try {
+                    const contentType = resp.headers.get("content-type") ?? "";
+                    const lastModified = resp.headers.get("last-modified");
+                    const body = (await resp.json());
+                    return { kind: "ok", data: { contentType, body, lastModified } };
+                }
+                catch (err) {
+                    return { kind: "error", status: resp.status, message: err instanceof Error ? err.message : String(err) };
+                }
+            }
+            if (resp.status === 404 || resp.status === 410)
+                return { kind: "not_found" };
+            if (resp.status === 429) {
+                return { kind: "rate_limited", retryAfterMs: parseRetryAfter(resp.headers.get("Retry-After")) };
+            }
+            return { kind: "error", status: resp.status, message: `HTTP ${resp.status}` };
+        }
+        catch (err) {
+            return { kind: "error", message: err instanceof Error ? err.message : String(err) };
+        }
+    });
+    return result.kind === "ok" ? result.data : null;
 }
 /**
  * Validate a publish date is within a sane range.
@@ -91167,15 +91225,8 @@ async function fetchOciBlobJson(host, repository, digest, token) {
     const headers = {};
     if (token)
         headers.Authorization = `Bearer ${token}`;
-    try {
-        const resp = await fetch(`https://${host}/v2/${repository}/blobs/${digest}`, { headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
-        if (!resp.ok)
-            return null;
-        return await resp.json();
-    }
-    catch {
-        return null;
-    }
+    const result = await http_fetchWithRetry(`https://${host}/v2/${repository}/blobs/${digest}`, headers);
+    return result.kind === "ok" ? result.data : null;
 }
 /**
  * Fetch metadata labels for a container image, merging OCI manifest annotations
@@ -91236,10 +91287,10 @@ async function imageExistsOnHost(host, repository, reference) {
         const safeRef = encodeOciReference(reference);
         if (safeRef === null)
             return "unknown"; // invalid digest format
-        const resp = await fetch(`https://${host}/v2/${repository}/manifests/${safeRef}`, { method: "HEAD", headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
-        if (resp.status === 200)
+        const result = await http_fetchHeadWithRetry(`https://${host}/v2/${repository}/manifests/${safeRef}`, headers);
+        if (result.kind === "ok")
             return "found";
-        if (resp.status === 404)
+        if (result.kind === "not_found")
             return "notfound";
         return "unknown";
     }
@@ -91300,6 +91351,18 @@ async function listVersions(url, headers, extract, label) {
 // "4.10" are preserved as strings (not coerced to the number 4.1).
 const mavenXmlParser = new XMLParser({ parseTagValue: false, parseAttributeValue: false, processEntities: false });
 /**
+ * Extract the textual content of a parsed maven-metadata.xml `<version>` element,
+ * which is a plain string in the common case but an object with a `#text` key when
+ * the element carries an XML attribute (parseAttributeValue is disabled, so attributed
+ * elements come back as `{ "#text": "1.2.3", "@_...": ... }` rather than a bare string).
+ */
+function mavenVersionText(v) {
+    if (v !== null && typeof v === "object" && "#text" in v) {
+        return String(v["#text"]);
+    }
+    return String(v);
+}
+/**
  * Returns true when any numeric segment of a semver string exceeds
  * Number.MAX_SAFE_INTEGER. semver.coerce() converts segments via Number(),
  * which loses precision beyond that bound — e.g. a 17-digit segment silently
@@ -91307,6 +91370,35 @@ const mavenXmlParser = new XMLParser({ parseTagValue: false, parseAttributeValue
  */
 function hasOverflowingSegment(v) {
     return v.split(/[\s+\-.]/).some((seg) => /^\d+$/.test(seg) && !Number.isSafeInteger(Number(seg)));
+}
+/**
+ * Normalize leading zeros in each numeric segment before coercing so that
+ * "2.00" → "2.0" and coerces correctly instead of returning undefined.
+ * Uses (^[vV]?|[.\s+\-]) so a leading "v" in "v01.2.3" is included in the
+ * captured prefix ($1) rather than forming a word-char boundary that blocks
+ * the match — /\b/ would fail between [vV] and the following zero.
+ */
+function normalizeLeadingZeros(v) {
+    return v.replace(/(^[vV]?|[.\s+-])0+([0-9])/g, "$1$2");
+}
+/**
+ * Returns the semver-coerced form of `v` when it is usable for comparison/sorting
+ * under `compareVersionsDesc(..., useCoerce: true)`, or null when it is not —
+ * either because a numeric segment overflows Number.MAX_SAFE_INTEGER (see
+ * hasOverflowingSegment) or because semver.coerce cannot parse it at all.
+ *
+ * This is the single source of truth for "is this version comparable" shared by
+ * compareVersionsDesc and any pre-sort filter (e.g. bcrVersions). Filtering with a
+ * looser check (like a bare `semver.coerce(v) !== null`) would let an
+ * overflowing-segment version survive the filter while compareVersionsDesc treats
+ * it as non-comparable and sorts it last — the two disagreeing means a garbage
+ * version could end up first in the filtered array (before the explicit sort even
+ * runs its overflow handling) or otherwise be mis-selected as "latest".
+ */
+function coercedComparableVersion(v) {
+    if (hasOverflowingSegment(v))
+        return null;
+    return semver.coerce(normalizeLeadingZeros(v))?.version ?? null;
 }
 /**
  * Compare two version strings for descending sort (newest first).
@@ -91322,18 +91414,10 @@ function hasOverflowingSegment(v) {
  * because semver.coerce() overflows them to 0.0.0, mis-ranking them as oldest.
  */
 function compareVersionsDesc(a, b, useCoerce = false) {
-    const aOverflows = useCoerce && hasOverflowingSegment(a);
-    const bOverflows = useCoerce && hasOverflowingSegment(b);
-    // Normalize leading zeros in each numeric segment before coercing so that
-    // "2.00" → "2.0" and coerces correctly instead of returning undefined.
-    // Uses (^[vV]?|[.\s+\-]) so a leading "v" in "v01.2.3" is included in the
-    // captured prefix ($1) rather than forming a word-char boundary that blocks
-    // the match — /\b/ would fail between [vV] and the following zero.
-    const normalizeLeadingZeros = (v) => v.replace(/(^[vV]?|[.\s+-])0+([0-9])/g, "$1$2");
-    const av = aOverflows ? null : (useCoerce ? (node_modules_semver.coerce(normalizeLeadingZeros(a))?.version ?? null) : node_modules_semver.valid(a));
-    const bv = bOverflows ? null : (useCoerce ? (node_modules_semver.coerce(normalizeLeadingZeros(b))?.version ?? null) : node_modules_semver.valid(b));
+    const av = useCoerce ? coercedComparableVersion(a) : semver.valid(a);
+    const bv = useCoerce ? coercedComparableVersion(b) : semver.valid(b);
     if (av && bv) {
-        const cmp = node_modules_semver.rcompare(av, bv);
+        const cmp = semver.rcompare(av, bv);
         // Coercion is lossy for qualified Maven versions (e.g. "2.21.RELEASE" → "2.21.0"),
         // so two distinct inputs can coerce equal. Break the tie deterministically:
         // prefer the stable form (digits+dots only) over a qualified form, then fall
@@ -91370,8 +91454,9 @@ async function npmVersions(name, registries) {
         const publishedVersionSet = data.versions !== undefined
             ? new Set(Object.keys(data.versions))
             : null;
-        if (publishedVersionSet === null) {
-            lib_core.warning(`[lisan] npm registry returned a packument without a "versions" field — ` +
+        if (publishedVersionSet === null && !_warnedNpmNoVersionsField.has(registries.npm)) {
+            _warnedNpmNoVersionsField.add(registries.npm);
+            lib_core.warning(`[lisan] npm registry ${registries.npm} returned a packument without a "versions" field — ` +
                 `age dates are from the "time" map only; a hostile mirror could backdate versions.`);
         }
         const results = [];
@@ -91386,7 +91471,7 @@ async function npmVersions(name, registries) {
             // entries, `unpublished` tombstones, and — for a malicious mirror — backdated
             // injected versions. A release-only filter limits the promotion trust boundary
             // without affecting the common case (npmjs.org always returns `versions`).
-            if (publishedVersionSet === null && !node_modules_semver.valid(version))
+            if (publishedVersionSet === null && !semver.valid(version))
                 continue;
             const publishDate = sanePublishDate(dateStr);
             // Skip entries with malformed or out-of-range dates (NaN, pre-2000, far-future).
@@ -91439,8 +91524,18 @@ async function mavenMetadataVersions(group, artifact, repositories, registries) 
     const allVersionLists = [];
     for (const repo of repositories) {
         const base = requireHttpsMavenRepo(resolveMavenRepo(repo, registries));
-        if (base === null)
-            continue; // skip non-HTTPS repos silently
+        if (base === null) {
+            // SSRF-prevention skip (see requireHttpsMavenRepo): otherwise indistinguishable
+            // downstream from "this repo answered cleanly with no matching artifact", which
+            // would silently drop coverage. Warn once per repo (not once per artifact lookup)
+            // to surface the coverage loss without spamming a diff with many changed deps.
+            if (!_warnedNonHttpsMavenRepo.has(repo)) {
+                _warnedNonHttpsMavenRepo.add(repo);
+                core.warning(`[lisan] Skipping non-HTTPS Maven repository "${repo}" — only HTTPS repository URLs are queried ` +
+                    `(SSRF prevention). Versions hosted only in this repo will not be considered.`);
+            }
+            continue;
+        }
         const metadataUrl = `${base}/${groupPath}/${artifact}/maven-metadata.xml`;
         // Use fetchTextWithRetry so transient 5xx / 429 responses are retried with
         // exponential backoff, consistent with every other body-returning GET in this file.
@@ -91476,17 +91571,15 @@ async function mavenMetadataVersions(group, artifact, repositories, registries) 
         if (!versioning)
             continue;
         // Parse version list. With parseTagValue disabled the parser keeps numeric-looking
-        // versions ("4.10") as strings, but stringify defensively for any non-string shape.
+        // versions ("4.10") as strings; mavenVersionText additionally unwraps the
+        // { "#text": ... } shape produced for attributed <version> elements.
         const rawVersions = versioning.versions?.version;
         let versionList = [];
         if (Array.isArray(rawVersions)) {
-            versionList = rawVersions.map(String);
+            versionList = rawVersions.map(mavenVersionText);
         }
-        else if (typeof rawVersions === "string") {
-            versionList = [rawVersions];
-        }
-        else if (typeof rawVersions === "number") {
-            versionList = [String(rawVersions)];
+        else if (rawVersions !== undefined && rawVersions !== null) {
+            versionList = [mavenVersionText(rawVersions)];
         }
         // Pre-filter: keep only versions whose leading numeric run is immediately followed
         // by a version separator (`.`, `-`, `+`), whitespace, or end-of-string.
@@ -91505,7 +91598,10 @@ async function mavenMetadataVersions(group, artifact, repositories, registries) 
     if (allVersionLists.length === 0) {
         // Distinguish "artifact has no versions in any repo" (some repo answered 404/410)
         // from a transient outage where every repo was unreachable — callers should not
-        // treat the latter as a definitive empty version list.
+        // treat the latter as a definitive empty version list. `anyRepoReachable` is only
+        // ever set to true inside the loop above after a repo passed requireHttpsMavenRepo,
+        // so this also covers "every configured repo was skipped for being non-HTTPS": that
+        // case must throw here rather than silently returning [], same as a network outage.
         if (!anyRepoReachable) {
             throw new Error(`all Maven repos unreachable for ${group}:${artifact}`);
         }
@@ -91537,12 +91633,25 @@ async function bcrVersions(name, token, bcrUrl) {
     try {
         const url = `${bcrUrl.replace(/\/$/, "")}/modules/${encodeURIComponent(name)}/metadata.json`;
         const result = await fetchWithRetry(url);
-        if (result.kind !== "ok" || !result.data.versions?.length)
+        if (result.kind === "not_found")
+            return []; // module genuinely absent from BCR
+        if (result.kind !== "ok") {
+            // rate_limited or error after exhausting retries — transient failure. Throw (not a
+            // silent []) so the caller's fail-closed path (runBatched → core.warning) makes the
+            // outage visible, instead of reporting "module is up to date" when it was never checked.
+            throw new Error(`BCR metadata unreachable for ${name}: ${result.kind}`);
+        }
+        if (!result.data.versions?.length)
             return [];
         // Sort versions newest semver first; use coerce (not valid) so non-strict-semver BCR
         // releases ("1.0-rc1", date-style modules) aren't silently dropped.
+        // Filter with the exact same predicate compareVersionsDesc(..., true) uses to decide
+        // "comparable" (coercedComparableVersion) — a looser `semver.coerce(v) !== null` check
+        // here would let an overflowing-segment version (a malformed/fuzzed BCR metadata.json
+        // entry, e.g. a 17+ digit numeric segment) survive the filter while the comparator
+        // treats it as non-comparable, risking it being mis-picked as "latest".
         const sorted = [...result.data.versions]
-            .filter((v) => semver.coerce(v) !== null)
+            .filter((v) => coercedComparableVersion(v) !== null)
             .sort((a, b) => compareVersionsDesc(a, b, true));
         if (sorted.length === 0)
             return [];
@@ -91585,10 +91694,10 @@ async function registry_ociDigestForTag(registry, repository, tag, dockerhubMirr
             const headers = { Accept: MANIFEST_ACCEPT };
             if (token)
                 headers.Authorization = `Bearer ${token}`;
-            const resp = await fetch(`https://${host}/v2/${repository}/manifests/${encodeURIComponent(tag)}`, { method: "HEAD", headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-            if (!resp.ok)
+            const result = await fetchHeadWithRetry(`https://${host}/v2/${repository}/manifests/${encodeURIComponent(tag)}`, headers);
+            if (result.kind !== "ok")
                 return null;
-            const digest = resp.headers.get("Docker-Content-Digest");
+            const digest = result.data.headers.get("Docker-Content-Digest");
             // Validate format before trusting a value from an external registry.
             // Reuse the shared DIGEST_RE instead of an inline copy.
             return DIGEST_RE.test(digest ?? "") ? digest : null;
@@ -93094,6 +93203,12 @@ function extractString(node) {
     const text = node.text;
     if (text.length < 2)
         return null;
+    // Triple-quoted strings (""" or ''') have 3-char delimiters; the single-quote-stripping
+    // logic below would slice into the literal content rather than past the delimiter,
+    // yielding a value with stray interior quote characters rather than null. Reject
+    // outright here so every caller gets this guard for free.
+    if (text.startsWith('"""') || text.startsWith("'''"))
+        return null;
     const open = text[0];
     const close = text[text.length - 1];
     if ((open !== '"' && open !== "'") || open !== close)
@@ -93148,13 +93263,11 @@ function extractStringConstants(rootNode) {
             continue;
         if (!rightNode || rightNode.type !== "string")
             continue;
-        // Skip triple-quoted strings — extractString only strips one quote, yielding
-        // stray interior quotes rather than null. Prefix-byte strings (r"…", b"…") are
-        // caught downstream by extractString's text[0] check.
-        if (rightNode.text.startsWith('"""') || rightNode.text.startsWith("'''"))
-            continue;
+        // Triple-quoted and prefix-byte (r"…", b"…") strings are rejected inside extractString.
         const val = extractString(rightNode);
-        if (val === null)
+        // Reject an empty constant outright: e.g. `VER = ""` used as `bazel_dep(version=VER)`
+        // would otherwise emit a writable DepRef with current:"" — not fail-closed.
+        if (val === null || val === "")
             continue;
         const name = leftNode.text;
         if (reassigned.has(name))
@@ -93263,10 +93376,6 @@ function parsePercentInterpolation(node, constants) {
         return null;
     if (leftNode.type !== "string")
         return null;
-    // Reject triple-quoted template strings — extractString only strips one quote,
-    // yielding stray interior quotes rather than the template content.
-    if (leftNode.text.startsWith('"""') || leftNode.text.startsWith("'''"))
-        return null;
     // RHS must be a single identifier, a single-element tuple, or an rpartition subscript.
     // Resolve all three shapes in an IIFE so each branch can return early without
     // initialising variables to null (which would trip the no-useless-assignment rule).
@@ -93281,9 +93390,14 @@ function parsePercentInterpolation(node, constants) {
             return { identName: ident, entry: e, effectiveValue: e.value, readOnly: false };
         }
         if (rightNode.type === "tuple") {
+            // Require exactly one tuple element total (not just exactly one identifier) — otherwise
+            // "%s" % (CONST, "x") (one identifier + one non-identifier element, invalid Python that
+            // would raise "not all arguments converted") is wrongly accepted as a single-element tuple.
+            if (rightNode.namedChildren.length !== 1)
+                return null;
             const identChildren = rightNode.namedChildren.filter((c) => c.type === "identifier");
             if (identChildren.length !== 1)
-                return null; // reject multi-identifier or empty tuple
+                return null; // reject non-identifier single element
             const ident = identChildren[0].text;
             const e = constants.get(ident);
             if (!e)
@@ -93312,15 +93426,11 @@ function parsePercentInterpolation(node, constants) {
     const pctParts = template.split("%s");
     if (pctParts.length !== 2)
         return null; // 0 or 2+ %s → skip
-    // Reject templates with other Python format conversions (e.g. "%s%d", "%s%r").
-    const otherConversions = /%-?\d*[diouxXeEfFgGrsa]/;
-    if (pctParts.some((p) => otherConversions.test(p)))
-        return null;
     const [prefix, suffix] = pctParts;
     // Fail-closed on any remaining bare/trailing `%` in prefix or suffix (e.g. "%s-100%",
-    // "%(name)s", "%*s"). After stripping %% escapes and the single %s, any remaining `%`
-    // is an unhandled Python format conversion that we cannot reason about — emit null so
-    // the constant is never updated from a template Python would reject at runtime.
+    // "%(name)s", "%*s", "%s%d", "%s%r"). After stripping %% escapes and the single %s, any
+    // remaining `%` is an unhandled Python format conversion that we cannot reason about —
+    // emit null so the constant is never updated from a template Python would reject at runtime.
     if (prefix.includes("%") || suffix.includes("%"))
         return null;
     // Restrict interpolation to templates where the `%s` sits at a real version
@@ -93333,6 +93443,23 @@ function parsePercentInterpolation(node, constants) {
         return null;
     return { identName, entry, prefix, suffix, effectiveValue, readOnly };
 }
+/**
+ * Build a `VersionRef`, centralizing the field defaults/omissions every construction
+ * site must apply consistently (this is where the single-quote `quote`-field
+ * regression already recurred once across hand-duplicated literals).
+ */
+function makeVersionRef(opts) {
+    return {
+        value: opts.value,
+        nodeStart: opts.nodeStart,
+        nodeEnd: opts.nodeEnd,
+        templatePrefix: opts.templatePrefix ?? "",
+        templateSuffix: opts.templateSuffix ?? "",
+        quote: opts.quote,
+        ...(opts.constantName !== undefined ? { constantName: opts.constantName } : {}),
+        ...(opts.readOnly ? { readOnly: true } : {}),
+    };
+}
 function resolveVersionExpr(node, constants) {
     if (node.type === "string") {
         // Triple-quoted strings: extractString only strips one quote, yielding stray interior
@@ -93342,14 +93469,12 @@ function resolveVersionExpr(node, constants) {
         const val = extractString(node);
         if (val === null)
             return null;
-        return {
+        return makeVersionRef({
             value: val,
             nodeStart: node.startIndex + 1,
             nodeEnd: node.endIndex - 1,
-            templatePrefix: "",
-            templateSuffix: "",
             quote: node.text[0] ?? '"',
-        };
+        });
     }
     if (node.type === "identifier") {
         const entry = constants.get(node.text);
@@ -93358,15 +93483,13 @@ function resolveVersionExpr(node, constants) {
         // Reject forward references: the constant must be assigned before this use site.
         if (node.startIndex < entry.assignmentEnd)
             return null;
-        return {
+        return makeVersionRef({
             value: entry.value,
             nodeStart: entry.valueNodeStart,
             nodeEnd: entry.valueNodeEnd,
-            templatePrefix: "",
-            templateSuffix: "",
             constantName: node.text,
             quote: entry.quote,
-        };
+        });
     }
     if (node.type === "subscript") {
         // Handles `CONST.rpartition(SEP)[0]` — a lossy transform that cannot be
@@ -93375,23 +93498,21 @@ function resolveVersionExpr(node, constants) {
         if (!parsed)
             return null;
         const { identName, entry, head } = parsed;
-        return {
+        return makeVersionRef({
             value: head,
             nodeStart: entry.valueNodeStart,
             nodeEnd: entry.valueNodeEnd,
-            templatePrefix: "",
-            templateSuffix: "",
             constantName: identName,
             quote: entry.quote,
             readOnly: true,
-        };
+        });
     }
     if (node.type === "binary_operator") {
         const interp = parsePercentInterpolation(node, constants);
         if (!interp)
             return null;
         const { identName, entry, prefix, suffix, effectiveValue, readOnly } = interp;
-        return {
+        return makeVersionRef({
             value: prefix + effectiveValue + suffix,
             nodeStart: entry.valueNodeStart,
             nodeEnd: entry.valueNodeEnd,
@@ -93399,8 +93520,8 @@ function resolveVersionExpr(node, constants) {
             templateSuffix: suffix,
             constantName: identName,
             quote: entry.quote,
-            ...(readOnly ? { readOnly: true } : {}),
-        };
+            readOnly,
+        });
     }
     return null;
 }
@@ -93441,12 +93562,12 @@ function resolveArtifactCoord(node, constants) {
         const versionSuffix = firstColonRight >= 0 ? rightPart.slice(0, firstColonRight) : rightPart;
         return {
             coord,
-            versionRef: {
-                // The full version segment = versionPrefix + effectiveValue + versionSuffix.
-                // For bare-constant/tuple RHS, effectiveValue === entry.value and this equals
-                // coord.split(":")[2] for the common "group:artifact:VERSION" form.
-                // For rpartition RHS, effectiveValue is the truncated head — the versionRef is
-                // readOnly and carries the effective (shorter) version for age-gating only.
+            // The full version segment = versionPrefix + effectiveValue + versionSuffix.
+            // For bare-constant/tuple RHS, effectiveValue === entry.value and this equals
+            // coord.split(":")[2] for the common "group:artifact:VERSION" form.
+            // For rpartition RHS, effectiveValue is the truncated head — the versionRef is
+            // readOnly and carries the effective (shorter) version for age-gating only.
+            versionRef: makeVersionRef({
                 value: versionPrefix + effectiveValue + versionSuffix,
                 nodeStart: entry.valueNodeStart,
                 nodeEnd: entry.valueNodeEnd,
@@ -93454,8 +93575,8 @@ function resolveArtifactCoord(node, constants) {
                 templateSuffix: versionSuffix,
                 constantName: identName,
                 quote: entry.quote,
-                ...(readOnly ? { readOnly: true } : {}),
-            },
+                readOnly,
+            }),
         };
     }
     return null;
@@ -93544,13 +93665,18 @@ async function resolveModuleFiles(rootPath) {
     await visit(rootPath);
     return result;
 }
+/** Parse Starlark content and collect its top-level string constants in one pass. */
+async function parseModule(content) {
+    const tree = await parseStarlark(content);
+    const constants = extractStringConstants(tree.rootNode);
+    return { tree, constants };
+}
 /**
  * Extract crate.spec() calls from Starlark content.
  * Resolves constant variables and % interpolation in version= arguments.
  */
 async function extractCrateSpecs(content) {
-    const tree = await parseStarlark(content);
-    const constants = extractStringConstants(tree.rootNode);
+    const { tree, constants } = await parseModule(content);
     const calls = findCallsByName(tree.rootNode, "crate.spec");
     const specs = [];
     for (const call of calls) {
@@ -93579,8 +93705,7 @@ async function extractCrateSpecs(content) {
  * single_version_override, multiple_version_override
  */
 async function extractOverrides(content) {
-    const tree = await parseStarlark(content);
-    const constants = extractStringConstants(tree.rootNode);
+    const { tree, constants } = await parseModule(content);
     const overrides = new Map();
     const OVERRIDE_TYPE_MAP = {
         git_override: "git",
@@ -93650,8 +93775,7 @@ async function extractOverrides(content) {
     return overrides;
 }
 async function extractMavenInstalls(content, workspaceRoot) {
-    const tree = await parseStarlark(content);
-    const constants = extractStringConstants(tree.rootNode);
+    const { tree, constants } = await parseModule(content);
     const calls = findCallsByName(tree.rootNode, "maven.install");
     const installs = [];
     const wsRoot = workspaceRoot ?? cwd;
@@ -93680,8 +93804,7 @@ async function extractMavenInstalls(content, workspaceRoot) {
  * artifacts= lists). Resolves constant variables in the version= argument.
  */
 async function extractMavenArtifacts(content) {
-    const tree = await parseStarlark(content);
-    const constants = extractStringConstants(tree.rootNode);
+    const { tree, constants } = await parseModule(content);
     const calls = findCallsByName(tree.rootNode, "maven.artifact");
     const refs = [];
     for (const call of calls) {
@@ -93711,8 +93834,7 @@ async function extractMavenArtifacts(content) {
  * rewrite versions in-place without re-parsing.
  */
 async function extractBazelDeps(content) {
-    const tree = await parseStarlark(content);
-    const constants = extractStringConstants(tree.rootNode);
+    const { tree, constants } = await parseModule(content);
     const calls = findCallsByName(tree.rootNode, "bazel_dep");
     const deps = [];
     for (const call of calls) {
@@ -93839,7 +93961,7 @@ function resolveCrateVersion(name, range, lockVersions) {
     if (!versions || versions.length === 0)
         return range;
     const npmRange = cargoReqToNpmRange(range);
-    const best = node_modules_semver.maxSatisfying(versions, npmRange, { loose: true });
+    const best = semver.maxSatisfying(versions, npmRange, { loose: true });
     return best ?? range;
 }
 async function rust_getChangedDeps(baseRef, moduleBazelPath) {
@@ -94453,6 +94575,13 @@ const REPOSITORY_RE = /^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:
  * library/<name> so API lookups work (e.g. "postgres" → "library/postgres").
  * Returns null for references whose repository path is not a legal OCI name
  * (e.g. placeholder tokens like __DIND_IMAGE__, uppercase refs, etc.).
+ *
+ * Inherent ambiguity: a slash-less reference whose sole segment looks like
+ * "host:port" (e.g. "registry.example.com:5000") is indistinguishable from a
+ * bare "name:tag" and is always parsed as the latter (Docker Hub repository
+ * "registry.example.com", tag "5000") — a registry host alone, with no
+ * repository path, is not a meaningful image reference in this grammar, so
+ * this case is not expected to occur in practice.
  */
 function parseImageRef(raw) {
     const trimmed = raw.trim();
@@ -94567,6 +94696,19 @@ function ociDigestOf(imageRef) {
     const idx = imageRef.indexOf("@");
     return idx >= 0 ? imageRef.slice(idx + 1) : null;
 }
+/**
+ * For a COPY --from / RUN --mount=from image reference (Dockerfile/Containerfile), check
+ * whether the registry positively confirms the image exists. These sources are ambiguous —
+ * they may name a build-stage alias, a build context, or a typo rather than a real external
+ * image — so callers should only treat the result "found" as confirmed and treat every other
+ * outcome ("notfound"/"unknown") as unconfirmed (skip, preferring false-negatives over
+ * false-positives). Shared by the verify (`src/ecosystems/docker.ts`) and update
+ * (`src/update/ecosystems/docker.ts`) Dockerfile parsers so the gate can't drift between them.
+ */
+async function confirmCopyMountFromExists(ref, dockerhubMirror) {
+    const reference = ref.digest ?? ref.tag ?? "latest";
+    return imageExists(ref.registry, ref.repository, reference, dockerhubMirror);
+}
 function makeName(ref) {
     return `${ref.registry}/${ref.repository}`;
 }
@@ -94671,7 +94813,6 @@ async function fetchImageAgeFromDigest(registry, repository, digest, tag) {
 }
 //# sourceMappingURL=image.js.map
 ;// CONCATENATED MODULE: ./out/ecosystems/docker.js
-
 
 
 
@@ -94859,8 +95000,7 @@ async function docker_getChangedDeps(baseRef, dockerfilesInput, dockerhubMirror)
             // sources are ambiguous (build contexts, stage aliases, typos) and we
             // prefer false-negatives over false-positives.
             if (source === "copy-from" || source === "mount-from") {
-                const reference = ref.digest ?? ref.tag ?? "latest";
-                const exists = await imageExists(ref.registry, ref.repository, reference, dockerhubMirror);
+                const exists = await confirmCopyMountFromExists(ref, dockerhubMirror);
                 if (exists !== "found") {
                     lib_core.info(`docker: ${raw} not confirmed in registry (${exists}; build context, alias, or typo), skipping`);
                     continue;
@@ -95164,6 +95304,20 @@ function computeContainerScopeLines(lines) {
     return result;
 }
 /**
+ * Accept/reject ceiling check: is a line at `lineIndent` a direct field of the
+ * current container item (per `info`, from `computeContainerScopeLines`)? Colocated
+ * with the scope computer so the invariant is auditable/testable in one place rather
+ * than duplicated inline at each call site.
+ *
+ * `itemFieldIndent` is set eagerly the moment the first container item's dash line is
+ * seen (see computeContainerScopeLines), so the `containerIndent + 4` fallback is only
+ * reachable before that point in the current scope (i.e. `itemFieldIndent === -1`).
+ */
+function isWithinContainerItemFieldScope(info, lineIndent) {
+    const maxImageIndent = info.itemFieldIndent >= 0 ? info.itemFieldIndent : info.containerIndent + 4;
+    return lineIndent <= maxImageIndent;
+}
+/**
  * Parse a rendered Kubernetes manifest and return all container image strings
  * with their source-level position info (line index and character offset within
  * that line where the image value starts).
@@ -95184,7 +95338,7 @@ function parseManifestImagesWithPositions(content, sourceFile) {
     const containerScopeData = computeContainerScopeLines(lines);
     // For each line, check if it matches `image: <value>` (with optional quotes).
     for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-        const { containerIndent, itemFieldIndent } = containerScopeData[lineIdx];
+        const { containerIndent } = containerScopeData[lineIdx];
         if (containerIndent === -1)
             continue; // reject non-container `image:` keys
         const line = lines[lineIdx];
@@ -95197,13 +95351,7 @@ function parseManifestImagesWithPositions(content, sourceFile) {
         if (!imageMap.has(imageValue))
             continue;
         // Depth guard: reject `image:` keys that are not a direct field of the container
-        // list item. `itemFieldIndent` is set eagerly to `itemDashIndent + prefixWidth` when
-        // a container item is first seen (so it is never -1 by the time any image key
-        // could appear under it), giving a correct ceiling that rejects sub-list entries
-        // like `env[]` items whose `image:` keys land at a deeper indent. Falls back to
-        // `containerIndent + 4` only before any container item has been seen in this scope
-        // (i.e. `itemFieldIndent` is still -1), which covers the `- image: foo` dash-inline
-        // style where itemFieldIndent is set on the same line.
+        // list item — see isWithinContainerItemFieldScope for the ceiling invariant.
         //
         // LIMITATION: The image: field is identified by indentation depth alone. An image: key
         // at exactly itemFieldIndent is accepted regardless of its enclosing key path — e.g. a
@@ -95211,8 +95359,7 @@ function parseManifestImagesWithPositions(content, sourceFile) {
         // on imageMap.has(value) (populated by the semantic YAML parse) agreeing with indentation.
         // Flow-style YAML and anchors are unaffected (they produce no imageMap entries).
         const lineIndent = /^(\s*)/.exec(line)?.[1].length ?? 0;
-        const maxImageIndent = itemFieldIndent >= 0 ? itemFieldIndent : containerIndent + 4;
-        if (lineIndent > maxImageIndent)
+        if (!isWithinContainerItemFieldScope(containerScopeData[lineIdx], lineIndent))
             continue;
         // valueOffset = length of the "image: " prefix + optional opening quote
         const valueOffset = lineMatch[1].length + lineMatch[2].length;
@@ -95360,6 +95507,45 @@ async function runBatched(tasks, batchSize, logger) {
     }
 }
 //# sourceMappingURL=concurrency.js.map
+;// CONCATENATED MODULE: ./out/update/resolve.js
+
+
+/** Maximum number of concurrent registry/network tasks per batch. */
+const RESOLVE_CONCURRENCY = 8;
+/**
+ * Deduplicate deps by cache key, then batch-resolve each unique dep using `resolveOne`.
+ * Returns a Map<cacheKey, T | null> where null means resolution threw.
+ * Concurrency-bounded by `runBatched`.
+ *
+ * This module is intentionally a leaf (imports only `runBatched`) so it can be
+ * imported from `src/main.ts` without pulling in the clack TUI or any updater
+ * ecosystem module into the action bundle.
+ *
+ * @param logger Optional callback for per-dep resolve failures; defaults to `core.info`
+ * (the interactive updater's quieter default). The verify action passes `core.warning`
+ * so a failed registry lookup surfaces as a GitHub annotation instead of debug-only output.
+ */
+async function dedupeAndResolve(deps, keyOf, resolveOne, concurrency, logger) {
+    const log = logger ?? ((msg) => lib_core.info(msg));
+    const unique = new Map();
+    for (const dep of deps) {
+        const key = keyOf(dep);
+        if (!unique.has(key))
+            unique.set(key, dep);
+    }
+    const result = new Map();
+    await runBatched([...unique.entries()].map(([key, dep]) => async () => {
+        try {
+            result.set(key, await resolveOne(dep));
+        }
+        catch (err) {
+            log(`[lisan] resolve failed for ${key}: ${err instanceof Error ? err.message : String(err)}`);
+            result.set(key, null);
+        }
+    }), concurrency);
+    return result;
+}
+//# sourceMappingURL=resolve.js.map
 // EXTERNAL MODULE: external "node:zlib"
 var external_node_zlib_ = __nccwpck_require__(8522);
 ;// CONCATENATED MODULE: external "node:stream/promises"
@@ -95871,7 +96057,10 @@ function isCompatibleWith(depLicense, targetLicense) {
     return false;
 }
 // Numeric restrictiveness levels used by isLicenseMoreRestrictiveThan.
-// Lower = more permissive. "unknown" is absent (handled by callers as fail-open).
+// Lower = more permissive. "unknown" is deliberately excluded from the key type (handled
+// by callers as fail-open) — every OTHER LicenseCategory member is required here by the
+// `Record<Exclude<...>, number>` type, so adding a new category to the union without also
+// giving it a level is a compile error, not a silent runtime drift.
 const RESTRICTIVENESS_LEVEL = {
     permissive: 0,
     "apache-2.0": 1,
@@ -95884,6 +96073,15 @@ const RESTRICTIVENESS_LEVEL = {
 /**
  * Compute the effective restrictiveness level of a potentially compound SPDX
  * expression.
+ *
+ * This is a deliberately separate evaluator from `licenseLevel`/`licenseLevelFromNode`
+ * below: that one walks a real `spdx-expression-parse` AST (handles parens, returns a
+ * 3-bucket permissive/copyleft/unknown classification) but has no notion of *ordering*
+ * between two arbitrary expressions, which `isLicenseMoreRestrictiveThan` needs. Rather
+ * than extend the AST walker with a numeric-level return type used by only one caller,
+ * this string-split evaluator gives `isLicenseMoreRestrictiveThan` its own minimal,
+ * narrowly-scoped (and explicitly fail-open on parens, see below) ordering logic.
+ *
  *   - `A OR B`  → most-permissive (minimum) level: the user can choose the least
  *                 restrictive alternative, so the combined requirement is the lowest.
  *   - `A AND B` → most-restrictive (maximum) level: both licenses must be honored,
@@ -95924,7 +96122,10 @@ function licenseLevelOrd(spdx) {
     const withIdx = spdx.indexOf(" WITH ");
     if (withIdx !== -1)
         return licenseLevelOrd(spdx.slice(0, withIdx).trim());
-    return RESTRICTIVENESS_LEVEL[categorize(spdx)];
+    const category = categorize(spdx);
+    if (category === "unknown")
+        return undefined;
+    return RESTRICTIVENESS_LEVEL[category];
 }
 /**
  * Returns true when `newLicense` is strictly MORE restrictive than `currentLicense`
@@ -96125,6 +96326,10 @@ function licenseLevelFromNode(node) {
  * Return a coarse license level for a compound SPDX expression.
  * Parses the full AST (handles parentheses, AND, OR) via spdx-expression-parse.
  * Returns "permissive", "copyleft", or "unknown".
+ *
+ * Unlike `licenseLevelOrd` above, this handles parenthesized sub-expressions correctly
+ * (it walks a real AST rather than splitting strings) — see `licenseLevelOrd`'s docstring
+ * for why the two evaluators aren't unified.
  */
 function licenseLevel(expr) {
     try {
@@ -96743,8 +96948,6 @@ async function fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, l
  * Check licenses for all analyzed dependencies and return results.
  */
 async function checkLicenses(results, targetLicenseMap, registries, javaRepoMap, githubToken, bcrUrl, overrides, licenseHeuristics = true, kubernetesImageRefs = new Map(), dockerImageRefs = new Map()) {
-    // Cache: "ecosystem:name@version" → raw license string | null
-    const licenseCache = new Map();
     // Identify deps that need fetching (not overridden, not cached)
     const depsToCheck = results.filter(({ dep }) => {
         const ecoTargets = getEcosystemTargetLicenses(targetLicenseMap, dep.ecosystem);
@@ -96755,28 +96958,13 @@ async function checkLicenses(results, targetLicenseMap, registries, javaRepoMap,
             return false;
         return true;
     });
-    // Deduplicate and fetch licenses in batches of 10
-    const toFetch = [];
-    const seen = new Set();
-    for (const { dep } of depsToCheck) {
-        const override = overrides?.get(dep.ecosystem)?.get(dep.name);
-        if (override)
-            continue;
-        const cacheKey = `${dep.ecosystem}:${dep.name}@${dep.version}`;
-        if (licenseCache.has(cacheKey) || seen.has(cacheKey))
-            continue;
-        seen.add(cacheKey);
-        toFetch.push({ dep, cacheKey });
-    }
+    // Dedupe-and-batch-fetch via the same leaf helper the updater uses (src/update/resolve.ts)
+    // so the "dedupe by cache key → runBatched → catch-per-task → null" pattern isn't
+    // hand-rolled twice. Pass core.warning so a failed license fetch is visible as a GitHub
+    // annotation rather than silently resolving to "no license declared".
+    const toFetch = depsToCheck.filter(({ dep }) => !overrides?.get(dep.ecosystem)?.get(dep.name));
     const LICENSE_FETCH_CONCURRENCY = 10;
-    await runBatched(toFetch.map(({ dep, cacheKey }) => async () => {
-        try {
-            licenseCache.set(cacheKey, await fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics, kubernetesImageRefs, dockerImageRefs));
-        }
-        catch {
-            licenseCache.set(cacheKey, null);
-        }
-    }), LICENSE_FETCH_CONCURRENCY);
+    const licenseCache = await dedupeAndResolve(toFetch, ({ dep }) => `${dep.ecosystem}:${dep.name}@${dep.version}`, ({ dep }) => fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics, kubernetesImageRefs, dockerImageRefs), LICENSE_FETCH_CONCURRENCY, lib_core.warning);
     // Process results
     const licenseResults = [];
     for (const { dep } of depsToCheck) {
@@ -97710,10 +97898,10 @@ const STATUS_ORDER = {
  * Falls back to lexicographic comparison for non-semver versions.
  */
 function compareVersions(a, b) {
-    const sa = node_modules_semver.coerce(a);
-    const sb = node_modules_semver.coerce(b);
+    const sa = semver.coerce(a);
+    const sb = semver.coerce(b);
     if (sa && sb)
-        return node_modules_semver.compare(sa, sb);
+        return semver.compare(sa, sb);
     return a.localeCompare(b);
 }
 /**
@@ -97892,40 +98080,6 @@ function resolveCacheKey(ecosystem, name, current) {
     return `${ecosystem}|||${name}|||${current}`;
 }
 //# sourceMappingURL=cache-key.js.map
-;// CONCATENATED MODULE: ./out/update/resolve.js
-
-
-/** Maximum number of concurrent registry/network tasks per batch. */
-const RESOLVE_CONCURRENCY = 8;
-/**
- * Deduplicate deps by cache key, then batch-resolve each unique dep using `resolveOne`.
- * Returns a Map<cacheKey, T | null> where null means resolution threw.
- * Concurrency-bounded by `runBatched`.
- *
- * This module is intentionally a leaf (imports only `runBatched`) so it can be
- * imported from `src/main.ts` without pulling in the clack TUI or any updater
- * ecosystem module into the action bundle.
- */
-async function dedupeAndResolve(deps, keyOf, resolveOne, concurrency) {
-    const unique = new Map();
-    for (const dep of deps) {
-        const key = keyOf(dep);
-        if (!unique.has(key))
-            unique.set(key, dep);
-    }
-    const result = new Map();
-    await runBatched([...unique.entries()].map(([key, dep]) => async () => {
-        try {
-            result.set(key, await resolveOne(dep));
-        }
-        catch (err) {
-            lib_core.info(`[lisan] resolve failed for ${key}: ${err instanceof Error ? err.message : String(err)}`);
-            result.set(key, null);
-        }
-    }), concurrency);
-    return result;
-}
-//# sourceMappingURL=resolve.js.map
 ;// CONCATENATED MODULE: ./out/main.js
 
 
@@ -98186,7 +98340,7 @@ async function run() {
         // dedupeAndResolve returns null for failed resolutions — stored as null in cache
         // to record "lookup was attempted but failed" (avoids re-fetching on future iterations).
         const depsForLookup = filteredDeps.filter((dep) => !publishDateCache.has(resolveCacheKey(dep.ecosystem, dep.name, dep.version)));
-        const lookupResults = await dedupeAndResolve(depsForLookup, (dep) => resolveCacheKey(dep.ecosystem, dep.name, dep.version), (dep) => lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs, dockerImageRefs), RESOLVE_CONCURRENCY);
+        const lookupResults = await dedupeAndResolve(depsForLookup, (dep) => resolveCacheKey(dep.ecosystem, dep.name, dep.version), (dep) => lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs, dockerImageRefs), RESOLVE_CONCURRENCY, lib_core.warning);
         for (const [key, value] of lookupResults) {
             publishDateCache.set(key, value);
         }
@@ -98276,21 +98430,27 @@ async function run() {
                     // Note: the `update` CLI updates ALL age-failing deps in those ecosystems,
                     // not a filtered subset — per-package filtering is not supported in v1.
                     parts.push(`To update these packages interactively, run: npx -p github:runloopai/lisan-al-gaib-action update ${ecosystemArg} --min-age ${inputs.minAgeDays}` +
-                        ` (add --allow-downgrade only to search for older versions that meet the age gate instead)`);
+                        ` (to search for older versions that meet the age gate instead, add: --allow-downgrade only)`);
                 }
             }
             if (inputs.bypassKeyword) {
-                // Three-way hint that matches the actual bypass paths in bypass.ts:
+                // Four-way hint that matches the actual bypass paths in bypass.ts:
                 //   PR events       → PR label only (commit message is contributor-editable)
                 //   push events     → commit message (HEAD commit, authored by pusher) OR PR label
-                //   unattended runs → PR label only (commit-message bypass disabled on schedule/
-                //                     workflow_dispatch/etc. to prevent a pre-planted keyword from
-                //                     silently bypassing every future unattended run)
+                //   merge_group     → PR label only, but checkBypass looks up the label via
+                //                     listPullRequestsAssociatedWithCommit on the merge-queue commit
+                //                     SHA, which usually has no associated PR — the label must be
+                //                     applied to the source PR before it enters the queue.
+                //   other unattended runs → PR label only (commit-message bypass disabled on
+                //                     schedule/workflow_dispatch/etc. to prevent a pre-planted
+                //                     keyword from silently bypassing every future unattended run)
                 const bypassHint = isPrEvent()
                     ? `To bypass, add "${inputs.bypassKeyword}" as a PR label`
                     : INTERACTIVE_PUSH_EVENTS.has(github.context.eventName)
                         ? `To bypass, add "${inputs.bypassKeyword}" on its own line in the HEAD commit message, or add it as a label on the associated PR`
-                        : `To bypass, add "${inputs.bypassKeyword}" as a label on the associated PR (commit-message bypass is disabled on unattended events)`;
+                        : github.context.eventName === "merge_group"
+                            ? `To bypass, add "${inputs.bypassKeyword}" as a label on the PR before it enters the merge queue — the merge-queue commit itself usually has no associated PR to label`
+                            : `To bypass, add "${inputs.bypassKeyword}" as a label on the associated PR (commit-message bypass is disabled on unattended events)`;
                 parts.push(bypassHint);
             }
             lib_core.setFailed(parts.join(". "));

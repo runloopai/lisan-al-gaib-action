@@ -83420,8 +83420,6 @@ ${c}
 
 // EXTERNAL MODULE: ./node_modules/.pnpm/@actions+core@1.11.1/node_modules/@actions/core/lib/core.js
 var lib_core = __nccwpck_require__(6966);
-;// CONCATENATED MODULE: external "node:fs/promises"
-const promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs/promises");
 ;// CONCATENATED MODULE: ./node_modules/.pnpm/fast-xml-parser@5.5.9/node_modules/fast-xml-parser/src/util.js
 
 
@@ -86622,8 +86620,11 @@ function parseRetryAfter(value) {
     // exponential backoff instead.
     if (/^\d+$/.test(trimmed)) {
         const seconds = Number(trimmed);
-        if (!(seconds > 0))
-            return undefined; // /^\d+$/ already excludes NaN/Infinity; this guards seconds===0
+        // /^\d+$/ excludes NaN, but a long enough digit string (>308 digits) still
+        // overflows to Infinity — reject explicitly rather than relying on the
+        // Math.min clamp below to absorb it silently.
+        if (!Number.isFinite(seconds) || !(seconds > 0))
+            return undefined; // also guards seconds===0
         return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
     }
     // HTTP-date form
@@ -86648,6 +86649,12 @@ function parseRetryAfter(value) {
  *   - 5xx server errors: retry up to maxRetries with exponential backoff + ±25% jitter.
  *   - Network/timeout errors (no HTTP status): retry at most once (maxNetworkRetries=1)
  *     to recover from transient blips without masking persistent failures.
+ *
+ * Exported for callers that need the raw response (headers, custom status-code
+ * classification) beyond what fetchWithRetry/fetchTextWithRetry/fetchHeadWithRetry expose —
+ * e.g. OCI registry manifest/blob fetches, which need both a parsed JSON body and response
+ * headers together. Such callers supply their own `singleAttempt` classifier and get the same
+ * retry/backoff/jitter policy as the built-in helpers, so that policy cannot drift between them.
  */
 async function retryWithBackoff(singleAttempt, opts = {}) {
     const maxRetries = opts.maxRetries ?? 3;
@@ -86808,6 +86815,16 @@ const MAVEN_CENTRAL_PREFIXES = [
 // Warn at most once per process run so we don't spam repeated messages.
 let _warnedRateLimit = false;
 let _warnedUnauth = false;
+// Keyed by npm registry URL: warn at most once per registry, not once per package — a
+// mirror that omits "versions" from every packument would otherwise emit this warning
+// on every changed npm dep in a lockfile diff, which is noisy and conflates an
+// informational mirror-shape fact with a security alert.
+const _warnedNpmNoVersionsField = new Set();
+// Keyed by the raw (pre-resolution) repo URL string: warn at most once per configured
+// repo, not once per artifact lookup — a non-HTTPS repo listed in maven.install()
+// repositories is checked for every changed Maven dep in a diff, which would otherwise
+// spam this warning once per artifact.
+const _warnedNonHttpsMavenRepo = new Set();
 /**
  * Fetch a GitHub REST API URL, classifying the response so callers can
  * distinguish rate-limiting/auth failures from genuine 404s.
@@ -86875,6 +86892,8 @@ async function registry_githubApiFetch(url, token) {
 function _resetGitHubWarningFlags() {
     _warnedRateLimit = false;
     _warnedUnauth = false;
+    _warnedNpmNoVersionsField.clear();
+    _warnedNonHttpsMavenRepo.clear();
 }
 /**
  * Replace Maven Central URLs with the configured registry URL.
@@ -86961,7 +86980,10 @@ async function mavenPublishDate(group, artifact, version, repositories, registri
     // Fall back to Maven Central search API
     const result = await http_fetchWithRetry(`https://search.maven.org/solrsearch/select?q=g:${encodeURIComponent(group)}+AND+a:${encodeURIComponent(artifact)}+AND+v:${encodeURIComponent(version)}&rows=1&wt=json`);
     const ts = result.kind === "ok" ? result.data.response?.docs?.[0]?.timestamp : undefined;
-    if (ts != null) {
+    // The `timestamp` field is declared as `number` above, but the response is untrusted JSON —
+    // guard against a hostile/malformed mirror substituting a string (e.g. a short numeric
+    // string that Date() would parse as a year rather than epoch-ms).
+    if (typeof ts === "number") {
         // Verify the POM exists before trusting the search API's timestamp —
         // search index can list versions whose POM has since been deleted.
         const pomExists = await mavenArtifactExists(group, artifact, version, repositories, registries);
@@ -87138,16 +87160,13 @@ function encodeOciReference(ref) {
 }
 // ─── OCI / Docker registry helpers ──────────────────────────────────────────
 //
-// These helpers use bare `fetch()` rather than the `fetchWithRetry` layer from
-// http.ts. This is intentional — every path returns null / "unknown" on any
-// non-2xx response, which is fail-closed (a transient 429 or 5xx produces an
-// unresolvable digest/date, causing the dep to be skipped rather than promoted).
-// The cost is availability: Docker Hub anonymous rate-limits cause spurious
-// skips that a retry would often recover. If this becomes a significant
-// operational pain point, thread these through fetchWithRetry; for now the
-// fail-closed behaviour is the right tradeoff for this security-sensitive tool.
-// Compare: githubApiFetch is similarly retry-less and documented at the top of
-// that function for the same reason.
+// These helpers route body-reading GET/HEAD requests through fetchWithRetry /
+// fetchHeadWithRetry / retryWithBackoff (the same retry/backoff/classification layer
+// used elsewhere in this file), so a transient 429/503 from a registry is retried rather
+// than being indistinguishable from "tag absent" — which would otherwise produce a
+// spurious "unknown" (verify) or silently drop an available upgrade (update). Every path
+// still fails closed on exhausted retries / genuine errors: null / "unknown", causing the
+// dep to be skipped rather than promoted.
 /**
  * Obtain an anonymous OCI bearer token for the given registry and repository
  * using the WWW-Authenticate challenge flow. Returns null if the registry
@@ -87156,14 +87175,31 @@ function encodeOciReference(ref) {
  */
 async function getOciToken(host, repository) {
     try {
-        const pingResp = await fetch(`https://${host}/v2/`, {
-            signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS),
+        // 200 and 401 are both terminal (expected) outcomes — never retried, matching the
+        // original behaviour. Only 429/5xx (transient) are retried; any other status or a
+        // thrown network error is treated as private/unreachable, same as before.
+        const pingResult = await retryWithBackoff(async () => {
+            try {
+                const resp = await fetch(`https://${host}/v2/`, {
+                    signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS),
+                });
+                if (resp.status === 200 || resp.status === 401) {
+                    return { kind: "ok", data: { status: resp.status, wwwAuth: resp.headers.get("www-authenticate") ?? "" } };
+                }
+                if (resp.status === 429) {
+                    return { kind: "rate_limited", retryAfterMs: parseRetryAfter(resp.headers.get("Retry-After")) };
+                }
+                return { kind: "error", status: resp.status, message: `HTTP ${resp.status}` };
+            }
+            catch (err) {
+                return { kind: "error", message: err instanceof Error ? err.message : String(err) };
+            }
         });
-        if (pingResp.status === 200)
+        if (pingResult.kind !== "ok")
+            return null; // private, unreachable, or retries exhausted
+        if (pingResult.data.status === 200)
             return null; // no auth needed
-        if (pingResp.status !== 401)
-            return null; // private or unreachable
-        const wwwAuth = pingResp.headers.get("www-authenticate") ?? "";
+        const wwwAuth = pingResult.data.wwwAuth;
         const realmMatch = wwwAuth.match(/realm="([^"]+)"/);
         if (!realmMatch)
             return null;
@@ -87197,21 +87233,35 @@ async function fetchOciManifest(host, repository, reference, token) {
     const headers = { Accept: MANIFEST_ACCEPT };
     if (token)
         headers.Authorization = `Bearer ${token}`;
-    try {
-        const safeRef = encodeOciReference(reference);
-        if (safeRef === null)
-            return null; // invalid digest format — bail
-        const resp = await fetch(`https://${host}/v2/${repository}/manifests/${safeRef}`, { headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
-        if (!resp.ok)
-            return null;
-        const contentType = resp.headers.get("content-type") ?? "";
-        const lastModified = resp.headers.get("last-modified");
-        const body = (await resp.json());
-        return { contentType, body, lastModified };
-    }
-    catch {
-        return null;
-    }
+    const safeRef = encodeOciReference(reference);
+    if (safeRef === null)
+        return null; // invalid digest format — bail
+    const result = await retryWithBackoff(async () => {
+        try {
+            const resp = await fetch(`https://${host}/v2/${repository}/manifests/${safeRef}`, { headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
+            if (resp.ok) {
+                try {
+                    const contentType = resp.headers.get("content-type") ?? "";
+                    const lastModified = resp.headers.get("last-modified");
+                    const body = (await resp.json());
+                    return { kind: "ok", data: { contentType, body, lastModified } };
+                }
+                catch (err) {
+                    return { kind: "error", status: resp.status, message: err instanceof Error ? err.message : String(err) };
+                }
+            }
+            if (resp.status === 404 || resp.status === 410)
+                return { kind: "not_found" };
+            if (resp.status === 429) {
+                return { kind: "rate_limited", retryAfterMs: parseRetryAfter(resp.headers.get("Retry-After")) };
+            }
+            return { kind: "error", status: resp.status, message: `HTTP ${resp.status}` };
+        }
+        catch (err) {
+            return { kind: "error", message: err instanceof Error ? err.message : String(err) };
+        }
+    });
+    return result.kind === "ok" ? result.data : null;
 }
 /**
  * Validate a publish date is within a sane range.
@@ -87326,15 +87376,8 @@ async function fetchOciBlobJson(host, repository, digest, token) {
     const headers = {};
     if (token)
         headers.Authorization = `Bearer ${token}`;
-    try {
-        const resp = await fetch(`https://${host}/v2/${repository}/blobs/${digest}`, { headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
-        if (!resp.ok)
-            return null;
-        return await resp.json();
-    }
-    catch {
-        return null;
-    }
+    const result = await http_fetchWithRetry(`https://${host}/v2/${repository}/blobs/${digest}`, headers);
+    return result.kind === "ok" ? result.data : null;
 }
 /**
  * Fetch metadata labels for a container image, merging OCI manifest annotations
@@ -87395,10 +87438,10 @@ async function imageExistsOnHost(host, repository, reference) {
         const safeRef = encodeOciReference(reference);
         if (safeRef === null)
             return "unknown"; // invalid digest format
-        const resp = await fetch(`https://${host}/v2/${repository}/manifests/${safeRef}`, { method: "HEAD", headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-        if (resp.status === 200)
+        const result = await http_fetchHeadWithRetry(`https://${host}/v2/${repository}/manifests/${safeRef}`, headers);
+        if (result.kind === "ok")
             return "found";
-        if (resp.status === 404)
+        if (result.kind === "not_found")
             return "notfound";
         return "unknown";
     }
@@ -87424,7 +87467,7 @@ async function imageExistsOnHost(host, repository, reference) {
  * mirror.gcr.io) resolve ambiguous COPY --from / RUN --mount=from references
  * even when the primary registry is throttling anonymous requests.
  */
-async function registry_imageExists(registry, repository, reference, dockerhubMirror) {
+async function imageExists(registry, repository, reference, dockerhubMirror) {
     const host = resolveOciHost(registry);
     const result = await imageExistsOnHost(host, repository, reference);
     if (result === "unknown" &&
@@ -87459,6 +87502,18 @@ async function listVersions(url, headers, extract, label) {
 // "4.10" are preserved as strings (not coerced to the number 4.1).
 const mavenXmlParser = new XMLParser({ parseTagValue: false, parseAttributeValue: false, processEntities: false });
 /**
+ * Extract the textual content of a parsed maven-metadata.xml `<version>` element,
+ * which is a plain string in the common case but an object with a `#text` key when
+ * the element carries an XML attribute (parseAttributeValue is disabled, so attributed
+ * elements come back as `{ "#text": "1.2.3", "@_...": ... }` rather than a bare string).
+ */
+function mavenVersionText(v) {
+    if (v !== null && typeof v === "object" && "#text" in v) {
+        return String(v["#text"]);
+    }
+    return String(v);
+}
+/**
  * Returns true when any numeric segment of a semver string exceeds
  * Number.MAX_SAFE_INTEGER. semver.coerce() converts segments via Number(),
  * which loses precision beyond that bound — e.g. a 17-digit segment silently
@@ -87466,6 +87521,35 @@ const mavenXmlParser = new XMLParser({ parseTagValue: false, parseAttributeValue
  */
 function hasOverflowingSegment(v) {
     return v.split(/[\s+\-.]/).some((seg) => /^\d+$/.test(seg) && !Number.isSafeInteger(Number(seg)));
+}
+/**
+ * Normalize leading zeros in each numeric segment before coercing so that
+ * "2.00" → "2.0" and coerces correctly instead of returning undefined.
+ * Uses (^[vV]?|[.\s+\-]) so a leading "v" in "v01.2.3" is included in the
+ * captured prefix ($1) rather than forming a word-char boundary that blocks
+ * the match — /\b/ would fail between [vV] and the following zero.
+ */
+function normalizeLeadingZeros(v) {
+    return v.replace(/(^[vV]?|[.\s+-])0+([0-9])/g, "$1$2");
+}
+/**
+ * Returns the semver-coerced form of `v` when it is usable for comparison/sorting
+ * under `compareVersionsDesc(..., useCoerce: true)`, or null when it is not —
+ * either because a numeric segment overflows Number.MAX_SAFE_INTEGER (see
+ * hasOverflowingSegment) or because semver.coerce cannot parse it at all.
+ *
+ * This is the single source of truth for "is this version comparable" shared by
+ * compareVersionsDesc and any pre-sort filter (e.g. bcrVersions). Filtering with a
+ * looser check (like a bare `semver.coerce(v) !== null`) would let an
+ * overflowing-segment version survive the filter while compareVersionsDesc treats
+ * it as non-comparable and sorts it last — the two disagreeing means a garbage
+ * version could end up first in the filtered array (before the explicit sort even
+ * runs its overflow handling) or otherwise be mis-selected as "latest".
+ */
+function coercedComparableVersion(v) {
+    if (hasOverflowingSegment(v))
+        return null;
+    return semver.coerce(normalizeLeadingZeros(v))?.version ?? null;
 }
 /**
  * Compare two version strings for descending sort (newest first).
@@ -87481,16 +87565,8 @@ function hasOverflowingSegment(v) {
  * because semver.coerce() overflows them to 0.0.0, mis-ranking them as oldest.
  */
 function compareVersionsDesc(a, b, useCoerce = false) {
-    const aOverflows = useCoerce && hasOverflowingSegment(a);
-    const bOverflows = useCoerce && hasOverflowingSegment(b);
-    // Normalize leading zeros in each numeric segment before coercing so that
-    // "2.00" → "2.0" and coerces correctly instead of returning undefined.
-    // Uses (^[vV]?|[.\s+\-]) so a leading "v" in "v01.2.3" is included in the
-    // captured prefix ($1) rather than forming a word-char boundary that blocks
-    // the match — /\b/ would fail between [vV] and the following zero.
-    const normalizeLeadingZeros = (v) => v.replace(/(^[vV]?|[.\s+-])0+([0-9])/g, "$1$2");
-    const av = aOverflows ? null : (useCoerce ? (semver.coerce(normalizeLeadingZeros(a))?.version ?? null) : semver.valid(a));
-    const bv = bOverflows ? null : (useCoerce ? (semver.coerce(normalizeLeadingZeros(b))?.version ?? null) : semver.valid(b));
+    const av = useCoerce ? coercedComparableVersion(a) : semver.valid(a);
+    const bv = useCoerce ? coercedComparableVersion(b) : semver.valid(b);
     if (av && bv) {
         const cmp = semver.rcompare(av, bv);
         // Coercion is lossy for qualified Maven versions (e.g. "2.21.RELEASE" → "2.21.0"),
@@ -87529,8 +87605,9 @@ async function npmVersions(name, registries) {
         const publishedVersionSet = data.versions !== undefined
             ? new Set(Object.keys(data.versions))
             : null;
-        if (publishedVersionSet === null) {
-            lib_core.warning(`[lisan] npm registry returned a packument without a "versions" field — ` +
+        if (publishedVersionSet === null && !_warnedNpmNoVersionsField.has(registries.npm)) {
+            _warnedNpmNoVersionsField.add(registries.npm);
+            lib_core.warning(`[lisan] npm registry ${registries.npm} returned a packument without a "versions" field — ` +
                 `age dates are from the "time" map only; a hostile mirror could backdate versions.`);
         }
         const results = [];
@@ -87598,8 +87675,18 @@ async function mavenMetadataVersions(group, artifact, repositories, registries) 
     const allVersionLists = [];
     for (const repo of repositories) {
         const base = requireHttpsMavenRepo(resolveMavenRepo(repo, registries));
-        if (base === null)
-            continue; // skip non-HTTPS repos silently
+        if (base === null) {
+            // SSRF-prevention skip (see requireHttpsMavenRepo): otherwise indistinguishable
+            // downstream from "this repo answered cleanly with no matching artifact", which
+            // would silently drop coverage. Warn once per repo (not once per artifact lookup)
+            // to surface the coverage loss without spamming a diff with many changed deps.
+            if (!_warnedNonHttpsMavenRepo.has(repo)) {
+                _warnedNonHttpsMavenRepo.add(repo);
+                lib_core.warning(`[lisan] Skipping non-HTTPS Maven repository "${repo}" — only HTTPS repository URLs are queried ` +
+                    `(SSRF prevention). Versions hosted only in this repo will not be considered.`);
+            }
+            continue;
+        }
         const metadataUrl = `${base}/${groupPath}/${artifact}/maven-metadata.xml`;
         // Use fetchTextWithRetry so transient 5xx / 429 responses are retried with
         // exponential backoff, consistent with every other body-returning GET in this file.
@@ -87635,17 +87722,15 @@ async function mavenMetadataVersions(group, artifact, repositories, registries) 
         if (!versioning)
             continue;
         // Parse version list. With parseTagValue disabled the parser keeps numeric-looking
-        // versions ("4.10") as strings, but stringify defensively for any non-string shape.
+        // versions ("4.10") as strings; mavenVersionText additionally unwraps the
+        // { "#text": ... } shape produced for attributed <version> elements.
         const rawVersions = versioning.versions?.version;
         let versionList = [];
         if (Array.isArray(rawVersions)) {
-            versionList = rawVersions.map(String);
+            versionList = rawVersions.map(mavenVersionText);
         }
-        else if (typeof rawVersions === "string") {
-            versionList = [rawVersions];
-        }
-        else if (typeof rawVersions === "number") {
-            versionList = [String(rawVersions)];
+        else if (rawVersions !== undefined && rawVersions !== null) {
+            versionList = [mavenVersionText(rawVersions)];
         }
         // Pre-filter: keep only versions whose leading numeric run is immediately followed
         // by a version separator (`.`, `-`, `+`), whitespace, or end-of-string.
@@ -87664,7 +87749,10 @@ async function mavenMetadataVersions(group, artifact, repositories, registries) 
     if (allVersionLists.length === 0) {
         // Distinguish "artifact has no versions in any repo" (some repo answered 404/410)
         // from a transient outage where every repo was unreachable — callers should not
-        // treat the latter as a definitive empty version list.
+        // treat the latter as a definitive empty version list. `anyRepoReachable` is only
+        // ever set to true inside the loop above after a repo passed requireHttpsMavenRepo,
+        // so this also covers "every configured repo was skipped for being non-HTTPS": that
+        // case must throw here rather than silently returning [], same as a network outage.
         if (!anyRepoReachable) {
             throw new Error(`all Maven repos unreachable for ${group}:${artifact}`);
         }
@@ -87696,12 +87784,25 @@ async function bcrVersions(name, token, bcrUrl) {
     try {
         const url = `${bcrUrl.replace(/\/$/, "")}/modules/${encodeURIComponent(name)}/metadata.json`;
         const result = await http_fetchWithRetry(url);
-        if (result.kind !== "ok" || !result.data.versions?.length)
+        if (result.kind === "not_found")
+            return []; // module genuinely absent from BCR
+        if (result.kind !== "ok") {
+            // rate_limited or error after exhausting retries — transient failure. Throw (not a
+            // silent []) so the caller's fail-closed path (runBatched → core.warning) makes the
+            // outage visible, instead of reporting "module is up to date" when it was never checked.
+            throw new Error(`BCR metadata unreachable for ${name}: ${result.kind}`);
+        }
+        if (!result.data.versions?.length)
             return [];
         // Sort versions newest semver first; use coerce (not valid) so non-strict-semver BCR
         // releases ("1.0-rc1", date-style modules) aren't silently dropped.
+        // Filter with the exact same predicate compareVersionsDesc(..., true) uses to decide
+        // "comparable" (coercedComparableVersion) — a looser `semver.coerce(v) !== null` check
+        // here would let an overflowing-segment version (a malformed/fuzzed BCR metadata.json
+        // entry, e.g. a 17+ digit numeric segment) survive the filter while the comparator
+        // treats it as non-comparable, risking it being mis-picked as "latest".
         const sorted = [...result.data.versions]
-            .filter((v) => semver.coerce(v) !== null)
+            .filter((v) => coercedComparableVersion(v) !== null)
             .sort((a, b) => compareVersionsDesc(a, b, true));
         if (sorted.length === 0)
             return [];
@@ -87744,10 +87845,10 @@ async function ociDigestForTag(registry, repository, tag, dockerhubMirror) {
             const headers = { Accept: MANIFEST_ACCEPT };
             if (token)
                 headers.Authorization = `Bearer ${token}`;
-            const resp = await fetch(`https://${host}/v2/${repository}/manifests/${encodeURIComponent(tag)}`, { method: "HEAD", headers, signal: AbortSignal.timeout(http_FETCH_TIMEOUT_MS) });
-            if (!resp.ok)
+            const result = await http_fetchHeadWithRetry(`https://${host}/v2/${repository}/manifests/${encodeURIComponent(tag)}`, headers);
+            if (result.kind !== "ok")
                 return null;
-            const digest = resp.headers.get("Docker-Content-Digest");
+            const digest = result.data.headers.get("Docker-Content-Digest");
             // Validate format before trusting a value from an external registry.
             // Reuse the shared DIGEST_RE instead of an inline copy.
             return DIGEST_RE.test(digest ?? "") ? digest : null;
@@ -87811,6 +87912,13 @@ const REPOSITORY_RE = /^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:
  * library/<name> so API lookups work (e.g. "postgres" → "library/postgres").
  * Returns null for references whose repository path is not a legal OCI name
  * (e.g. placeholder tokens like __DIND_IMAGE__, uppercase refs, etc.).
+ *
+ * Inherent ambiguity: a slash-less reference whose sole segment looks like
+ * "host:port" (e.g. "registry.example.com:5000") is indistinguishable from a
+ * bare "name:tag" and is always parsed as the latter (Docker Hub repository
+ * "registry.example.com", tag "5000") — a registry host alone, with no
+ * repository path, is not a meaningful image reference in this grammar, so
+ * this case is not expected to occur in practice.
  */
 function parseImageRef(raw) {
     const trimmed = raw.trim();
@@ -87925,6 +88033,19 @@ function ociDigestOf(imageRef) {
     const idx = imageRef.indexOf("@");
     return idx >= 0 ? imageRef.slice(idx + 1) : null;
 }
+/**
+ * For a COPY --from / RUN --mount=from image reference (Dockerfile/Containerfile), check
+ * whether the registry positively confirms the image exists. These sources are ambiguous —
+ * they may name a build-stage alias, a build context, or a typo rather than a real external
+ * image — so callers should only treat the result "found" as confirmed and treat every other
+ * outcome ("notfound"/"unknown") as unconfirmed (skip, preferring false-negatives over
+ * false-positives). Shared by the verify (`src/ecosystems/docker.ts`) and update
+ * (`src/update/ecosystems/docker.ts`) Dockerfile parsers so the gate can't drift between them.
+ */
+async function image_confirmCopyMountFromExists(ref, dockerhubMirror) {
+    const reference = ref.digest ?? ref.tag ?? "latest";
+    return imageExists(ref.registry, ref.repository, reference, dockerhubMirror);
+}
 function image_makeName(ref) {
     return `${ref.registry}/${ref.repository}`;
 }
@@ -88028,6 +88149,8 @@ async function fetchImageAgeFromDigest(registry, repository, digest, tag) {
     return { publishDate, ageDays: computeAgeDays(publishDate) };
 }
 //# sourceMappingURL=image.js.map
+;// CONCATENATED MODULE: external "node:fs/promises"
+const promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs/promises");
 // EXTERNAL MODULE: ./node_modules/.pnpm/@actions+exec@1.1.1/node_modules/@actions/exec/lib/exec.js
 var lib_exec = __nccwpck_require__(2851);
 // EXTERNAL MODULE: ./node_modules/.pnpm/@actions+glob@0.5.1/node_modules/@actions/glob/lib/glob.js
@@ -88456,6 +88579,73 @@ async function getTagDate(owner, repo, tag, token) {
     return null;
 }
 //# sourceMappingURL=actions.js.map
+;// CONCATENATED MODULE: ./out/actions-stdout.js
+/**
+ * Shared stdout handling for the local CLIs (verify's `cli.ts` and the updater's
+ * `update/cli.ts`). @actions/core writes GitHub Actions workflow commands
+ * (`::error::`, `::warning::`, etc.) directly to `process.stdout` regardless of
+ * whether a real Actions runner is present to interpret them — outside Actions
+ * these are meaningless noise on stdout at best, and at worst corrupt output a
+ * CLI consumer expects to be pure (e.g. `update --json`).
+ */
+// Captured at module load time, before installActionsCommandFilter() ever patches
+// process.stdout.write — so writeRawStdout can always reach the real stdout even
+// after the filter below is installed.
+const pristineStdoutWrite = process.stdout.write.bind(process.stdout);
+/**
+ * Write text directly to the real stdout, bypassing any filter installed by
+ * {@link installActionsCommandFilter}. Use this for output that must never be
+ * redirected or swallowed — e.g. `update --json`'s final JSON payload.
+ */
+function writeRawStdout(text) {
+    pristineStdoutWrite(text);
+}
+/**
+ * When running outside GitHub Actions, intercept @actions/core's workflow
+ * commands on stdout and render them as colored, human-readable lines on
+ * stderr instead. All other string content written to stdout is redirected to
+ * stderr too — neither CLI has a legitimate reason to write plain diagnostic
+ * text to stdout, and this keeps stdout clean for output that does (piped
+ * results, `--json`, written via {@link writeRawStdout}).
+ *
+ * No-op when GITHUB_ACTIONS is set: inside a real Actions runner these lines
+ * are the actual annotation protocol and must reach the genuine stdout.
+ */
+function installActionsCommandFilter() {
+    if (process.env.GITHUB_ACTIONS)
+        return;
+    const red = (s) => `\x1b[31m${s}\x1b[0m`;
+    const yellow = (s) => `\x1b[33m${s}\x1b[0m`;
+    const stderrWrite = process.stderr.write.bind(process.stderr);
+    process.stdout.write = function (chunk, encodingOrCb, cb) {
+        if (typeof chunk === "string") {
+            if (chunk.startsWith("::error")) {
+                const msg = chunk.replace(/^::error\s*[^:]*::/, "").trim();
+                return stderrWrite(red(`ERROR: ${msg}`) + "\n");
+            }
+            if (chunk.startsWith("::warning")) {
+                const msg = chunk.replace(/^::warning\s*[^:]*::/, "").trim();
+                return stderrWrite(yellow(`WARN:  ${msg}`) + "\n");
+            }
+            if (chunk.startsWith("::debug::"))
+                return true;
+            if (chunk.startsWith("::group::")) {
+                return stderrWrite("\n" + chunk.replace("::group::", "").trim() + "\n");
+            }
+            if (chunk.startsWith("::endgroup::"))
+                return true;
+            if (chunk.startsWith("::set-output"))
+                return true;
+            // All other @actions/core output (info, etc.) → stderr
+            return stderrWrite(chunk, typeof encodingOrCb === "function" ? undefined : encodingOrCb);
+        }
+        if (typeof encodingOrCb === "function") {
+            return pristineStdoutWrite(chunk, undefined, encodingOrCb);
+        }
+        return pristineStdoutWrite(chunk, encodingOrCb, cb);
+    };
+}
+//# sourceMappingURL=actions-stdout.js.map
 ;// CONCATENATED MODULE: ./out/concurrency.js
 
 /**
@@ -88465,7 +88655,7 @@ async function getTagDate(owner, repo, tag, token) {
  *
  * @param logger Optional callback for failure messages; defaults to `core.warning`.
  */
-async function concurrency_runBatched(tasks, batchSize, logger) {
+async function runBatched(tasks, batchSize, logger) {
     const log = logger ?? ((msg) => lib_core.warning(msg));
     // Guard against batchSize <= 0: i += 0 would infinite-loop; i += negative would underflow.
     const size = Number.isInteger(batchSize) && batchSize > 0 ? batchSize : 1;
@@ -88494,8 +88684,13 @@ const RESOLVE_CONCURRENCY = 8;
  * This module is intentionally a leaf (imports only `runBatched`) so it can be
  * imported from `src/main.ts` without pulling in the clack TUI or any updater
  * ecosystem module into the action bundle.
+ *
+ * @param logger Optional callback for per-dep resolve failures; defaults to `core.info`
+ * (the interactive updater's quieter default). The verify action passes `core.warning`
+ * so a failed registry lookup surfaces as a GitHub annotation instead of debug-only output.
  */
-async function dedupeAndResolve(deps, keyOf, resolveOne, concurrency) {
+async function resolve_dedupeAndResolve(deps, keyOf, resolveOne, concurrency, logger) {
+    const log = logger ?? ((msg) => lib_core.info(msg));
     const unique = new Map();
     for (const dep of deps) {
         const key = keyOf(dep);
@@ -88503,12 +88698,12 @@ async function dedupeAndResolve(deps, keyOf, resolveOne, concurrency) {
             unique.set(key, dep);
     }
     const result = new Map();
-    await concurrency_runBatched([...unique.entries()].map(([key, dep]) => async () => {
+    await runBatched([...unique.entries()].map(([key, dep]) => async () => {
         try {
             result.set(key, await resolveOne(dep));
         }
         catch (err) {
-            lib_core.info(`[lisan] resolve failed for ${key}: ${err instanceof Error ? err.message : String(err)}`);
+            log(`[lisan] resolve failed for ${key}: ${err instanceof Error ? err.message : String(err)}`);
             result.set(key, null);
         }
     }), concurrency);
@@ -92396,11 +92591,14 @@ function getInputs() {
         .filter(Boolean);
     const parsedMin = parseInt(core.getInput("min-age-days") || String(DEFAULT_MIN_AGE_DAYS), 10);
     const minAgeDaysRaw = isNaN(parsedMin) ? DEFAULT_MIN_AGE_DAYS : parsedMin;
+    // Fail closed rather than silently clamp: min-age-days is the core security control this
+    // action exists to enforce, so a negative value (typo, or an attacker-controlled workflow
+    // input) must not be quietly downgraded to "gate disabled" — the run should stop and force
+    // the value to be fixed explicitly (use 0 to disable the age gate on purpose).
     if (minAgeDaysRaw < 0) {
-        core.warning(`min-age-days (${minAgeDaysRaw}) is negative — clamping to 0. ` +
-            "Set to 0 explicitly to disable the age gate.");
+        throw new Error(`min-age-days (${minAgeDaysRaw}) is negative. Set it to 0 explicitly to disable the age gate.`);
     }
-    const minAgeDays = Math.max(0, minAgeDaysRaw);
+    const minAgeDays = minAgeDaysRaw;
     const parsedWarn = parseInt(core.getInput("warn-age-days") || "21", 10);
     const warnAgeDaysRaw = isNaN(parsedWarn) ? 21 : parsedWarn;
     if (warnAgeDaysRaw < 0) {
@@ -93033,7 +93231,10 @@ function isCompatibleWith(depLicense, targetLicense) {
     return false;
 }
 // Numeric restrictiveness levels used by isLicenseMoreRestrictiveThan.
-// Lower = more permissive. "unknown" is absent (handled by callers as fail-open).
+// Lower = more permissive. "unknown" is deliberately excluded from the key type (handled
+// by callers as fail-open) — every OTHER LicenseCategory member is required here by the
+// `Record<Exclude<...>, number>` type, so adding a new category to the union without also
+// giving it a level is a compile error, not a silent runtime drift.
 const RESTRICTIVENESS_LEVEL = {
     permissive: 0,
     "apache-2.0": 1,
@@ -93046,6 +93247,15 @@ const RESTRICTIVENESS_LEVEL = {
 /**
  * Compute the effective restrictiveness level of a potentially compound SPDX
  * expression.
+ *
+ * This is a deliberately separate evaluator from `licenseLevel`/`licenseLevelFromNode`
+ * below: that one walks a real `spdx-expression-parse` AST (handles parens, returns a
+ * 3-bucket permissive/copyleft/unknown classification) but has no notion of *ordering*
+ * between two arbitrary expressions, which `isLicenseMoreRestrictiveThan` needs. Rather
+ * than extend the AST walker with a numeric-level return type used by only one caller,
+ * this string-split evaluator gives `isLicenseMoreRestrictiveThan` its own minimal,
+ * narrowly-scoped (and explicitly fail-open on parens, see below) ordering logic.
+ *
  *   - `A OR B`  → most-permissive (minimum) level: the user can choose the least
  *                 restrictive alternative, so the combined requirement is the lowest.
  *   - `A AND B` → most-restrictive (maximum) level: both licenses must be honored,
@@ -93086,7 +93296,10 @@ function licenseLevelOrd(spdx) {
     const withIdx = spdx.indexOf(" WITH ");
     if (withIdx !== -1)
         return licenseLevelOrd(spdx.slice(0, withIdx).trim());
-    return RESTRICTIVENESS_LEVEL[categorize(spdx)];
+    const category = categorize(spdx);
+    if (category === "unknown")
+        return undefined;
+    return RESTRICTIVENESS_LEVEL[category];
 }
 /**
  * Returns true when `newLicense` is strictly MORE restrictive than `currentLicense`
@@ -93287,6 +93500,10 @@ function licenseLevelFromNode(node) {
  * Return a coarse license level for a compound SPDX expression.
  * Parses the full AST (handles parentheses, AND, OR) via spdx-expression-parse.
  * Returns "permissive", "copyleft", or "unknown".
+ *
+ * Unlike `licenseLevelOrd` above, this handles parenthesized sub-expressions correctly
+ * (it walks a real AST rather than splitting strings) — see `licenseLevelOrd`'s docstring
+ * for why the two evaluators aren't unified.
  */
 function licenseLevel(expr) {
     try {
@@ -93905,8 +94122,6 @@ async function fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, l
  * Check licenses for all analyzed dependencies and return results.
  */
 async function checkLicenses(results, targetLicenseMap, registries, javaRepoMap, githubToken, bcrUrl, overrides, licenseHeuristics = true, kubernetesImageRefs = new Map(), dockerImageRefs = new Map()) {
-    // Cache: "ecosystem:name@version" → raw license string | null
-    const licenseCache = new Map();
     // Identify deps that need fetching (not overridden, not cached)
     const depsToCheck = results.filter(({ dep }) => {
         const ecoTargets = getEcosystemTargetLicenses(targetLicenseMap, dep.ecosystem);
@@ -93917,28 +94132,13 @@ async function checkLicenses(results, targetLicenseMap, registries, javaRepoMap,
             return false;
         return true;
     });
-    // Deduplicate and fetch licenses in batches of 10
-    const toFetch = [];
-    const seen = new Set();
-    for (const { dep } of depsToCheck) {
-        const override = overrides?.get(dep.ecosystem)?.get(dep.name);
-        if (override)
-            continue;
-        const cacheKey = `${dep.ecosystem}:${dep.name}@${dep.version}`;
-        if (licenseCache.has(cacheKey) || seen.has(cacheKey))
-            continue;
-        seen.add(cacheKey);
-        toFetch.push({ dep, cacheKey });
-    }
+    // Dedupe-and-batch-fetch via the same leaf helper the updater uses (src/update/resolve.ts)
+    // so the "dedupe by cache key → runBatched → catch-per-task → null" pattern isn't
+    // hand-rolled twice. Pass core.warning so a failed license fetch is visible as a GitHub
+    // annotation rather than silently resolving to "no license declared".
+    const toFetch = depsToCheck.filter(({ dep }) => !overrides?.get(dep.ecosystem)?.get(dep.name));
     const LICENSE_FETCH_CONCURRENCY = 10;
-    await runBatched(toFetch.map(({ dep, cacheKey }) => async () => {
-        try {
-            licenseCache.set(cacheKey, await fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics, kubernetesImageRefs, dockerImageRefs));
-        }
-        catch {
-            licenseCache.set(cacheKey, null);
-        }
-    }), LICENSE_FETCH_CONCURRENCY);
+    const licenseCache = await dedupeAndResolve(toFetch, ({ dep }) => `${dep.ecosystem}:${dep.name}@${dep.version}`, ({ dep }) => fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics, kubernetesImageRefs, dockerImageRefs), LICENSE_FETCH_CONCURRENCY, core.warning);
     // Process results
     const licenseResults = [];
     for (const { dep } of depsToCheck) {
@@ -94294,6 +94494,17 @@ function filterByFlavor(versions, current) {
     return versions.filter((v) => versionFlavor(v.version) === flavor);
 }
 /**
+ * Normalize a version string for semver comparison: strict semver is used as-is,
+ * otherwise falls back to semver.coerce (e.g. "1.21", "v3" → "1.21.0", "3.0.0").
+ * Returns null when the string can't be coerced to semver at all.
+ *
+ * Single-sourced so classifyUpdateLevel and filterByMode can't drift on how they
+ * coerce non-strict tags (container/action version tags rarely use strict semver).
+ */
+function normalizeForCompare(v) {
+    return semver.valid(v) ?? semver.coerce(v)?.version ?? null;
+}
+/**
  * Classify the update level between two semver strings.
  * Returns "major", "minor", or "patch".
  * For prerelease variants, maps to the base type (e.g. "premajor" → "major").
@@ -94302,8 +94513,8 @@ function filterByFlavor(versions, current) {
 function classifyUpdateLevel(current, latest) {
     // Coerce non-strict tags (e.g. "1.21", "v3") so two-part container/action tags
     // classify by their real delta instead of defaulting to "major" (breaking).
-    const c = semver.valid(current) ?? semver.coerce(current)?.version;
-    const l = semver.valid(latest) ?? semver.coerce(latest)?.version;
+    const c = normalizeForCompare(current);
+    const l = normalizeForCompare(latest);
     if (!c || !l) {
         return "major";
     }
@@ -94327,30 +94538,39 @@ function classifyUpdateLevel(current, latest) {
 }
 /**
  * Filter a list of VersionInfo entries to only those allowed by the given mode.
- * - "patch": only patch-level changes (diff === "patch" or null)
+ * - "patch": only patch-level changes
  * - "minor": patch and minor changes
  * - "major": all versions
  * If current is not valid semver, all versions are returned.
+ *
+ * Delegates to {@link classifyUpdateLevel} (rather than inspecting raw
+ * `semver.diff` output directly) so magnitude classification is single-sourced
+ * and direction-aware: `semver.diff` itself is symmetric (it grades by which
+ * component differs, not by which argument is numerically larger), so a
+ * downgrade candidate is graded by the magnitude of the step DOWN the same
+ * way an equivalent-magnitude upgrade would be graded. This matters for
+ * `--allow-downgrade only`, where downgrade candidates flow through this same
+ * filter — without delegating here, a duplicated inline classification could
+ * drift from classifyUpdateLevel's mapping (e.g. its "same version → patch"
+ * and "unparseable → major" conventions) and misclassify downgrade magnitude.
  */
 function filterByMode(versions, current, mode) {
     if (mode === "major")
         return versions;
     // Coerce non-strict tags (e.g. "v3", "1.21") so --mode patch/minor applies to
     // container and action version tags that don't use strict semver.
-    const normalizedCurrent = semver.valid(current) ?? semver.coerce(current)?.version ?? null;
+    const normalizedCurrent = normalizeForCompare(current);
     if (!normalizedCurrent)
         return versions;
     return versions.filter((v) => {
-        const normalizedV = semver.valid(v.version) ?? semver.coerce(v.version)?.version ?? null;
+        const normalizedV = normalizeForCompare(v.version);
         if (!normalizedV)
             return false;
-        const diff = semver.diff(normalizedCurrent, normalizedV);
-        if (mode === "patch") {
-            return diff === "patch" || diff === "prepatch" || diff === "prerelease" || diff === null;
-        }
+        const level = classifyUpdateLevel(normalizedCurrent, normalizedV);
+        if (mode === "patch")
+            return level === "patch";
         // mode === "minor"
-        return diff === "patch" || diff === "prepatch" || diff === "prerelease"
-            || diff === "minor" || diff === "preminor" || diff === null;
+        return level === "patch" || level === "minor";
     });
 }
 /**
@@ -94514,7 +94734,19 @@ function decideLicense(args) {
 async function resolveEager(fetcher, dep, opts) {
     const { mode, minAgeDays, registries } = opts;
     const raw = await fetcher(dep.name, dep.ecosystem, registries);
-    const withAge = raw.map((v) => ({
+    // De-duplicate by version string before computing ages/sorting — a hostile or
+    // misbehaving mirror returning the same version twice (possibly with different
+    // publish dates attached) could otherwise perturb downstream ordering/selection.
+    // Keep the first occurrence, mirroring the dedup mavenMetadataVersions already
+    // applies when unioning version lists across repos.
+    const seenVersions = new Set();
+    const deduped = raw.filter((v) => {
+        if (seenVersions.has(v.version))
+            return false;
+        seenVersions.add(v.version);
+        return true;
+    });
+    const withAge = deduped.map((v) => ({
         version: v.version,
         publishDate: v.publishDate,
         ageDays: computeAgeDays(v.publishDate),
@@ -94604,23 +94836,6 @@ async function resolveLazy(fetcher, dateResolver, dep, opts, repos) {
     }
     return { versions: gated, currentAgeDays };
 }
-/**
- * Main dispatcher: resolve available update versions for a dependency.
- * Returns viable update candidates (age-gated and mode-filtered), newest first,
- * along with the age in days of the currently-installed version (or null if unknown).
- *
- * For digest-less mutable OCI image refs (docker/kubernetes with no @sha256:
- * in dep.current), returns `pinInPlace: true` with `versions[0].version` set to
- * the current tag. The updater will pin the tag to its current digest instead of
- * bumping to a different tag.
- *
- * Pin-in-place requires the tag's age to meet the minAgeDays gate (fail-closed):
- * when the registry is unreachable or the publish date cannot be confirmed,
- * `currentAgeDays` is null and the candidate is skipped rather than promoted
- * (buildCandidates enforces this gate). The resolved digest is returned so
- * resolvePins can reuse it without a second round-trip (eliminating TOCTOU).
- */
-// ECOSYSTEM_SYNC: keep in sync with ECOSYSTEM_DISPATCH in src/update/run.ts and lookupPublishDate switch in src/main.ts
 async function resolveLatest(dep, opts) {
     const { token, registries } = opts;
     switch (dep.ecosystem) {
@@ -94709,594 +94924,6 @@ async function resolveLatest(dep, opts) {
 // When adding a new ecosystem: (1) add the case to the switch, (2) extend the union here.
 null;
 //# sourceMappingURL=latest.js.map
-;// CONCATENATED MODULE: ./out/update/apply.js
-
-
-
-/**
- * Triage a heterogeneous list of rewrites into offset-based and string-based
- * buckets. Warns and skips any malformed Rewrite (one carrying both or neither
- * discriminating key) so it is never silently applied.
- */
-function partitionRewrites(rewrites, file) {
-    const offsetRewrites = [];
-    const stringRewrites = [];
-    for (const r of rewrites) {
-        const hasOffset = "offset" in r;
-        const hasSearch = "search" in r;
-        if (hasOffset && hasSearch) {
-            lib_core.warning(`[lisan] apply: (${file}) malformed Rewrite has both "offset" and "search" keys — skipping`);
-        }
-        else if (hasOffset) {
-            offsetRewrites.push(r);
-        }
-        else if (hasSearch) {
-            stringRewrites.push(r);
-        }
-        else {
-            lib_core.warning(`[lisan] apply: (${file}) malformed Rewrite has neither "offset" nor "search" key — skipping`);
-        }
-    }
-    return { offsetRewrites, stringRewrites };
-}
-/**
- * Read a file and apply all rewrites, returning the new file content string and
- * the set of search strings that were actually applied (not skipped).
- * Does NOT write to disk — use this for the validation phase of a two-phase write.
- *
- * Offset-based rewrites are applied in reverse order (highest offset first)
- * so earlier UTF-16 code-unit positions are not shifted by later edits.
- *
- * String-based rewrites use split/join to replace all occurrences across the file.
- * Only unambiguous (exactly one occurrence) rewrites are applied; ambiguous ones are
- * skipped with a warning and will NOT appear in `appliedSearches`.
- *
- * Throws if any rewrite has invalid offsets, overlaps, or stale expected bytes.
- */
-async function buildFileContent(edit) {
-    // Read as a Buffer so a leading UTF-8 BOM (EF BB BF → \uFEFF) is not silently stripped.
-    // fs.readFile(path, "utf8") drops the BOM on decode; Buffer.toString("utf8") preserves it.
-    const rawBuf = await promises_namespaceObject.readFile(edit.file);
-    let content = rawBuf.toString("utf8");
-    // Strip the BOM character for offset processing: parser offsets are relative to BOM-free content.
-    const hasBom = content.startsWith("\uFEFF");
-    if (hasBom)
-        content = content.slice(1);
-    const { offsetRewrites, stringRewrites } = partitionRewrites(edit.rewrites, edit.file);
-    // Validate and apply offset-based rewrites in reverse order to preserve earlier positions.
-    const sorted = [...offsetRewrites].sort((a, b) => b.offset - a.offset || a.length - b.length);
-    // Guard against adversarial/garbage parsers emitting overlapping or out-of-bounds offsets.
-    // NaN and non-integer values must be rejected explicitly: `NaN < 0` is false, so without
-    // this check a fuzzed `offset: NaN` silently passes bounds and overlap validation.
-    for (let i = 0; i < sorted.length; i++) {
-        const rw = sorted[i];
-        if (!Number.isInteger(rw.offset) || !Number.isInteger(rw.length)) {
-            throw new Error(`[lisan] apply: offset rewrite has non-integer offset/length in ${edit.file}: ` +
-                `offset=${rw.offset} length=${rw.length}`);
-        }
-        if (rw.offset < 0 || rw.length < 0 || rw.offset + rw.length > content.length) {
-            throw new Error(`[lisan] apply: offset rewrite out of bounds in ${edit.file}: ` +
-                `offset=${rw.offset} length=${rw.length} fileLen=${content.length}`);
-        }
-        if (i > 0) {
-            const prev = sorted[i - 1];
-            // sorted descending, so prev.offset >= rw.offset; check that rw's end doesn't reach into prev's range.
-            // Zero-length rewrites (length===0) are insertions at a point — they occupy no range
-            // and cannot overlap anything. Skip the overlap check when either side has length===0:
-            // a zero-length prev at the same offset as rw is not an overlap; a zero-length rw
-            // at any position cannot extend into prev's range regardless of offset arithmetic.
-            if (rw.length > 0 && prev.length > 0 && rw.offset + rw.length > prev.offset) {
-                throw new Error(`[lisan] apply: overlapping offset rewrites in ${edit.file}: ` +
-                    `[${rw.offset},${rw.offset + rw.length}) overlaps [${prev.offset},${prev.offset + prev.length})`);
-            }
-        }
-    }
-    // Fail-closed stale-offset guard: verify the expected slice is still present
-    // before any write. A mismatch means the file changed between discover and apply.
-    for (const rewrite of sorted) {
-        const actual = content.slice(rewrite.offset, rewrite.offset + rewrite.length);
-        if (actual !== rewrite.expected) {
-            throw new Error(`[lisan] apply: stale offset in ${edit.file} — ` +
-                `expected ${JSON.stringify(rewrite.expected.slice(0, 120))} ` +
-                `but found ${JSON.stringify(actual.slice(0, 120))}`);
-        }
-    }
-    for (const rewrite of sorted) {
-        content =
-            content.slice(0, rewrite.offset) +
-                rewrite.replace +
-                content.slice(rewrite.offset + rewrite.length);
-    }
-    // Apply string-based rewrites using split/join (replaceAll semantics).
-    const appliedSearches = new Set();
-    for (const rewrite of stringRewrites) {
-        if (rewrite.search === rewrite.replace)
-            continue;
-        if (!content.includes(rewrite.search)) {
-            lib_core.warning(`[lisan] apply: search string not found in ${edit.file}: ${rewrite.search.slice(0, 60)}`);
-            continue;
-        }
-        // Reject ambiguous rewrites: multiple occurrences mean we can't safely target
-        // just the right one (e.g. "org.foo:bar:1.0" as a substring of "…:1.0.1").
-        const occurrences = content.split(rewrite.search).length - 1;
-        if (occurrences > 1) {
-            lib_core.warning(`[lisan] apply: skipping ambiguous string rewrite — ${occurrences} occurrences of ` +
-                `${JSON.stringify(rewrite.search.slice(0, 60))} in ${edit.file}; ` +
-                `manual update required to avoid corrupting the wrong occurrence`);
-            continue;
-        }
-        content = content.split(rewrite.search).join(rewrite.replace);
-        appliedSearches.add(rewrite.search);
-    }
-    // Re-prepend the BOM so the written file preserves the original byte-order mark.
-    if (hasBom)
-        content = "\uFEFF" + content;
-    return { content, appliedSearches };
-}
-/**
- * Apply a FileEdit to disk: computes the new content then writes atomically.
- *
- * For writing multiple files atomically as a set, use the two-phase pattern:
- * call `buildFileContent` for each file first (validates all), then write all
- * with `writeFileContent` only if every validation succeeds.
- */
-async function applyFileEdit(edit) {
-    const { content } = await buildFileContent(edit);
-    await writeFileContent(edit.file, content);
-}
-/**
- * Stage `content` to a uniquely-named temp file in the same directory as `file`.
- * Returns the temp file path. The caller must either `commitTemp` or clean up
- * the temp file (via `fs.unlink`) — both are handled by `writeFileContent`.
- *
- * The temp name includes process PID, a timestamp, and a random token to guard
- * against same-file concurrent calls and PID-recycle stale-temp collisions.
- */
-async function stageTemp(file, content) {
-    const absFile = external_node_path_namespaceObject.resolve(file);
-    const dir = external_node_path_namespaceObject.dirname(absFile);
-    const rnd = crypto.randomUUID().replace(/-/g, "");
-    const tmp = external_node_path_namespaceObject.join(dir, `.lisan-tmp-${process.pid}-${Date.now()}-${rnd}-${external_node_path_namespaceObject.basename(absFile)}`);
-    try {
-        await promises_namespaceObject.writeFile(tmp, content, "utf8");
-        return tmp;
-    }
-    catch (err) {
-        await promises_namespaceObject.unlink(tmp).catch(() => undefined);
-        throw err;
-    }
-}
-/**
- * Commit a previously staged temp file to its final location via an atomic rename.
- * Cleans up the temp file on failure.
- */
-async function commitTemp(tmp, file) {
-    try {
-        await promises_namespaceObject.rename(tmp, file);
-    }
-    catch (err) {
-        await promises_namespaceObject.unlink(tmp).catch(() => undefined);
-        throw err;
-    }
-}
-/**
- * Write content to a file atomically using a rename-from-temp approach.
- * If the process crashes mid-write the original file is left intact.
- * The temp file is created in the same directory to ensure rename stays
- * on the same filesystem (cross-device rename would require a copy).
- */
-async function writeFileContent(file, content) {
-    const tmp = await stageTemp(file, content);
-    await commitTemp(tmp, file);
-}
-//# sourceMappingURL=apply.js.map
-;// CONCATENATED MODULE: ./out/update/ecosystems/bazel-shared.js
-
-
-
-
-/**
- * Given a new full version from the registry (e.g. "4.33.0") and a versionRef
- * that was derived from an interpolation template (e.g. `"4.%s" % CONST` where
- * templatePrefix = "4."), compute the new constant value to write ("33.0").
- *
- * For direct literals and bare-constant references (templatePrefix/Suffix = ""),
- * this is a no-op and candidate.latest is returned unchanged.
- *
- * Returns null if the candidate.latest is incompatible with the template
- * (e.g. doesn't start with templatePrefix), in which case the rewrite is skipped.
- */
-function computeNewConstantValue(latest, versionRef) {
-    const { templatePrefix, templateSuffix } = versionRef;
-    let value = latest;
-    if (templatePrefix) {
-        if (!value.startsWith(templatePrefix))
-            return null;
-        value = value.slice(templatePrefix.length);
-    }
-    if (templateSuffix) {
-        if (!value.endsWith(templateSuffix))
-            return null;
-        value = value.slice(0, value.length - templateSuffix.length);
-    }
-    // Round-trip guard: re-applying the template to the stripped value must
-    // reproduce `latest` exactly. If not (e.g. overlapping prefix/suffix), the
-    // stripped value is unsafe to write — skip with the caller's warning path.
-    if (templatePrefix + value + templateSuffix !== latest)
-        return null;
-    if (!value.trim())
-        return null; // degenerate template: stripped value is empty
-    return value;
-}
-/**
- * Returns true when every version string in the array is coercible to semver.
- * Used by both reconcileConstantGroups (candidate selection) and
- * resolveConflictingReplaces (rewrite reconciliation) so the "drop on
- * non-comparable version" precondition is a single shared predicate.
- */
-function allVersionsComparable(versions) {
-    return versions.every((v) => semver.coerce(v) !== null);
-}
-/**
- * Given an array of items and a function to extract a version string from each,
- * returns the item whose version is the semver minimum (the highest version that
- * exists for all referencing deps — acceptability per dep is validated separately
- * via existence checks). Uses semver.coerce so 2-segment versions ("4.13",
- * "2.21") compare correctly alongside full semver.
- *
- * Returns null when the array is empty or all versions fail to coerce.
- */
-function pickSemverMin(items, versionOf) {
-    if (items.length === 0)
-        return null;
-    let minItem = items[0];
-    // Prefer semver.valid() (strict) so that prerelease ordering is preserved:
-    //   1.2.3-rc1 < 1.2.3 (strict), but semver.coerce() flattens both to 1.2.3.
-    // Fall back to semver.coerce() only for 2-segment Maven/BCR versions like "4.13"
-    // that strict semver rejects but coerce can handle.
-    const resolveVersion = (v) => semver.valid(v) ?? semver.coerce(v)?.version ?? null;
-    let minResolved = resolveVersion(versionOf(minItem));
-    for (let i = 1; i < items.length; i++) {
-        const v = versionOf(items[i]);
-        const sv = resolveVersion(v);
-        if (!sv)
-            continue; // non-semver: skip; keep current min
-        if (!minResolved || semver.lt(sv, minResolved)) {
-            minItem = items[i];
-            minResolved = sv;
-        }
-    }
-    return minResolved ? minItem : null;
-}
-/**
- * Build a single raw offset-based rewrite for a Starlark constant literal,
- * shared by rust/bazel (via buildBazelVersionEdits) and java (versionRef branch).
- *
- * Returns null with a warning when:
- *   - The template prefix/suffix is incompatible with versionPrefix (would produce
- *     corrupt output like `=4.=33.0`).
- *   - candidate.latest is incompatible with the template (computeNewConstantValue → null).
- *   - The old literal bytes cannot be computed for the stale-offset expected check.
- *
- * Callers should skip the candidate when null is returned.
- */
-function buildConstantRewrite(candidate, versionRef, versionPrefix, file, content) {
-    // Read-only refs (e.g. CONST.rpartition(".")[0]) must never be rewritten — the constant
-    // is driven by a non-lossy sibling reference.  Discover guards in the per-ecosystem
-    // modules skip these, but this defense-in-depth check ensures no rewrite escapes if a
-    // caller is added that doesn't apply the guard.
-    if (versionRef.readOnly) {
-        lib_core.warning(`[lisan] apply: (${file}) skipping ${candidate.dep.name} — versionRef is read-only ` +
-            `(lossy transform; constant is driven by a sibling reference)`);
-        return null;
-    }
-    // Combining a Cargo specifier prefix (e.g. "=") with a non-trivial template
-    // (templatePrefix/Suffix) would produce garbage like "=4.=33.0".
-    if (versionPrefix && (versionRef.templatePrefix || versionRef.templateSuffix)) {
-        lib_core.warning(`[lisan] apply: (${file}) skipping ${candidate.dep.name} — cannot combine ` +
-            `Cargo specifier prefix "${versionPrefix}" with interpolation template ` +
-            `"${versionRef.templatePrefix}%s${versionRef.templateSuffix}"`);
-        return null;
-    }
-    const newConstValue = computeNewConstantValue(candidate.latest, versionRef);
-    if (newConstValue === null) {
-        lib_core.warning(`[lisan] apply: (${file}) skipping ${candidate.dep.name} — latest version ` +
-            `${candidate.latest} is incompatible with template prefix ` +
-            `"${versionRef.templatePrefix}" / suffix "${versionRef.templateSuffix}"`);
-        return null;
-    }
-    // Guard against a fuzzed/stale versionRef where nodeEnd < nodeStart — that produces a
-    // negative `length` in the OffsetRewrite. apply.ts would catch the negative length and
-    // throw, but that throw aborts ALL co-located edits in the same file rather than just
-    // this candidate. Return null here so only the malformed candidate is skipped and valid
-    // siblings in the same MODULE.bazel proceed normally.
-    if (versionRef.nodeEnd < versionRef.nodeStart) {
-        lib_core.warning(`[lisan] apply: (${file}) skipping ${candidate.dep.name} — degenerate versionRef offsets ` +
-            `(nodeEnd=${versionRef.nodeEnd} < nodeStart=${versionRef.nodeStart})`);
-        return null;
-    }
-    const q = versionRef.quote ?? '"';
-    // The offset arithmetic (`nodeStart-1`, `nodeEnd+1`) assumes exactly one quote char
-    // on each side of the literal.  Triple-quoted strings (""" or ''') have 3-char delimiters
-    // and would produce an offset that lands inside the opening """ — corrupting the file.
-    // The Starlark parser does not emit VersionRef for triple-quoted strings (resolveVersionExpr
-    // returns null for them), so in practice q.length > 1 only if a fuzzed/malformed versionRef
-    // reaches here.  Return null rather than silently produce a bad offset.
-    if (q.length !== 1) {
-        lib_core.warning(`[lisan] apply: (${file}) skipping ${candidate.dep.name} — unsupported quote style ` +
-            `(${JSON.stringify(q)}); offset arithmetic requires exactly one quote char on each side`);
-        return null;
-    }
-    // Compute the expected bytes for the stale-offset guard.
-    // When `content` is provided (preferred path — like docker/k8s), slice the exact
-    // bytes from the file content at discovery-time offsets. This avoids the lossy
-    // round-trip of reconstructing expected from versionRef.value via computeNewConstantValue,
-    // which can trigger the stale-offset guard spuriously when the file content bytes
-    // differ from the reconstructed string in any way.
-    // When `content` is absent (e.g. callers that do not have content available), fall
-    // back to the old reconstruction logic for backward compatibility.
-    let expected;
-    if (content !== undefined) {
-        // nodeStart is the first char INSIDE the quotes; nodeStart-1 is the opening quote.
-        // nodeEnd is the exclusive end INSIDE the quotes; nodeEnd+1 is after the closing quote.
-        expected = content.slice(versionRef.nodeStart - 1, versionRef.nodeEnd + 1);
-    }
-    else {
-        const oldLiteral = computeNewConstantValue(versionRef.value, versionRef);
-        if (oldLiteral === null) {
-            lib_core.warning(`[lisan] apply: (${file}) skipping ${candidate.dep.name} — ` +
-                `cannot compute oldLiteral for stale-offset expected bytes: ` +
-                `versionRef.value=${JSON.stringify(versionRef.value)} is incompatible with template ` +
-                `"${versionRef.templatePrefix}%s${versionRef.templateSuffix}"`);
-            return null;
-        }
-        expected = `${q}${oldLiteral}${q}`;
-    }
-    return {
-        offset: versionRef.nodeStart - 1,
-        length: versionRef.nodeEnd - versionRef.nodeStart + 2,
-        replace: `${q}${versionPrefix ?? ""}${newConstValue}${q}`,
-        expected,
-    };
-}
-// extractSpecifier/stripInnerSpecifier: extract the Cargo specifier prefix from a quoted
-// replace string like '"=1.2.3"'. Only used for conflict resolution between multiple
-// deps sharing a constant — the specifier is part of the replace string by design
-// (buildConstantRewrite includes the versionPrefix in the replace: field).
-// This regex is intentionally Cargo-specific and lives here because resolveConflictingReplaces
-// is only called for offset-based rewrites produced by Starlark/Rust/Java Bazel paths.
-// Regex: consume any sequence of =^~<> and surrounding whitespace.
-const SPECIFIER_RE_INNER = /^([=^~<>\s]+)/;
-const extractSpecifier = (r) => (SPECIFIER_RE_INNER.exec(r.slice(1, -1))?.[1] ?? "").trim();
-const stripInnerSpecifier = (r) => r.slice(1, -1).replace(/^[=^~<>\s]+/, "");
-/**
- * Resolve a set of conflicting replace-strings that all target the same constant literal
- * (same offset/length). Picks the semver-minimum replacement that is safe for all
- * referencing deps, handling Cargo-style specifier prefixes. Returns null to drop the
- * group entirely when the conflict cannot be safely resolved.
- */
-function resolveConflictingReplaces(candidates, offset, file) {
-    // Multiple deps share this constant but want different versions. Pick the semver
-    // minimum — the highest version that is safe for all referencing deps (each dep's
-    // resolveLatest already accepted this version as age-compliant).
-    const distinctSpecifiers = new Set(candidates.map(extractSpecifier));
-    // If any dep uses an exact-pin specifier (=) alongside range specifiers, we
-    // cannot safely pick one version for all consumers — an exact pin forces a
-    // specific version that may be outside another dep's accepted range entirely
-    // (e.g. =1.2.0 and ^2.0.0 share a constant; writing "=1.2.0" breaks ^2.x).
-    if (distinctSpecifiers.size > 1 && [...distinctSpecifiers].some((s) => s === "=")) {
-        lib_core.warning(`[lisan] bazel-shared: (${file}) skipping shared constant at offset ${offset} — ` +
-            `conflicting exact-pin (=) and range specifiers cannot be safely reconciled: ` +
-            `${candidates.map((r) => JSON.stringify(r)).join(", ")}`);
-        return null;
-    }
-    // Also drop when ALL specifiers are exact-pin (=) but the inner versions differ —
-    // writing the minimum "=X.Y.Z" to a dep that requires "=A.B.C" (different exact pin)
-    // would break it, because "=" means exactly that version, not "at least".
-    if ([...distinctSpecifiers].every((s) => s === "=")) {
-        const innerVersions = new Set(candidates.map(stripInnerSpecifier));
-        if (innerVersions.size > 1) {
-            lib_core.warning(`[lisan] bazel-shared: (${file}) skipping shared constant at offset ${offset} — ` +
-                `all-exact-pin specifiers require different versions (${candidates.map((r) => JSON.stringify(r)).join(", ")}); cannot reconcile`);
-            return null;
-        }
-    }
-    // Use pickSemverMin so 2-segment Maven/BCR versions like "4.13" or "2.21" compare
-    // correctly (semver.valid rejects them, causing the whole group to be dropped).
-    if (!allVersionsComparable(candidates.map(stripInnerSpecifier))) {
-        lib_core.warning(`[lisan] apply: (${file}) skipping conflicting rewrites at offset ${offset} ` +
-            `(shared constant referenced by deps resolving to different versions: ` +
-            `${candidates.map((r) => JSON.stringify(r)).join(", ")})`);
-        return null;
-    }
-    // pickSemverMin tracks the winning candidate by index (via identity), avoiding
-    // indexOf mis-matches when two candidates share the same inner version string.
-    const minReplace = pickSemverMin(candidates, stripInnerSpecifier);
-    if (!minReplace) {
-        lib_core.warning(`[lisan] apply: (${file}) skipping conflicting rewrites at offset ${offset} — no comparable version found`);
-        return null;
-    }
-    lib_core.warning(`[lisan] apply: (${file}) shared constant at offset ${offset} proposed by multiple deps ` +
-        `(${candidates.map((r) => JSON.stringify(r)).join(", ")}); ` +
-        `using minimum ${JSON.stringify(minReplace)} to satisfy all`);
-    // Warn when candidates carry more than one distinct Cargo specifier so the
-    // user can verify the written specifier is correct for all referencing deps.
-    if (distinctSpecifiers.size > 1) {
-        const chosenSpecifier = extractSpecifier(minReplace);
-        const chosenInner = stripInnerSpecifier(minReplace);
-        lib_core.warning(`[lisan] bazel-shared: shared constant at offset ${offset} has mixed Cargo specifiers ` +
-            `(${[...distinctSpecifiers].map((s) => JSON.stringify(s || "(none)")).join(", ")}); ` +
-            `writing specifier "${chosenSpecifier || "(none)"}" version "${chosenInner}" — ` +
-            `verify Cargo resolution is still correct for all referencing deps`);
-    }
-    return minReplace;
-}
-/**
- * Deduplicate offset-based rewrites targeting the same range (i.e. rewrites
- * to a shared constant value literal that multiple deps reference). Rules:
- *   - If all rewrites agree on the replacement text → emit one.
- *   - If they disagree and all proposed values are valid semver → pick the semver
- *     minimum (the highest version safe for all referencing deps) and warn.
- *   - If they disagree and the values are not all valid semver → drop all with a warning
- *     (non-semver constant values like partial template fragments can't be safely compared).
- *
- * Non-constant (unique-position) rewrites are passed through unchanged.
- */
-/**
- * Reconcile a set of rewrites, deduplicating offset-based rewrites that target the
- * same constant literal node and resolving conflicts via semver-minimum selection.
- *
- * @param templateKeys — optional map from OffsetRewrite object → `"prefix:suffix"` template
- *   key (as produced by `buildBazelVersionEdits`/`buildJavaEdits`). When provided, any
- *   offset group whose entries carry different template keys is dropped with a warning
- *   instead of trying to reconcile replace-strings that are in incompatible "value spaces"
- *   (e.g. bare full version vs. inner value stripped of its template prefix).
- *
- *   When `templateKeys` is NOT provided (e.g. called from the cross-ecosystem merge in
- *   run.ts), the function is fail-closed: any offset group with more than one distinct
- *   `replace` value is dropped with a warning rather than attempting a semver-minimum pick
- *   across potentially incompatible template value-spaces. Only groups where all rewrites
- *   agree on an identical `replace` string (exact-pin case) are allowed through.
- */
-function reconcileConstantRewrites(rewrites, file, templateKeys) {
-    // Separate offset-based from string-based; only offset-based can conflict.
-    // Shared triage warns and skips malformed rewrites rather than dropping silently.
-    const { offsetRewrites, stringRewrites } = partitionRewrites(rewrites, file);
-    // Group by (offset, length) — each unique range should produce one replacement.
-    // In practice all rewrites to a shared constant reference the identical literal node,
-    // so ranges are always exactly equal (never merely overlapping).
-    const groups = new Map();
-    for (const rw of offsetRewrites) {
-        const key = `${rw.offset}:${rw.length}`;
-        const tk = templateKeys?.get(rw);
-        const existing = groups.get(key);
-        if (existing) {
-            // Invariant: all rewrites in the same offset group must agree on `expected` —
-            // they all reference the same literal bytes in the file. If they disagree, the
-            // stale-offset guard in apply.ts would fire against the wrong bytes, letting a
-            // corrupt write through. Warn and skip the conflicting rewrite rather than
-            // silently discarding one `expected` in favour of another.
-            if (rw.expected !== existing.expected) {
-                lib_core.warning(`[lisan] apply: (${file}) skipping offset-rewrite at ${rw.offset}:${rw.length} — ` +
-                    `conflicting "expected" bytes (${JSON.stringify(rw.expected.slice(0, 60))} vs ` +
-                    `${JSON.stringify(existing.expected.slice(0, 60))}); cannot safely determine which is current`);
-                continue;
-            }
-            // Detect mixed-template groups: if this entry's template key differs from the
-            // first entry's, the replace-strings are in incompatible value spaces. Mark the
-            // group for dropping rather than trying to pickSemverMin across incompatible spaces.
-            if (templateKeys && tk !== existing.templateKey) {
-                existing.templateMixed = true;
-            }
-            existing.replaces.add(rw.replace);
-        }
-        else {
-            const group = {
-                offset: rw.offset, length: rw.length, expected: rw.expected,
-                replaces: new Set(),
-                templateKey: tk,
-                templateMixed: false,
-            };
-            group.replaces.add(rw.replace);
-            groups.set(key, group);
-        }
-    }
-    const reconciledOffsets = [];
-    for (const { offset, length, expected, replaces, templateMixed } of groups.values()) {
-        if (templateMixed) {
-            // The same constant literal is referenced both as a bare version and via a template
-            // — the replace-strings are in incompatible value spaces. Attempting to pick a
-            // minimum would corrupt one consumer. Drop the group; reconcileConstantGroups in
-            // run.ts already prevents this in the normal flow, so this guards future callers.
-            lib_core.warning(`[lisan] apply: (${file}) skipping constant at ${offset}:${length} — ` +
-                `conflicting template/bare references that cannot be safely reconciled`);
-            continue;
-        }
-        if (replaces.size === 1) {
-            reconciledOffsets.push({ offset, length, expected, replace: [...replaces][0] });
-        }
-        else if (!templateKeys) {
-            // templateKeys unavailable — called from the cross-ecosystem merge in run.ts.
-            // We cannot distinguish template-mixing from a legitimate semver conflict without
-            // knowing the template key for each rewrite. Fail-closed: drop any conflicting
-            // group to avoid template-space corruption rather than attempting a semver-minimum
-            // pick across potentially incompatible value-spaces.
-            lib_core.warning(`[lisan] apply: (${file}) templateKeys unavailable — dropping conflicting constant ` +
-                `group at ${offset}:${length} to avoid template-space corruption ` +
-                `(${[...replaces].map((r) => JSON.stringify(r)).join(", ")})`);
-        }
-        else {
-            const replace = resolveConflictingReplaces([...replaces], offset, file);
-            if (replace !== null)
-                reconciledOffsets.push({ offset, length, expected, replace });
-        }
-    }
-    const allRewrites = [...reconciledOffsets, ...stringRewrites];
-    return { rewrites: allRewrites };
-}
-/**
- * Return the composite `"offset:length"` key for the OffsetRewrite that
- * `buildBazelVersionEdits` / `buildConstantRewrite` will emit for this candidate,
- * or undefined when the position has no versionRef (string-rewrite or missing data).
- *
- * Used by the attribution pass in `run.ts` so that the key computation lives in
- * exactly one place — next to the formula in `buildConstantRewrite` — rather than
- * being duplicated in `expectedOffsetKeyOf`. Matches `${rw.offset}:${rw.length}`
- * produced by `buildConstantRewrite`: offset = nodeStart-1, length = nodeEnd-nodeStart+2.
- */
-function rewriteKeyOf(candidate) {
-    const pos = candidate.dep.position;
-    const vr = pos?.versionRef;
-    if (!vr || typeof vr.nodeStart !== "number" || typeof vr.nodeEnd !== "number")
-        return undefined;
-    if (vr.nodeEnd < vr.nodeStart)
-        return undefined;
-    return `${vr.nodeStart - 1}:${vr.nodeEnd - vr.nodeStart + 2}`;
-}
-async function buildBazelVersionEdits(candidates) {
-    // Group by file
-    const byFile = new Map();
-    for (const candidate of candidates) {
-        const pos = candidate.dep.position;
-        const arr = byFile.get(pos.file) ?? [];
-        arr.push(candidate);
-        byFile.set(pos.file, arr);
-    }
-    const edits = [];
-    for (const [file, fileCandidates] of byFile) {
-        // Read file content once per file so buildConstantRewrite can slice the exact expected
-        // bytes from the original file rather than reconstructing them from versionRef fields.
-        // This eliminates the drift surface where reconstructed expected differs from file bytes
-        // (e.g. template suffix mismatch), which would cause a spurious stale-offset throw.
-        // Strip BOM (if present) so sliced offsets align with the parser's BOM-free view.
-        let content;
-        try {
-            const raw = await promises_namespaceObject.readFile(file);
-            const str = raw.toString("utf8");
-            content = str.startsWith("\uFEFF") ? str.slice(1) : str;
-        }
-        catch {
-            // File unreadable at apply time — fall back to offset reconstruction.
-            lib_core.warning(`[lisan] bazel: could not read ${file} for expected-byte slicing; falling back to reconstruction`);
-        }
-        const rawRewrites = [];
-        const templateKeys = new Map();
-        for (const candidate of fileCandidates) {
-            const pos = candidate.dep.position;
-            const { versionRef, versionPrefix } = pos;
-            const raw = buildConstantRewrite(candidate, versionRef, versionPrefix, file, content);
-            if (raw === null)
-                continue;
-            rawRewrites.push(raw);
-            templateKeys.set(raw, `${versionRef.templatePrefix}:${versionRef.templateSuffix}`);
-        }
-        const { rewrites } = reconcileConstantRewrites(rawRewrites, file, templateKeys);
-        if (rewrites.length > 0)
-            edits.push({ file, rewrites });
-    }
-    return edits;
-}
-//# sourceMappingURL=bazel-shared.js.map
 ;// CONCATENATED MODULE: ./out/update/cache-key.js
 /**
  * Stable cache-key for a (ecosystem, name, current) tuple.
@@ -95314,6 +94941,26 @@ function resolveCacheKey(ecosystem, name, current) {
     return `${ecosystem}|||${name}|||${current}`;
 }
 //# sourceMappingURL=cache-key.js.map
+;// CONCATENATED MODULE: ./out/update/age-gate.js
+/**
+ * Returns true when an originally-unpinned OCI image should bypass the age gate.
+ * Pinning a mutable tag to its current digest introduces no new content — it
+ * freezes what the user is already running — so the age gate's purpose does not
+ * apply. Already-pinned images (wasUnpinned=false) stay fail-closed regardless.
+ */
+function shouldBypassAgeGate(wasUnpinned, pinUnpinned) {
+    return pinUnpinned && wasUnpinned;
+}
+/**
+ * Format the age-gate failure clause shown in skip/warning messages.
+ * Returns e.g. "14d old (< 28d min-age)" or "publish date unconfirmable".
+ */
+function formatAgeClause(ageDays, minAgeDays) {
+    return ageDays !== null
+        ? `${ageDays}d old (< ${minAgeDays}d min-age)`
+        : "publish date unconfirmable";
+}
+//# sourceMappingURL=age-gate.js.map
 // EXTERNAL MODULE: external "node:url"
 var external_node_url_ = __nccwpck_require__(3136);
 // EXTERNAL MODULE: ./node_modules/.pnpm/web-tree-sitter@0.24.7/node_modules/web-tree-sitter/tree-sitter.js
@@ -95405,6 +95052,12 @@ function extractString(node) {
     const text = node.text;
     if (text.length < 2)
         return null;
+    // Triple-quoted strings (""" or ''') have 3-char delimiters; the single-quote-stripping
+    // logic below would slice into the literal content rather than past the delimiter,
+    // yielding a value with stray interior quote characters rather than null. Reject
+    // outright here so every caller gets this guard for free.
+    if (text.startsWith('"""') || text.startsWith("'''"))
+        return null;
     const open = text[0];
     const close = text[text.length - 1];
     if ((open !== '"' && open !== "'") || open !== close)
@@ -95459,13 +95112,11 @@ function extractStringConstants(rootNode) {
             continue;
         if (!rightNode || rightNode.type !== "string")
             continue;
-        // Skip triple-quoted strings — extractString only strips one quote, yielding
-        // stray interior quotes rather than null. Prefix-byte strings (r"…", b"…") are
-        // caught downstream by extractString's text[0] check.
-        if (rightNode.text.startsWith('"""') || rightNode.text.startsWith("'''"))
-            continue;
+        // Triple-quoted and prefix-byte (r"…", b"…") strings are rejected inside extractString.
         const val = extractString(rightNode);
-        if (val === null)
+        // Reject an empty constant outright: e.g. `VER = ""` used as `bazel_dep(version=VER)`
+        // would otherwise emit a writable DepRef with current:"" — not fail-closed.
+        if (val === null || val === "")
             continue;
         const name = leftNode.text;
         if (reassigned.has(name))
@@ -95574,10 +95225,6 @@ function parsePercentInterpolation(node, constants) {
         return null;
     if (leftNode.type !== "string")
         return null;
-    // Reject triple-quoted template strings — extractString only strips one quote,
-    // yielding stray interior quotes rather than the template content.
-    if (leftNode.text.startsWith('"""') || leftNode.text.startsWith("'''"))
-        return null;
     // RHS must be a single identifier, a single-element tuple, or an rpartition subscript.
     // Resolve all three shapes in an IIFE so each branch can return early without
     // initialising variables to null (which would trip the no-useless-assignment rule).
@@ -95592,9 +95239,14 @@ function parsePercentInterpolation(node, constants) {
             return { identName: ident, entry: e, effectiveValue: e.value, readOnly: false };
         }
         if (rightNode.type === "tuple") {
+            // Require exactly one tuple element total (not just exactly one identifier) — otherwise
+            // "%s" % (CONST, "x") (one identifier + one non-identifier element, invalid Python that
+            // would raise "not all arguments converted") is wrongly accepted as a single-element tuple.
+            if (rightNode.namedChildren.length !== 1)
+                return null;
             const identChildren = rightNode.namedChildren.filter((c) => c.type === "identifier");
             if (identChildren.length !== 1)
-                return null; // reject multi-identifier or empty tuple
+                return null; // reject non-identifier single element
             const ident = identChildren[0].text;
             const e = constants.get(ident);
             if (!e)
@@ -95623,15 +95275,11 @@ function parsePercentInterpolation(node, constants) {
     const pctParts = template.split("%s");
     if (pctParts.length !== 2)
         return null; // 0 or 2+ %s → skip
-    // Reject templates with other Python format conversions (e.g. "%s%d", "%s%r").
-    const otherConversions = /%-?\d*[diouxXeEfFgGrsa]/;
-    if (pctParts.some((p) => otherConversions.test(p)))
-        return null;
     const [prefix, suffix] = pctParts;
     // Fail-closed on any remaining bare/trailing `%` in prefix or suffix (e.g. "%s-100%",
-    // "%(name)s", "%*s"). After stripping %% escapes and the single %s, any remaining `%`
-    // is an unhandled Python format conversion that we cannot reason about — emit null so
-    // the constant is never updated from a template Python would reject at runtime.
+    // "%(name)s", "%*s", "%s%d", "%s%r"). After stripping %% escapes and the single %s, any
+    // remaining `%` is an unhandled Python format conversion that we cannot reason about —
+    // emit null so the constant is never updated from a template Python would reject at runtime.
     if (prefix.includes("%") || suffix.includes("%"))
         return null;
     // Restrict interpolation to templates where the `%s` sits at a real version
@@ -95644,6 +95292,23 @@ function parsePercentInterpolation(node, constants) {
         return null;
     return { identName, entry, prefix, suffix, effectiveValue, readOnly };
 }
+/**
+ * Build a `VersionRef`, centralizing the field defaults/omissions every construction
+ * site must apply consistently (this is where the single-quote `quote`-field
+ * regression already recurred once across hand-duplicated literals).
+ */
+function makeVersionRef(opts) {
+    return {
+        value: opts.value,
+        nodeStart: opts.nodeStart,
+        nodeEnd: opts.nodeEnd,
+        templatePrefix: opts.templatePrefix ?? "",
+        templateSuffix: opts.templateSuffix ?? "",
+        quote: opts.quote,
+        ...(opts.constantName !== undefined ? { constantName: opts.constantName } : {}),
+        ...(opts.readOnly ? { readOnly: true } : {}),
+    };
+}
 function resolveVersionExpr(node, constants) {
     if (node.type === "string") {
         // Triple-quoted strings: extractString only strips one quote, yielding stray interior
@@ -95653,14 +95318,12 @@ function resolveVersionExpr(node, constants) {
         const val = extractString(node);
         if (val === null)
             return null;
-        return {
+        return makeVersionRef({
             value: val,
             nodeStart: node.startIndex + 1,
             nodeEnd: node.endIndex - 1,
-            templatePrefix: "",
-            templateSuffix: "",
             quote: node.text[0] ?? '"',
-        };
+        });
     }
     if (node.type === "identifier") {
         const entry = constants.get(node.text);
@@ -95669,15 +95332,13 @@ function resolveVersionExpr(node, constants) {
         // Reject forward references: the constant must be assigned before this use site.
         if (node.startIndex < entry.assignmentEnd)
             return null;
-        return {
+        return makeVersionRef({
             value: entry.value,
             nodeStart: entry.valueNodeStart,
             nodeEnd: entry.valueNodeEnd,
-            templatePrefix: "",
-            templateSuffix: "",
             constantName: node.text,
             quote: entry.quote,
-        };
+        });
     }
     if (node.type === "subscript") {
         // Handles `CONST.rpartition(SEP)[0]` — a lossy transform that cannot be
@@ -95686,23 +95347,21 @@ function resolveVersionExpr(node, constants) {
         if (!parsed)
             return null;
         const { identName, entry, head } = parsed;
-        return {
+        return makeVersionRef({
             value: head,
             nodeStart: entry.valueNodeStart,
             nodeEnd: entry.valueNodeEnd,
-            templatePrefix: "",
-            templateSuffix: "",
             constantName: identName,
             quote: entry.quote,
             readOnly: true,
-        };
+        });
     }
     if (node.type === "binary_operator") {
         const interp = parsePercentInterpolation(node, constants);
         if (!interp)
             return null;
         const { identName, entry, prefix, suffix, effectiveValue, readOnly } = interp;
-        return {
+        return makeVersionRef({
             value: prefix + effectiveValue + suffix,
             nodeStart: entry.valueNodeStart,
             nodeEnd: entry.valueNodeEnd,
@@ -95710,8 +95369,8 @@ function resolveVersionExpr(node, constants) {
             templateSuffix: suffix,
             constantName: identName,
             quote: entry.quote,
-            ...(readOnly ? { readOnly: true } : {}),
-        };
+            readOnly,
+        });
     }
     return null;
 }
@@ -95752,12 +95411,12 @@ function resolveArtifactCoord(node, constants) {
         const versionSuffix = firstColonRight >= 0 ? rightPart.slice(0, firstColonRight) : rightPart;
         return {
             coord,
-            versionRef: {
-                // The full version segment = versionPrefix + effectiveValue + versionSuffix.
-                // For bare-constant/tuple RHS, effectiveValue === entry.value and this equals
-                // coord.split(":")[2] for the common "group:artifact:VERSION" form.
-                // For rpartition RHS, effectiveValue is the truncated head — the versionRef is
-                // readOnly and carries the effective (shorter) version for age-gating only.
+            // The full version segment = versionPrefix + effectiveValue + versionSuffix.
+            // For bare-constant/tuple RHS, effectiveValue === entry.value and this equals
+            // coord.split(":")[2] for the common "group:artifact:VERSION" form.
+            // For rpartition RHS, effectiveValue is the truncated head — the versionRef is
+            // readOnly and carries the effective (shorter) version for age-gating only.
+            versionRef: makeVersionRef({
                 value: versionPrefix + effectiveValue + versionSuffix,
                 nodeStart: entry.valueNodeStart,
                 nodeEnd: entry.valueNodeEnd,
@@ -95765,8 +95424,8 @@ function resolveArtifactCoord(node, constants) {
                 templateSuffix: versionSuffix,
                 constantName: identName,
                 quote: entry.quote,
-                ...(readOnly ? { readOnly: true } : {}),
-            },
+                readOnly,
+            }),
         };
     }
     return null;
@@ -95855,13 +95514,18 @@ async function resolveModuleFiles(rootPath) {
     await visit(rootPath);
     return result;
 }
+/** Parse Starlark content and collect its top-level string constants in one pass. */
+async function parseModule(content) {
+    const tree = await parseStarlark(content);
+    const constants = extractStringConstants(tree.rootNode);
+    return { tree, constants };
+}
 /**
  * Extract crate.spec() calls from Starlark content.
  * Resolves constant variables and % interpolation in version= arguments.
  */
 async function extractCrateSpecs(content) {
-    const tree = await parseStarlark(content);
-    const constants = extractStringConstants(tree.rootNode);
+    const { tree, constants } = await parseModule(content);
     const calls = findCallsByName(tree.rootNode, "crate.spec");
     const specs = [];
     for (const call of calls) {
@@ -95890,8 +95554,7 @@ async function extractCrateSpecs(content) {
  * single_version_override, multiple_version_override
  */
 async function extractOverrides(content) {
-    const tree = await parseStarlark(content);
-    const constants = extractStringConstants(tree.rootNode);
+    const { tree, constants } = await parseModule(content);
     const overrides = new Map();
     const OVERRIDE_TYPE_MAP = {
         git_override: "git",
@@ -95961,8 +95624,7 @@ async function extractOverrides(content) {
     return overrides;
 }
 async function extractMavenInstalls(content, workspaceRoot) {
-    const tree = await parseStarlark(content);
-    const constants = extractStringConstants(tree.rootNode);
+    const { tree, constants } = await parseModule(content);
     const calls = findCallsByName(tree.rootNode, "maven.install");
     const installs = [];
     const wsRoot = workspaceRoot ?? cwd;
@@ -95991,8 +95653,7 @@ async function extractMavenInstalls(content, workspaceRoot) {
  * artifacts= lists). Resolves constant variables in the version= argument.
  */
 async function extractMavenArtifacts(content) {
-    const tree = await parseStarlark(content);
-    const constants = extractStringConstants(tree.rootNode);
+    const { tree, constants } = await parseModule(content);
     const calls = findCallsByName(tree.rootNode, "maven.artifact");
     const refs = [];
     for (const call of calls) {
@@ -96022,8 +95683,7 @@ async function extractMavenArtifacts(content) {
  * rewrite versions in-place without re-parsing.
  */
 async function extractBazelDeps(content) {
-    const tree = await parseStarlark(content);
-    const constants = extractStringConstants(tree.rootNode);
+    const { tree, constants } = await parseModule(content);
     const calls = findCallsByName(tree.rootNode, "bazel_dep");
     const deps = [];
     for (const call of calls) {
@@ -96248,6 +95908,12 @@ async function discover(opts) {
                     // phantom downgrade/wrong breaking flag under --yes. This is an accepted
                     // trade-off (saves one API call per action); the API slow-path below is
                     // the correct path when no comment is present.
+                    // TODO(--yes hardening): discover() has no visibility into whether this run
+                    // is unattended (opts carries no `yes`/`allowAutoApply` flag, and threading
+                    // one through would require changes in run.ts's dispatch). If that plumbing
+                    // is ever added, consider verifying `fromComment` against `ref.ref` via
+                    // shaToTag (as used in the slow path below) before trusting it under --yes,
+                    // so a stale comment can't drive an unattended major-version auto-bump.
                     const fromComment = commentVersionToken(ref.trailingComment);
                     if (fromComment) {
                         current = fromComment;
@@ -96300,7 +95966,7 @@ async function discover(opts) {
  * Matches `${rw.offset}:${rw.length}` produced by `buildFileEdits`:
  *   offset = matchOffset, length = matchLength + trailingCommentLength
  */
-function actions_rewriteKeyOf(candidate) {
+function rewriteKeyOf(candidate) {
     const pos = candidate.dep.position;
     if (!pos || typeof pos.matchOffset !== "number")
         return undefined;
@@ -96334,6 +96000,20 @@ function buildFileEdits(candidates, style) {
             else {
                 // Preserve style (or sha but no pinnedTo) — just update the tag,
                 // re-wrapping in the original quote character if the source used one.
+                //
+                // Guard: if the source ref is currently pinned to a commit SHA, never fall
+                // through to a tag rewrite here — that would silently downgrade an immutable
+                // pin to a mutable tag (a supply-chain regression), the exact risk this tool
+                // exists to prevent. Skip with a warning instead; `--style sha` is the path
+                // that re-pins to the new commit SHA.
+                const atIdx = pos.raw.lastIndexOf("@");
+                const originalRef = atIdx >= 0 ? pos.raw.slice(atIdx + 1) : "";
+                if (isCommitSha(originalRef)) {
+                    console.warn(`actions: skipping ${name} — currently pinned to commit ${originalRef}; ` +
+                        "refusing to rewrite a SHA pin to a mutable tag under --style preserve. " +
+                        "Use --style sha to update the pin instead.");
+                    continue;
+                }
                 // If the trailing comment carried the old version tag, update it to the
                 // new version so it doesn't become stale after the rewrite.
                 let commentSuffix = "";
@@ -96357,7 +96037,6 @@ function buildFileEdits(candidates, style) {
 // EXTERNAL MODULE: ./node_modules/.pnpm/dockerfile-ast@0.7.1/node_modules/dockerfile-ast/lib/main.js
 var main = __nccwpck_require__(4908);
 ;// CONCATENATED MODULE: ./out/ecosystems/docker.js
-
 
 
 
@@ -96545,8 +96224,7 @@ async function docker_getChangedDeps(baseRef, dockerfilesInput, dockerhubMirror)
             // sources are ambiguous (build contexts, stage aliases, typos) and we
             // prefer false-negatives over false-positives.
             if (source === "copy-from" || source === "mount-from") {
-                const reference = ref.digest ?? ref.tag ?? "latest";
-                const exists = await imageExists(ref.registry, ref.repository, reference, dockerhubMirror);
+                const exists = await confirmCopyMountFromExists(ref, dockerhubMirror);
                 if (exists !== "found") {
                     core.info(`docker: ${raw} not confirmed in registry (${exists}; build context, alias, or typo), skipping`);
                     continue;
@@ -96590,6 +96268,98 @@ const DEFAULT_DOCKERFILE_GLOB_PATTERN = [
     "**/containerfile",
     ...DEFAULT_GLOB_EXCLUSIONS,
 ].join("\n");
+/**
+ * For a FROM instruction, compute how many code-units after the image ref to
+ * consume in the rewrite (spanning any AS clause plus a trailing "#" comment,
+ * up to the instruction's parsed end), and extract any existing trailing
+ * comment that must be re-appended verbatim (as opposed to a previously-injected
+ * "# was <token>" tool annotation, which is consumed entirely and replaced).
+ */
+function reconcileFromTrailingComment(content, lineStarts, instrEndLine, instrEndChar, absoluteOffset, refLength, itemRef) {
+    let existingTrailingComment = "";
+    // A1: When instrEndLine === lines.length (last instruction has no trailing newline),
+    // lineStarts[instrEndLine] is undefined. Fall back to content.length (end of file)
+    // rather than to the last LINE START — the last line start is less than the file
+    // end, which makes absoluteInstrEnd < absoluteOffset + refLength, collapsing
+    // trailingConsumeLength to 0 and leaving any AS <stage> clause un-consumed.
+    const instrEndLineStart = lineStarts[instrEndLine] ?? content.length;
+    const absoluteInstrEnd = instrEndLineStart + instrEndChar;
+    const trailingConsumeLength = Math.max(0, absoluteInstrEnd - (absoluteOffset + refLength));
+    // Detect an existing trailing "#" comment in the consumed span. Author comments
+    // are preserved (re-appended after the new "# was" note). A previously-injected
+    // "# was <X>" annotation is consumed entirely and not re-appended — the new
+    // "# was <current>" replaces it, preventing comment accumulation on re-runs.
+    //
+    // IMPORTANT: trailingConsumeLength must always span the FULL instruction end
+    // (including any trailing comment), so that `expected` covers the whole region
+    // and the stale-offset guard in apply.ts catches file mutations. The
+    // existingTrailingComment is re-appended in buildFileEdits, not left in place.
+    if (trailingConsumeLength > 0) {
+        const consumedSpan = content.slice(absoluteOffset + refLength, absoluteOffset + refLength + trailingConsumeLength);
+        // A3: Find the "#" comment start by locating the end of the actual "AS <stage>"
+        // clause in the consumed span rather than using restOfLine.length as the search
+        // offset. restOfLine is reconstructed from the AST and uses a single space before
+        // AS, but the source may have double-spaces (e.g. "FROM nginx  AS  build"), making
+        // the reconstructed length shorter than the actual consumed AS span — a "#" before
+        // the real end would then be mis-located as the comment start.
+        // Using the actual regex match against consumedSpan avoids this.
+        const asMatch = /\bAS\s+\S+/i.exec(consumedSpan);
+        const hashSearchStart = asMatch ? asMatch.index + asMatch[0].length : 0;
+        const hashIdx = consumedSpan.indexOf("#", hashSearchStart);
+        if (hashIdx !== -1) {
+            const comment = consumedSpan.slice(hashIdx);
+            // Detect whether the comment is a previously-injected "# was <token>"
+            // annotation (possibly followed by an author comment) or a pure author
+            // comment.
+            //
+            // Strategy: match "/^#\s*was\s+(\S+)\s*/s" against the trimmed comment.
+            // If the prefix matches, the captured token is the annotation ref; any
+            // text remaining after it is the author comment. This approach correctly
+            // handles cases like:
+            //   "# was nginx:1.24  # prod"   → annotation token "nginx:1.24", author "# prod"
+            //   "# was repo#weird:1"          → annotation token "repo#weird:1", no author
+            //   "# keep this around"          → no annotation match → entire comment is author
+            // Unlike the previous indexOf("#",1) approach, it never splits mid-token on
+            // an embedded "#" inside the ref itself (M-container-1 fix).
+            const trimmed = comment.trimStart();
+            const annotationMatch = /^#\s*was\s+(\S+)(\s*)(.*)/s.exec(trimmed);
+            // Only treat as a tool-injected annotation when the captured token is a parseable
+            // image reference for the SAME repository AND registry as item.raw. A tool
+            // annotation always names the exact prior ref of the same image, so its registry
+            // can never differ from the current one — matching repository alone would let a
+            // same-named repository on a *different* registry (e.g. a private mirror also
+            // called "alpine") be misclassified as our own annotation. The copy-from path
+            // already uses an exact item.raw match; this brings FROM as close to that
+            // conservative standard as its "prior ref, not current ref" shape allows.
+            const annotationToken = annotationMatch?.[1] ?? "";
+            const annotationRef = annotationToken ? parseImageRef(annotationToken) : null;
+            const isAnnotation = annotationMatch !== null &&
+                annotationRef !== null &&
+                annotationRef.repository === itemRef.repository &&
+                annotationRef.registry === itemRef.registry;
+            if (isAnnotation && annotationMatch) {
+                // Previously-injected annotation: consume it entirely and replace with the
+                // new "# was <current>" note. Extract any trailing author comment for re-append.
+                const remainder = annotationMatch[3].trimStart();
+                if (remainder.length > 0) {
+                    // Author comment follows the annotation token — preserve it for re-append.
+                    // trailingConsumeLength stays unchanged — full span consumed atomically.
+                    existingTrailingComment = remainder.startsWith("#") ? remainder : `# ${remainder}`;
+                }
+                else {
+                    existingTrailingComment = "";
+                }
+            }
+            else {
+                // Genuine author comment: capture for re-append, consume the full span
+                // atomically so the original is not left in the file alongside the
+                // re-appended copy. trailingConsumeLength stays unchanged (full span).
+                existingTrailingComment = comment;
+            }
+        }
+    }
+    return { trailingConsumeLength, existingTrailingComment };
+}
 async function docker_discover(opts) {
     const files = await discoverViaGlobs({
         inputGlob: opts.dockerfiles,
@@ -96624,6 +96394,17 @@ async function docker_discover(opts) {
                     `(getImageRange() returned null or position is inconsistent); manual update required`);
                 continue;
             }
+            // For COPY --from and RUN --mount=from, require positive confirmation that the
+            // image exists before treating it as a real external image dependency —
+            // confirmCopyMountFromExists is shared with the verify-side gate in
+            // src/ecosystems/docker.ts so the two can't drift.
+            if (item.source === "copy-from" || item.source === "mount-from") {
+                const exists = await image_confirmCopyMountFromExists(item.ref, opts.dockerhubMirror);
+                if (exists !== "found") {
+                    lib_core.info(`[lisan] docker: ${item.raw} not confirmed in registry (${exists}; build context, alias, or typo), skipping`);
+                    continue;
+                }
+            }
             // For FROM: reconstruct the trailing AS clause from the parsed build stage name
             // (never slice raw line text — that would capture old "# was" comments on re-runs).
             // For copy-from / mount-from: no trailing content needed.
@@ -96637,85 +96418,7 @@ async function docker_discover(opts) {
             let trailingConsumeLength = 0;
             let existingTrailingComment = "";
             if (item.source === "from") {
-                // A1: When instrEndLine === lines.length (last instruction has no trailing newline),
-                // lineStarts[instrEndLine] is undefined. Fall back to content.length (end of file)
-                // rather than to the last LINE START — the last line start is less than the file
-                // end, which makes absoluteInstrEnd < absoluteOffset + refLength, collapsing
-                // trailingConsumeLength to 0 and leaving any AS <stage> clause un-consumed.
-                const instrEndLineStart = lineStarts[item.instrEndLine] ?? content.length;
-                const absoluteInstrEnd = instrEndLineStart + item.instrEndChar;
-                trailingConsumeLength = Math.max(0, absoluteInstrEnd - (absoluteOffset + refLength));
-                // Detect an existing trailing "#" comment in the consumed span. Author comments
-                // are preserved (re-appended after the new "# was" note). A previously-injected
-                // "# was <X>" annotation is consumed entirely and not re-appended — the new
-                // "# was <current>" replaces it, preventing comment accumulation on re-runs.
-                //
-                // IMPORTANT: trailingConsumeLength must always span the FULL instruction end
-                // (including any trailing comment), so that `expected` covers the whole region
-                // and the stale-offset guard in apply.ts catches file mutations. The
-                // existingTrailingComment is re-appended in buildFileEdits, not left in place.
-                if (trailingConsumeLength > 0) {
-                    const consumedSpan = content.slice(absoluteOffset + refLength, absoluteOffset + refLength + trailingConsumeLength);
-                    // A3: Find the "#" comment start by locating the end of the actual "AS <stage>"
-                    // clause in the consumed span rather than using restOfLine.length as the search
-                    // offset. restOfLine is reconstructed from the AST and uses a single space before
-                    // AS, but the source may have double-spaces (e.g. "FROM nginx  AS  build"), making
-                    // the reconstructed length shorter than the actual consumed AS span — a "#" before
-                    // the real end would then be mis-located as the comment start.
-                    // Using the actual regex match against consumedSpan avoids this.
-                    const asMatch = /\bAS\s+\S+/i.exec(consumedSpan);
-                    const hashSearchStart = asMatch ? asMatch.index + asMatch[0].length : 0;
-                    const hashIdx = consumedSpan.indexOf("#", hashSearchStart);
-                    if (hashIdx !== -1) {
-                        const comment = consumedSpan.slice(hashIdx);
-                        // Detect whether the comment is a previously-injected "# was <token>"
-                        // annotation (possibly followed by an author comment) or a pure author
-                        // comment.
-                        //
-                        // Strategy: match "/^#\s*was\s+(\S+)\s*/s" against the trimmed comment.
-                        // If the prefix matches, the captured token is the annotation ref; any
-                        // text remaining after it is the author comment. This approach correctly
-                        // handles cases like:
-                        //   "# was nginx:1.24  # prod"   → annotation token "nginx:1.24", author "# prod"
-                        //   "# was repo#weird:1"          → annotation token "repo#weird:1", no author
-                        //   "# keep this around"          → no annotation match → entire comment is author
-                        // Unlike the previous indexOf("#",1) approach, it never splits mid-token on
-                        // an embedded "#" inside the ref itself (M-container-1 fix).
-                        const trimmed = comment.trimStart();
-                        const annotationMatch = /^#\s*was\s+(\S+)(\s*)(.*)/s.exec(trimmed);
-                        // Only treat as a tool-injected annotation when the captured token is a parseable
-                        // image reference for the SAME repository as item.raw. This prevents clobbering
-                        // genuine author comments like `# was alpine:3 in staging` (token "alpine:3" has
-                        // ":", but the repository "alpine" would differ from e.g. "nginx" in item.raw).
-                        // The copy-from path already uses an exact item.raw match; this aligns FROM with
-                        // the same conservative standard: only strip if we recognise our own annotation.
-                        const annotationToken = annotationMatch?.[1] ?? "";
-                        const annotationRef = annotationToken ? parseImageRef(annotationToken) : null;
-                        const itemRef = item.ref; // already parsed upstream
-                        const isAnnotation = annotationMatch !== null &&
-                            annotationRef !== null &&
-                            annotationRef.repository === itemRef.repository;
-                        if (isAnnotation && annotationMatch) {
-                            // Previously-injected annotation: consume it entirely and replace with the
-                            // new "# was <current>" note. Extract any trailing author comment for re-append.
-                            const remainder = annotationMatch[3].trimStart();
-                            if (remainder.length > 0) {
-                                // Author comment follows the annotation token — preserve it for re-append.
-                                // trailingConsumeLength stays unchanged — full span consumed atomically.
-                                existingTrailingComment = remainder.startsWith("#") ? remainder : `# ${remainder}`;
-                            }
-                            else {
-                                existingTrailingComment = "";
-                            }
-                        }
-                        else {
-                            // Genuine author comment: capture for re-append, consume the full span
-                            // atomically so the original is not left in the file alongside the
-                            // re-appended copy. trailingConsumeLength stays unchanged (full span).
-                            existingTrailingComment = comment;
-                        }
-                    }
-                }
+                ({ trailingConsumeLength, existingTrailingComment } = reconcileFromTrailingComment(content, lineStarts, item.instrEndLine, item.instrEndChar, absoluteOffset, refLength, item.ref));
             }
             const instructionOffset = lineStarts[item.instrLineIndex];
             const instrLine = lines[item.instrLineIndex];
@@ -97052,6 +96755,20 @@ function computeContainerScopeLines(lines) {
     return result;
 }
 /**
+ * Accept/reject ceiling check: is a line at `lineIndent` a direct field of the
+ * current container item (per `info`, from `computeContainerScopeLines`)? Colocated
+ * with the scope computer so the invariant is auditable/testable in one place rather
+ * than duplicated inline at each call site.
+ *
+ * `itemFieldIndent` is set eagerly the moment the first container item's dash line is
+ * seen (see computeContainerScopeLines), so the `containerIndent + 4` fallback is only
+ * reachable before that point in the current scope (i.e. `itemFieldIndent === -1`).
+ */
+function isWithinContainerItemFieldScope(info, lineIndent) {
+    const maxImageIndent = info.itemFieldIndent >= 0 ? info.itemFieldIndent : info.containerIndent + 4;
+    return lineIndent <= maxImageIndent;
+}
+/**
  * Parse a rendered Kubernetes manifest and return all container image strings
  * with their source-level position info (line index and character offset within
  * that line where the image value starts).
@@ -97072,7 +96789,7 @@ function parseManifestImagesWithPositions(content, sourceFile) {
     const containerScopeData = computeContainerScopeLines(lines);
     // For each line, check if it matches `image: <value>` (with optional quotes).
     for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-        const { containerIndent, itemFieldIndent } = containerScopeData[lineIdx];
+        const { containerIndent } = containerScopeData[lineIdx];
         if (containerIndent === -1)
             continue; // reject non-container `image:` keys
         const line = lines[lineIdx];
@@ -97085,13 +96802,7 @@ function parseManifestImagesWithPositions(content, sourceFile) {
         if (!imageMap.has(imageValue))
             continue;
         // Depth guard: reject `image:` keys that are not a direct field of the container
-        // list item. `itemFieldIndent` is set eagerly to `itemDashIndent + prefixWidth` when
-        // a container item is first seen (so it is never -1 by the time any image key
-        // could appear under it), giving a correct ceiling that rejects sub-list entries
-        // like `env[]` items whose `image:` keys land at a deeper indent. Falls back to
-        // `containerIndent + 4` only before any container item has been seen in this scope
-        // (i.e. `itemFieldIndent` is still -1), which covers the `- image: foo` dash-inline
-        // style where itemFieldIndent is set on the same line.
+        // list item — see isWithinContainerItemFieldScope for the ceiling invariant.
         //
         // LIMITATION: The image: field is identified by indentation depth alone. An image: key
         // at exactly itemFieldIndent is accepted regardless of its enclosing key path — e.g. a
@@ -97099,8 +96810,7 @@ function parseManifestImagesWithPositions(content, sourceFile) {
         // on imageMap.has(value) (populated by the semantic YAML parse) agreeing with indentation.
         // Flow-style YAML and anchors are unaffected (they produce no imageMap entries).
         const lineIndent = /^(\s*)/.exec(line)?.[1].length ?? 0;
-        const maxImageIndent = itemFieldIndent >= 0 ? itemFieldIndent : containerIndent + 4;
-        if (lineIndent > maxImageIndent)
+        if (!isWithinContainerItemFieldScope(containerScopeData[lineIdx], lineIndent))
             continue;
         // valueOffset = length of the "image: " prefix + optional opening quote
         const valueOffset = lineMatch[1].length + lineMatch[2].length;
@@ -97232,6 +96942,13 @@ async function kubernetes_discover(opts) {
             // Not a valid manifest, skip
             continue;
         }
+        // Note: parseManifestImagesWithPositions (../../ecosystems/kubernetes.ts) fails safe for
+        // images the semantic YAML parse found but the line-scan positioner couldn't locate
+        // (flow-style `{image: ...}` or YAML anchors/aliases) — those never appear in `refs` at
+        // all, so they are silently absent here rather than mis-rewritten. That module emits a
+        // core.warning for the dropped images, which today is Actions-log/stderr-only; there is
+        // no per-dep note/warning channel on DepRef to relay it into the CLI's own summary output
+        // without adding new cross-file plumbing (types.ts/run.ts), so it is left as-is.
         // Pre-compute per-line start offsets for converting line+char to absolute offset
         const lineStarts = lineStartOffsets(content);
         for (const item of refs) {
@@ -97311,6 +97028,667 @@ function kubernetes_buildFileEdits(candidates, style) {
     return edits;
 }
 //# sourceMappingURL=kubernetes.js.map
+;// CONCATENATED MODULE: ./out/update/apply.js
+
+
+
+/**
+ * Triage a heterogeneous list of rewrites into offset-based and string-based
+ * buckets. Warns and skips any malformed Rewrite (one carrying both or neither
+ * discriminating key) so it is never silently applied.
+ */
+function partitionRewrites(rewrites, file) {
+    const offsetRewrites = [];
+    const stringRewrites = [];
+    for (const r of rewrites) {
+        const hasOffset = "offset" in r;
+        const hasSearch = "search" in r;
+        if (hasOffset && hasSearch) {
+            lib_core.warning(`[lisan] apply: (${file}) malformed Rewrite has both "offset" and "search" keys — skipping`);
+        }
+        else if (hasOffset) {
+            offsetRewrites.push(r);
+        }
+        else if (hasSearch) {
+            stringRewrites.push(r);
+        }
+        else {
+            lib_core.warning(`[lisan] apply: (${file}) malformed Rewrite has neither "offset" nor "search" key — skipping`);
+        }
+    }
+    return { offsetRewrites, stringRewrites };
+}
+/**
+ * Read a file and apply all rewrites, returning the new file content string and
+ * the set of search strings that were actually applied (not skipped).
+ * Does NOT write to disk — use this for the validation phase of a two-phase write.
+ *
+ * Offset-based rewrites are applied in reverse order (highest offset first)
+ * so earlier UTF-16 code-unit positions are not shifted by later edits.
+ *
+ * String-based rewrites use split/join to replace all occurrences across the file.
+ * Only unambiguous (exactly one occurrence) rewrites are applied; ambiguous ones are
+ * skipped with a warning and will NOT appear in `appliedSearches`.
+ *
+ * Throws if any rewrite has invalid offsets, overlaps, or stale expected bytes.
+ */
+async function buildFileContent(edit) {
+    // Read as a Buffer so a leading UTF-8 BOM (EF BB BF → \uFEFF) is not silently stripped.
+    // fs.readFile(path, "utf8") drops the BOM on decode; Buffer.toString("utf8") preserves it.
+    const rawBuf = await promises_namespaceObject.readFile(edit.file);
+    let content = rawBuf.toString("utf8");
+    // Strip the BOM character for offset processing: parser offsets are relative to BOM-free content.
+    const hasBom = content.startsWith("\uFEFF");
+    if (hasBom)
+        content = content.slice(1);
+    const { offsetRewrites, stringRewrites } = partitionRewrites(edit.rewrites, edit.file);
+    // Validate and apply offset-based rewrites in reverse order to preserve earlier positions.
+    // Tie-break length descending (not ascending): at a shared offset, a positive-length
+    // rewrite must sort before a zero-length insertion so the adjacency overlap check below
+    // sees the positive-length range first and correctly treats a same-offset insertion as
+    // a boundary case, not a skip.
+    const sorted = [...offsetRewrites].sort((a, b) => b.offset - a.offset || b.length - a.length);
+    // Guard against adversarial/garbage parsers emitting overlapping or out-of-bounds offsets.
+    // NaN and non-integer values must be rejected explicitly: `NaN < 0` is false, so without
+    // this check a fuzzed `offset: NaN` silently passes bounds and overlap validation.
+    for (let i = 0; i < sorted.length; i++) {
+        const rw = sorted[i];
+        if (!Number.isInteger(rw.offset) || !Number.isInteger(rw.length)) {
+            throw new Error(`[lisan] apply: offset rewrite has non-integer offset/length in ${edit.file}: ` +
+                `offset=${rw.offset} length=${rw.length}`);
+        }
+        if (rw.offset < 0 || rw.length < 0 || rw.offset + rw.length > content.length) {
+            throw new Error(`[lisan] apply: offset rewrite out of bounds in ${edit.file}: ` +
+                `offset=${rw.offset} length=${rw.length} fileLen=${content.length}`);
+        }
+        if (i > 0) {
+            const prev = sorted[i - 1];
+            // sorted descending, so prev.offset >= rw.offset; check that rw's end doesn't reach into prev's range.
+            // Zero-length rewrites (length===0) are insertions at a point — they occupy no range
+            // and cannot overlap anything. Skip the overlap check when either side has length===0:
+            // a zero-length prev at the same offset as rw is not an overlap; a zero-length rw
+            // at any position cannot extend into prev's range regardless of offset arithmetic.
+            if (rw.length > 0 && prev.length > 0 && rw.offset + rw.length > prev.offset) {
+                throw new Error(`[lisan] apply: overlapping offset rewrites in ${edit.file}: ` +
+                    `[${rw.offset},${rw.offset + rw.length}) overlaps [${prev.offset},${prev.offset + prev.length})`);
+            }
+        }
+    }
+    // The adjacency check above only compares neighbors in offset order, so a zero-length
+    // insertion sorted between two other rewrites (or sharing an offset with a non-adjacent
+    // one) can still land strictly inside a positive-length rewrite's range without ever
+    // being adjacent to it. Check every zero-length insertion against every positive-length
+    // range directly — rewrite batches are small, so the O(n^2) scan is cheap.
+    for (const rw of sorted) {
+        if (rw.length !== 0)
+            continue;
+        for (const other of sorted) {
+            if (other === rw || other.length === 0)
+                continue;
+            if (rw.offset > other.offset && rw.offset < other.offset + other.length) {
+                throw new Error(`[lisan] apply: zero-length insertion at offset ${rw.offset} in ${edit.file} falls inside ` +
+                    `another rewrite's range [${other.offset},${other.offset + other.length})`);
+            }
+        }
+    }
+    // Fail-closed stale-offset guard: verify the expected slice is still present
+    // before any write. A mismatch means the file changed between discover and apply.
+    for (const rewrite of sorted) {
+        const actual = content.slice(rewrite.offset, rewrite.offset + rewrite.length);
+        if (actual !== rewrite.expected) {
+            throw new Error(`[lisan] apply: stale offset in ${edit.file} — ` +
+                `expected ${JSON.stringify(rewrite.expected.slice(0, 120))} ` +
+                `but found ${JSON.stringify(actual.slice(0, 120))}`);
+        }
+    }
+    for (const rewrite of sorted) {
+        content =
+            content.slice(0, rewrite.offset) +
+                rewrite.replace +
+                content.slice(rewrite.offset + rewrite.length);
+    }
+    // Apply string-based rewrites using split/join (replaceAll semantics).
+    const appliedSearches = new Set();
+    for (const rewrite of stringRewrites) {
+        // An identity rewrite (search === replace) is intentionally excluded from
+        // appliedSearches: nothing actually changed, so a candidate whose only
+        // rewrite is an identity no-op correctly surfaces as noEdits upstream
+        // rather than being reported as applied.
+        if (rewrite.search === rewrite.replace)
+            continue;
+        if (!content.includes(rewrite.search)) {
+            lib_core.warning(`[lisan] apply: search string not found in ${edit.file}: ${rewrite.search.slice(0, 60)}`);
+            continue;
+        }
+        // Reject ambiguous rewrites: multiple occurrences mean we can't safely target
+        // just the right one (e.g. "org.foo:bar:1.0" as a substring of "…:1.0.1").
+        const occurrences = content.split(rewrite.search).length - 1;
+        if (occurrences > 1) {
+            lib_core.warning(`[lisan] apply: skipping ambiguous string rewrite — ${occurrences} occurrences of ` +
+                `${JSON.stringify(rewrite.search.slice(0, 60))} in ${edit.file}; ` +
+                `manual update required to avoid corrupting the wrong occurrence`);
+            continue;
+        }
+        content = content.split(rewrite.search).join(rewrite.replace);
+        appliedSearches.add(rewrite.search);
+    }
+    // Re-prepend the BOM so the written file preserves the original byte-order mark.
+    if (hasBom)
+        content = "\uFEFF" + content;
+    return { content, appliedSearches };
+}
+/**
+ * Apply a FileEdit to disk: computes the new content then writes atomically.
+ *
+ * For writing multiple files as a set, use the two-phase pattern: call
+ * `buildFileContent` for each file first (validates all), then write all with
+ * `writeFileContent` only if every validation succeeds. This is best-effort
+ * set semantics, not a true multi-file transaction: each file's write is
+ * individually atomic (rename-from-temp), but if a later file in the set
+ * fails to write, earlier files already committed in this call are NOT rolled
+ * back automatically — the caller is responsible for any cross-file rollback
+ * policy (e.g. re-writing from a pre-change snapshot), which can itself fail
+ * (e.g. the same read-only-filesystem condition that failed the write),
+ * leaving a partially-updated tree. There is no journal or two-phase commit
+ * across files.
+ */
+async function applyFileEdit(edit) {
+    const { content } = await buildFileContent(edit);
+    await writeFileContent(edit.file, content);
+}
+/**
+ * Stage `content` to a uniquely-named temp file in the same directory as `file`.
+ * Returns the temp file path. The caller must either `commitTemp` or clean up
+ * the temp file (via `fs.unlink`) — both are handled by `writeFileContent`.
+ *
+ * The temp name includes process PID, a timestamp, and a random token to guard
+ * against same-file concurrent calls and PID-recycle stale-temp collisions.
+ */
+async function stageTemp(file, content) {
+    const absFile = external_node_path_namespaceObject.resolve(file);
+    const dir = external_node_path_namespaceObject.dirname(absFile);
+    const rnd = crypto.randomUUID().replace(/-/g, "");
+    const tmp = external_node_path_namespaceObject.join(dir, `.lisan-tmp-${process.pid}-${Date.now()}-${rnd}-${external_node_path_namespaceObject.basename(absFile)}`);
+    try {
+        await promises_namespaceObject.writeFile(tmp, content, "utf8");
+        return tmp;
+    }
+    catch (err) {
+        await promises_namespaceObject.unlink(tmp).catch(() => undefined);
+        throw err;
+    }
+}
+/**
+ * Commit a previously staged temp file to its final location via an atomic rename.
+ * Cleans up the temp file on failure.
+ */
+async function commitTemp(tmp, file) {
+    try {
+        await promises_namespaceObject.rename(tmp, file);
+    }
+    catch (err) {
+        await promises_namespaceObject.unlink(tmp).catch(() => undefined);
+        throw err;
+    }
+}
+/**
+ * Write content to a file atomically using a rename-from-temp approach.
+ * If the process crashes mid-write the original file is left intact.
+ * The temp file is created in the same directory to ensure rename stays
+ * on the same filesystem (cross-device rename would require a copy).
+ */
+async function writeFileContent(file, content) {
+    const tmp = await stageTemp(file, content);
+    await commitTemp(tmp, file);
+}
+//# sourceMappingURL=apply.js.map
+;// CONCATENATED MODULE: ./out/update/ecosystems/bazel-shared.js
+
+
+
+
+/**
+ * Given a new full version from the registry (e.g. "4.33.0") and a versionRef
+ * that was derived from an interpolation template (e.g. `"4.%s" % CONST` where
+ * templatePrefix = "4."), compute the new constant value to write ("33.0").
+ *
+ * For direct literals and bare-constant references (templatePrefix/Suffix = ""),
+ * this is a no-op and candidate.latest is returned unchanged.
+ *
+ * Returns null if the candidate.latest is incompatible with the template
+ * (e.g. doesn't start with templatePrefix), in which case the rewrite is skipped.
+ */
+function computeNewConstantValue(latest, versionRef) {
+    const { templatePrefix, templateSuffix } = versionRef;
+    let value = latest;
+    if (templatePrefix) {
+        if (!value.startsWith(templatePrefix))
+            return null;
+        value = value.slice(templatePrefix.length);
+    }
+    if (templateSuffix) {
+        if (!value.endsWith(templateSuffix))
+            return null;
+        value = value.slice(0, value.length - templateSuffix.length);
+    }
+    // Round-trip guard: re-applying the template to the stripped value must
+    // reproduce `latest` exactly. If not (e.g. overlapping prefix/suffix), the
+    // stripped value is unsafe to write — skip with the caller's warning path.
+    if (templatePrefix + value + templateSuffix !== latest)
+        return null;
+    if (!value.trim())
+        return null; // degenerate template: stripped value is empty
+    return value;
+}
+/**
+ * Returns true when every version string in the array is coercible to semver.
+ * Used by both reconcileConstantGroups (candidate selection) and
+ * resolveConflictingReplaces (rewrite reconciliation) so the "drop on
+ * non-comparable version" precondition is a single shared predicate.
+ */
+function allVersionsComparable(versions) {
+    return versions.every((v) => semver.coerce(v) !== null);
+}
+/**
+ * Given an array of items and a function to extract a version string from each,
+ * returns the item whose version is the semver minimum (the highest version that
+ * exists for all referencing deps — acceptability per dep is validated separately
+ * via existence checks). Uses semver.coerce so 2-segment versions ("4.13",
+ * "2.21") compare correctly alongside full semver.
+ *
+ * Returns null when the array is empty or all versions fail to coerce.
+ */
+function pickSemverMin(items, versionOf) {
+    if (items.length === 0)
+        return null;
+    let minItem = items[0];
+    // Prefer semver.valid() (strict) so that prerelease ordering is preserved:
+    //   1.2.3-rc1 < 1.2.3 (strict), but semver.coerce() flattens both to 1.2.3.
+    // Fall back to semver.coerce() only for 2-segment Maven/BCR versions like "4.13"
+    // that strict semver rejects but coerce can handle.
+    const resolveVersion = (v) => semver.valid(v) ?? semver.coerce(v)?.version ?? null;
+    let minResolved = resolveVersion(versionOf(minItem));
+    for (let i = 1; i < items.length; i++) {
+        const v = versionOf(items[i]);
+        const sv = resolveVersion(v);
+        if (!sv)
+            continue; // non-semver: skip; keep current min
+        if (!minResolved || semver.lt(sv, minResolved)) {
+            minItem = items[i];
+            minResolved = sv;
+        }
+    }
+    return minResolved ? minItem : null;
+}
+/**
+ * Build a single raw offset-based rewrite for a Starlark constant literal,
+ * shared by rust/bazel (via buildBazelVersionEdits) and java (versionRef branch).
+ *
+ * Returns null with a warning when:
+ *   - The template prefix/suffix is incompatible with versionPrefix (would produce
+ *     corrupt output like `=4.=33.0`).
+ *   - candidate.latest is incompatible with the template (computeNewConstantValue → null).
+ *   - The old literal bytes cannot be computed for the stale-offset expected check.
+ *
+ * Callers should skip the candidate when null is returned.
+ */
+function buildConstantRewrite(candidate, versionRef, versionPrefix, file, content) {
+    // Read-only refs (e.g. CONST.rpartition(".")[0]) must never be rewritten — the constant
+    // is driven by a non-lossy sibling reference.  Discover guards in the per-ecosystem
+    // modules skip these, but this defense-in-depth check ensures no rewrite escapes if a
+    // caller is added that doesn't apply the guard.
+    if (versionRef.readOnly) {
+        lib_core.warning(`[lisan] apply: (${file}) skipping ${candidate.dep.name} — versionRef is read-only ` +
+            `(lossy transform; constant is driven by a sibling reference)`);
+        return null;
+    }
+    // Combining a Cargo specifier prefix (e.g. "=") with a non-trivial template
+    // (templatePrefix/Suffix) would produce garbage like "=4.=33.0".
+    if (versionPrefix && (versionRef.templatePrefix || versionRef.templateSuffix)) {
+        lib_core.warning(`[lisan] apply: (${file}) skipping ${candidate.dep.name} — cannot combine ` +
+            `Cargo specifier prefix "${versionPrefix}" with interpolation template ` +
+            `"${versionRef.templatePrefix}%s${versionRef.templateSuffix}"`);
+        return null;
+    }
+    const newConstValue = computeNewConstantValue(candidate.latest, versionRef);
+    if (newConstValue === null) {
+        lib_core.warning(`[lisan] apply: (${file}) skipping ${candidate.dep.name} — latest version ` +
+            `${candidate.latest} is incompatible with template prefix ` +
+            `"${versionRef.templatePrefix}" / suffix "${versionRef.templateSuffix}"`);
+        return null;
+    }
+    // Guard against a fuzzed/stale versionRef where nodeEnd < nodeStart — that produces a
+    // negative `length` in the OffsetRewrite. apply.ts would catch the negative length and
+    // throw, but that throw aborts ALL co-located edits in the same file rather than just
+    // this candidate. Return null here so only the malformed candidate is skipped and valid
+    // siblings in the same MODULE.bazel proceed normally.
+    if (versionRef.nodeEnd < versionRef.nodeStart) {
+        lib_core.warning(`[lisan] apply: (${file}) skipping ${candidate.dep.name} — degenerate versionRef offsets ` +
+            `(nodeEnd=${versionRef.nodeEnd} < nodeStart=${versionRef.nodeStart})`);
+        return null;
+    }
+    const q = versionRef.quote ?? '"';
+    // The offset arithmetic (`nodeStart-1`, `nodeEnd+1`) assumes exactly one quote char
+    // on each side of the literal.  Triple-quoted strings (""" or ''') have 3-char delimiters
+    // and would produce an offset that lands inside the opening """ — corrupting the file.
+    // The Starlark parser does not emit VersionRef for triple-quoted strings (resolveVersionExpr
+    // returns null for them), so in practice q.length > 1 only if a fuzzed/malformed versionRef
+    // reaches here.  Return null rather than silently produce a bad offset.
+    if (q.length !== 1) {
+        lib_core.warning(`[lisan] apply: (${file}) skipping ${candidate.dep.name} — unsupported quote style ` +
+            `(${JSON.stringify(q)}); offset arithmetic requires exactly one quote char on each side`);
+        return null;
+    }
+    // Compute the expected bytes for the stale-offset guard.
+    // When `content` is provided (preferred path — like docker/k8s), slice the exact
+    // bytes from the file content at discovery-time offsets. This avoids the lossy
+    // round-trip of reconstructing expected from versionRef.value via computeNewConstantValue,
+    // which can trigger the stale-offset guard spuriously when the file content bytes
+    // differ from the reconstructed string in any way.
+    // When `content` is absent (e.g. callers that do not have content available), fall
+    // back to the old reconstruction logic for backward compatibility.
+    let expected;
+    if (content !== undefined) {
+        // nodeStart is the first char INSIDE the quotes; nodeStart-1 is the opening quote.
+        // nodeEnd is the exclusive end INSIDE the quotes; nodeEnd+1 is after the closing quote.
+        expected = content.slice(versionRef.nodeStart - 1, versionRef.nodeEnd + 1);
+    }
+    else {
+        const oldLiteral = computeNewConstantValue(versionRef.value, versionRef);
+        if (oldLiteral === null) {
+            lib_core.warning(`[lisan] apply: (${file}) skipping ${candidate.dep.name} — ` +
+                `cannot compute oldLiteral for stale-offset expected bytes: ` +
+                `versionRef.value=${JSON.stringify(versionRef.value)} is incompatible with template ` +
+                `"${versionRef.templatePrefix}%s${versionRef.templateSuffix}"`);
+            return null;
+        }
+        expected = `${q}${oldLiteral}${q}`;
+    }
+    return {
+        offset: versionRef.nodeStart - 1,
+        length: versionRef.nodeEnd - versionRef.nodeStart + 2,
+        replace: `${q}${versionPrefix ?? ""}${newConstValue}${q}`,
+        expected,
+    };
+}
+// extractSpecifier/stripInnerSpecifier: extract the Cargo specifier prefix from a quoted
+// replace string like '"=1.2.3"'. Only used for conflict resolution between multiple
+// deps sharing a constant — the specifier is part of the replace string by design
+// (buildConstantRewrite includes the versionPrefix in the replace: field).
+// This regex is intentionally Cargo-specific and lives here because resolveConflictingReplaces
+// is only called for offset-based rewrites produced by Starlark/Rust/Java Bazel paths.
+// Regex: consume any sequence of =^~<> and surrounding whitespace.
+const SPECIFIER_RE_INNER = /^([=^~<>\s]+)/;
+const extractSpecifier = (r) => (SPECIFIER_RE_INNER.exec(r.slice(1, -1))?.[1] ?? "").trim();
+const stripInnerSpecifier = (r) => r.slice(1, -1).replace(SPECIFIER_RE_INNER, "");
+/**
+ * Resolve a set of conflicting replace-strings that all target the same constant literal
+ * (same offset/length). Picks the semver-minimum replacement that is safe for all
+ * referencing deps, handling Cargo-style specifier prefixes. Returns null to drop the
+ * group entirely when the conflict cannot be safely resolved.
+ */
+function resolveConflictingReplaces(candidates, offset, file) {
+    // Multiple deps share this constant but want different versions. Pick the semver
+    // minimum — the highest version that is safe for all referencing deps (each dep's
+    // resolveLatest already accepted this version as age-compliant).
+    const distinctSpecifiers = new Set(candidates.map(extractSpecifier));
+    // If any dep uses an exact-pin specifier (=) alongside range specifiers, we
+    // cannot safely pick one version for all consumers — an exact pin forces a
+    // specific version that may be outside another dep's accepted range entirely
+    // (e.g. =1.2.0 and ^2.0.0 share a constant; writing "=1.2.0" breaks ^2.x).
+    if (distinctSpecifiers.size > 1 && [...distinctSpecifiers].some((s) => s === "=")) {
+        lib_core.warning(`[lisan] bazel-shared: (${file}) skipping shared constant at offset ${offset} — ` +
+            `conflicting exact-pin (=) and range specifiers cannot be safely reconciled: ` +
+            `${candidates.map((r) => JSON.stringify(r)).join(", ")}`);
+        return null;
+    }
+    // Also drop when ALL specifiers are exact-pin (=) but the inner versions differ —
+    // writing the minimum "=X.Y.Z" to a dep that requires "=A.B.C" (different exact pin)
+    // would break it, because "=" means exactly that version, not "at least".
+    if ([...distinctSpecifiers].every((s) => s === "=")) {
+        const innerVersions = new Set(candidates.map(stripInnerSpecifier));
+        if (innerVersions.size > 1) {
+            lib_core.warning(`[lisan] bazel-shared: (${file}) skipping shared constant at offset ${offset} — ` +
+                `all-exact-pin specifiers require different versions (${candidates.map((r) => JSON.stringify(r)).join(", ")}); cannot reconcile`);
+            return null;
+        }
+    }
+    // Use pickSemverMin so 2-segment Maven/BCR versions like "4.13" or "2.21" compare
+    // correctly (semver.valid rejects them, causing the whole group to be dropped).
+    if (!allVersionsComparable(candidates.map(stripInnerSpecifier))) {
+        lib_core.warning(`[lisan] apply: (${file}) skipping conflicting rewrites at offset ${offset} ` +
+            `(shared constant referenced by deps resolving to different versions: ` +
+            `${candidates.map((r) => JSON.stringify(r)).join(", ")})`);
+        return null;
+    }
+    // pickSemverMin tracks the winning candidate by index (via identity), avoiding
+    // indexOf mis-matches when two candidates share the same inner version string.
+    const minReplace = pickSemverMin(candidates, stripInnerSpecifier);
+    if (!minReplace) {
+        lib_core.warning(`[lisan] apply: (${file}) skipping conflicting rewrites at offset ${offset} — no comparable version found`);
+        return null;
+    }
+    lib_core.warning(`[lisan] apply: (${file}) shared constant at offset ${offset} proposed by multiple deps ` +
+        `(${candidates.map((r) => JSON.stringify(r)).join(", ")}); ` +
+        `using minimum ${JSON.stringify(minReplace)} to satisfy all`);
+    // Warn when candidates carry more than one distinct Cargo specifier so the
+    // user can verify the written specifier is correct for all referencing deps.
+    if (distinctSpecifiers.size > 1) {
+        const chosenSpecifier = extractSpecifier(minReplace);
+        const chosenInner = stripInnerSpecifier(minReplace);
+        lib_core.warning(`[lisan] bazel-shared: shared constant at offset ${offset} has mixed Cargo specifiers ` +
+            `(${[...distinctSpecifiers].map((s) => JSON.stringify(s || "(none)")).join(", ")}); ` +
+            `writing specifier "${chosenSpecifier || "(none)"}" version "${chosenInner}" — ` +
+            `verify Cargo resolution is still correct for all referencing deps`);
+    }
+    return minReplace;
+}
+/**
+ * Deduplicate offset-based rewrites targeting the same range (i.e. rewrites
+ * to a shared constant value literal that multiple deps reference). Rules:
+ *   - If all rewrites agree on the replacement text → emit one.
+ *   - If they disagree and all proposed values are valid semver → pick the semver
+ *     minimum (the highest version safe for all referencing deps) and warn.
+ *   - If they disagree and the values are not all valid semver → drop all with a warning
+ *     (non-semver constant values like partial template fragments can't be safely compared).
+ *
+ * Non-constant (unique-position) rewrites are passed through unchanged.
+ */
+/**
+ * Reconcile a set of rewrites, deduplicating offset-based rewrites that target the
+ * same constant literal node and resolving conflicts via semver-minimum selection.
+ *
+ * @param templateKeys — optional map from OffsetRewrite object → `"prefix:suffix"` template
+ *   key (as produced by `buildBazelVersionEdits`/`buildJavaEdits`). When provided, any
+ *   offset group whose entries carry different template keys is dropped with a warning
+ *   instead of trying to reconcile replace-strings that are in incompatible "value spaces"
+ *   (e.g. bare full version vs. inner value stripped of its template prefix).
+ *
+ *   When `templateKeys` is NOT provided (e.g. called from the cross-ecosystem merge in
+ *   run.ts), the function is fail-closed: any offset group with more than one distinct
+ *   `replace` value is dropped with a warning rather than attempting a semver-minimum pick
+ *   across potentially incompatible template value-spaces. Only groups where all rewrites
+ *   agree on an identical `replace` string (exact-pin case) are allowed through.
+ */
+/**
+ * Precondition: every rewrite in `rewrites` must originate from `file`. The Rewrite
+ * union (OffsetRewrite/StringRewrite, see types.ts) carries no per-item file
+ * identity, so this cannot be checked from `rewrites` alone — offset:length grouping
+ * below assumes the caller already scoped the batch to a single file (as
+ * `buildConstantEditsForFile` does, which asserts this on its `candidates` input).
+ * Passing rewrites from multiple files would silently merge unrelated offset
+ * ranges that happen to collide.
+ */
+function reconcileConstantRewrites(rewrites, file, templateKeys) {
+    // Separate offset-based from string-based; only offset-based can conflict.
+    // Shared triage warns and skips malformed rewrites rather than dropping silently.
+    const { offsetRewrites, stringRewrites } = partitionRewrites(rewrites, file);
+    // Group by (offset, length) — each unique range should produce one replacement.
+    // In practice all rewrites to a shared constant reference the identical literal node,
+    // so ranges are always exactly equal (never merely overlapping).
+    const groups = new Map();
+    for (const rw of offsetRewrites) {
+        const key = `${rw.offset}:${rw.length}`;
+        const tk = templateKeys?.get(rw);
+        const existing = groups.get(key);
+        if (existing) {
+            // Invariant: all rewrites in the same offset group must agree on `expected` —
+            // they all reference the same literal bytes in the file. If they disagree, the
+            // stale-offset guard in apply.ts would fire against the wrong bytes, letting a
+            // corrupt write through. Warn and skip the conflicting rewrite rather than
+            // silently discarding one `expected` in favour of another.
+            if (rw.expected !== existing.expected) {
+                lib_core.warning(`[lisan] apply: (${file}) skipping offset-rewrite at ${rw.offset}:${rw.length} — ` +
+                    `conflicting "expected" bytes (${JSON.stringify(rw.expected.slice(0, 60))} vs ` +
+                    `${JSON.stringify(existing.expected.slice(0, 60))}); cannot safely determine which is current`);
+                continue;
+            }
+            // Detect mixed-template groups: if this entry's template key differs from the
+            // first entry's, the replace-strings are in incompatible value spaces. Mark the
+            // group for dropping rather than trying to pickSemverMin across incompatible spaces.
+            if (templateKeys && tk !== existing.templateKey) {
+                existing.templateMixed = true;
+            }
+            existing.replaces.add(rw.replace);
+        }
+        else {
+            const group = {
+                offset: rw.offset, length: rw.length, expected: rw.expected,
+                replaces: new Set(),
+                templateKey: tk,
+                templateMixed: false,
+            };
+            group.replaces.add(rw.replace);
+            groups.set(key, group);
+        }
+    }
+    const reconciledOffsets = [];
+    for (const { offset, length, expected, replaces, templateMixed } of groups.values()) {
+        if (templateMixed) {
+            // The same constant literal is referenced both as a bare version and via a template
+            // — the replace-strings are in incompatible value spaces. Attempting to pick a
+            // minimum would corrupt one consumer. Drop the group; reconcileConstantGroups in
+            // run.ts already prevents this in the normal flow, so this guards future callers.
+            lib_core.warning(`[lisan] apply: (${file}) skipping constant at ${offset}:${length} — ` +
+                `conflicting template/bare references that cannot be safely reconciled`);
+            continue;
+        }
+        if (replaces.size === 1) {
+            reconciledOffsets.push({ offset, length, expected, replace: [...replaces][0] });
+        }
+        else if (!templateKeys) {
+            // templateKeys unavailable — called from the cross-ecosystem merge in run.ts.
+            // We cannot distinguish template-mixing from a legitimate semver conflict without
+            // knowing the template key for each rewrite. Fail-closed: drop any conflicting
+            // group to avoid template-space corruption rather than attempting a semver-minimum
+            // pick across potentially incompatible value-spaces.
+            lib_core.warning(`[lisan] apply: (${file}) templateKeys unavailable — dropping conflicting constant ` +
+                `group at ${offset}:${length} to avoid template-space corruption ` +
+                `(${[...replaces].map((r) => JSON.stringify(r)).join(", ")})`);
+        }
+        else {
+            const replace = resolveConflictingReplaces([...replaces], offset, file);
+            if (replace !== null)
+                reconciledOffsets.push({ offset, length, expected, replace });
+        }
+    }
+    const allRewrites = [...reconciledOffsets, ...stringRewrites];
+    return { rewrites: allRewrites };
+}
+/**
+ * Return the composite `"offset:length"` key for the OffsetRewrite that
+ * `buildBazelVersionEdits` / `buildConstantRewrite` will emit for this candidate,
+ * or undefined when the position has no versionRef (string-rewrite or missing data).
+ *
+ * Used by the attribution pass in `run.ts` so that the key computation lives in
+ * exactly one place — next to the formula in `buildConstantRewrite` — rather than
+ * being duplicated in `expectedOffsetKeyOf`. Matches `${rw.offset}:${rw.length}`
+ * produced by `buildConstantRewrite`: offset = nodeStart-1, length = nodeEnd-nodeStart+2.
+ */
+function bazel_shared_rewriteKeyOf(candidate) {
+    const pos = candidate.dep.position;
+    const vr = pos?.versionRef;
+    if (!vr || typeof vr.nodeStart !== "number" || typeof vr.nodeEnd !== "number")
+        return undefined;
+    if (vr.nodeEnd < vr.nodeStart)
+        return undefined;
+    return `${vr.nodeStart - 1}:${vr.nodeEnd - vr.nodeStart + 2}`;
+}
+/**
+ * Read a file's content for use as the `content` argument to buildConstantRewrite,
+ * so the exact expected bytes are sliced from the file rather than reconstructed
+ * from versionRef fields (the drift-prone fallback path). Strips a leading BOM (if
+ * present) so sliced offsets align with the parser's BOM-free view.
+ *
+ * Shared by every Starlark-constant-rewriting ecosystem (rust/bazel via
+ * buildBazelVersionEdits, java via buildFileEdits) so the read/BOM-strip/warn
+ * behavior cannot drift between them.
+ */
+async function readFileForConstantEdits(file) {
+    try {
+        const raw = await promises_namespaceObject.readFile(file);
+        const str = raw.toString("utf8");
+        return str.startsWith("\uFEFF") ? str.slice(1) : str;
+    }
+    catch {
+        // File unreadable at apply time — fall back to offset reconstruction.
+        lib_core.warning(`[lisan] bazel: could not read ${file} for expected-byte slicing; falling back to reconstruction`);
+        return undefined;
+    }
+}
+/**
+ * Build the reconciled rewrite list for a single file's worth of versionRef candidates,
+ * plus any pre-built string-based rewrites (e.g. java's inline-literal-coord replacements).
+ *
+ * Shared by buildBazelVersionEdits (rust/bazel) and java's buildFileEdits so both use the
+ * same content-slice path through buildConstantRewrite and the same reconciliation pass,
+ * instead of java reimplementing this loop against the lossier no-content fallback.
+ */
+function buildConstantEditsForFile(candidates, file, content, extraRewrites = []) {
+    const rawRewrites = [...extraRewrites];
+    const templateKeys = new Map();
+    for (const candidate of candidates) {
+        // Dev-time guard: reconcileConstantRewrites (called below) groups the rewrites built
+        // here by "offset:length" alone, assuming every candidate targets the same `file`. A
+        // future caller passing mixed-file candidates would silently merge unrelated offset
+        // ranges. Skip (rather than throw) to stay consistent with this file's fail-safe,
+        // warn-and-skip style for malformed input.
+        if (candidate.dep.file !== file) {
+            lib_core.warning(`[lisan] bazel: (${file}) skipping ${candidate.dep.name} — candidate.dep.file ` +
+                `${JSON.stringify(candidate.dep.file)} does not match the file being processed; ` +
+                `buildConstantEditsForFile requires all candidates to target the same file`);
+            continue;
+        }
+        const pos = candidate.dep.position;
+        const { versionRef, versionPrefix } = pos;
+        const raw = buildConstantRewrite(candidate, versionRef, versionPrefix, file, content);
+        if (raw === null)
+            continue;
+        rawRewrites.push(raw);
+        templateKeys.set(raw, `${versionRef.templatePrefix}:${versionRef.templateSuffix}`);
+    }
+    const { rewrites } = reconcileConstantRewrites(rawRewrites, file, templateKeys);
+    return rewrites;
+}
+async function buildBazelVersionEdits(candidates) {
+    // Group by file
+    const byFile = new Map();
+    for (const candidate of candidates) {
+        const pos = candidate.dep.position;
+        const arr = byFile.get(pos.file) ?? [];
+        arr.push(candidate);
+        byFile.set(pos.file, arr);
+    }
+    const edits = [];
+    for (const [file, fileCandidates] of byFile) {
+        const content = await readFileForConstantEdits(file);
+        const rewrites = buildConstantEditsForFile(fileCandidates, file, content);
+        if (rewrites.length > 0)
+            edits.push({ file, rewrites });
+    }
+    return edits;
+}
+//# sourceMappingURL=bazel-shared.js.map
 ;// CONCATENATED MODULE: ./out/update/ecosystems/rust.js
 
 
@@ -97371,6 +97749,7 @@ async function rust_buildFileEdits(candidates, style) {
 }
 //# sourceMappingURL=rust.js.map
 ;// CONCATENATED MODULE: ./out/update/ecosystems/java.js
+
 
 
 
@@ -97462,26 +97841,20 @@ async function java_discover(opts) {
     }
     return deps;
 }
-function java_buildFileEdits(candidates, style) {
+async function java_buildFileEdits(candidates, style) {
     void style; // semver-only ecosystem; style (sha vs preserve) does not apply
     const byFile = groupByFile(candidates);
     const edits = [];
     for (const [file, fileCandidates] of byFile) {
-        const rawRewrites = [];
-        const templateKeys = new Map();
+        const versionRefCandidates = [];
+        const extraRewrites = [];
         for (const candidate of fileCandidates) {
             const pos = candidate.dep.position;
             if (pos.versionRef) {
-                // Constant/interpolated version → offset-based rewrite of the constant literal.
-                // Uses the shared helper (same as rust/bazel) which correctly fails-closed when
-                // the old literal bytes cannot be computed (rather than the unsafe ?? fallback
-                // that would build a wrong `expected` and trip the stale-offset guard for ALL
-                // co-located rewrites in the same file).
-                const raw = buildConstantRewrite(candidate, pos.versionRef, undefined, file);
-                if (raw === null)
-                    continue;
-                rawRewrites.push(raw);
-                templateKeys.set(raw, `${pos.versionRef.templatePrefix}:${pos.versionRef.templateSuffix}`);
+                // Constant/interpolated version → offset-based rewrite of the constant literal,
+                // built below via the shared bazel-shared.ts helper (same content-slice path as
+                // rust/bazel) rather than the lossy no-content reconstruction fallback.
+                versionRefCandidates.push(candidate);
             }
             else if (pos.artifactRaw) {
                 // Inline literal coord → string-replace the old coord with the new one.
@@ -97489,15 +97862,26 @@ function java_buildFileEdits(candidates, style) {
                 const parts = oldCoord.split(":");
                 if (parts.length < 3)
                     continue;
+                // Legal Maven versions cannot contain ":", but candidate.latest originates from a
+                // registry response that could theoretically be malformed. Writing a ":"-containing
+                // value into parts[2] before join(":") would corrupt the coordinate (e.g.
+                // "group:artifact:2.0.0:junk"). Fail closed rather than risk a silent corruption.
+                if (candidate.latest.includes(":")) {
+                    lib_core.warning(`[lisan] java: (${file}) skipping ${candidate.dep.name} — latest version ` +
+                        `${JSON.stringify(candidate.latest)} contains ":" and cannot be safely written ` +
+                        `into the group:artifact:version coordinate`);
+                    continue;
+                }
                 parts[2] = candidate.latest;
                 const newCoord = parts.join(":");
-                rawRewrites.push({
+                extraRewrites.push({
                     search: oldCoord,
                     replace: newCoord,
                 });
             }
         }
-        const { rewrites } = reconcileConstantRewrites(rawRewrites, file, templateKeys);
+        const content = await readFileForConstantEdits(file);
+        const rewrites = buildConstantEditsForFile(versionRefCandidates, file, content, extraRewrites);
         if (rewrites.length > 0)
             edits.push({ file, rewrites });
     }
@@ -97654,16 +98038,7 @@ const ECOSYSTEM_REGISTRY = {
 };
 const SUPPORTED_ECOSYSTEMS = new Set(Object.keys(ECOSYSTEM_REGISTRY));
 //# sourceMappingURL=ecosystem-registry.js.map
-;// CONCATENATED MODULE: ./out/update/ecosystems.js
-/**
- * Ecosystems supported by the update CLI. Kept in a leaf module so the verify
- * action can import this set without pulling in the rest of the updater.
- *
- * Re-exported from ecosystem-registry.ts, which is the single source of truth.
- */
-
-//# sourceMappingURL=ecosystems.js.map
-;// CONCATENATED MODULE: ./out/update/run.js
+;// CONCATENATED MODULE: ./out/update/dispatch.js
 
 
 
@@ -97672,54 +98047,16 @@ const SUPPORTED_ECOSYSTEMS = new Set(Object.keys(ECOSYSTEM_REGISTRY));
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/** Thrown when the user cancels the interactive prompt — callers should exit 0, not 1. */
-class UserCancelledError extends Error {
-    constructor() { super("Cancelled."); this.name = "UserCancelledError"; }
-}
-/**
- * Returns true when an originally-unpinned OCI image should bypass the age gate.
- * Pinning a mutable tag to its current digest introduces no new content — it
- * freezes what the user is already running — so the age gate's purpose does not
- * apply. Already-pinned images (wasUnpinned=false) stay fail-closed regardless.
- */
-function shouldBypassAgeGate(wasUnpinned, pinUnpinned) {
-    return pinUnpinned && wasUnpinned;
-}
-/**
- * Format the age-gate failure clause shown in skip/warning messages.
- * Returns e.g. "14d old (< 28d min-age)" or "publish date unconfirmable".
- */
-function formatAgeClause(ageDays, minAgeDays) {
-    return ageDays !== null
-        ? `${ageDays}d old (< ${minAgeDays}d min-age)`
-        : "publish date unconfirmable";
-}
 const STARLARK_ECOSYSTEMS = new Set(Object.entries(ECOSYSTEM_REGISTRY).filter(([, v]) => v.isStarlark).map(([k]) => k));
 /** Single source of truth for discover/buildFileEdits/rewriteKeyOf dispatch. */
 const ECOSYSTEM_DISPATCH = {
     actions: {
         discover: (opts) => discover({ workflowFiles: opts.workflowFiles, token: opts.token }),
         buildFileEdits: (c, s) => buildFileEdits(c, s),
-        rewriteKeyOf: (c) => actions_rewriteKeyOf(c),
+        rewriteKeyOf: (c) => rewriteKeyOf(c),
     },
     docker: {
-        discover: (opts) => docker_discover({ dockerfiles: opts.dockerfiles }),
+        discover: (opts) => docker_discover({ dockerfiles: opts.dockerfiles, dockerhubMirror: opts.dockerhubMirror }),
         buildFileEdits: (c, s) => docker_buildFileEdits(c, s),
         rewriteKeyOf: (c) => docker_rewriteKeyOf(c),
     },
@@ -97731,17 +98068,17 @@ const ECOSYSTEM_DISPATCH = {
     rust: {
         discover: (opts) => rust_discover({ moduleBazel: opts.moduleBazel }),
         buildFileEdits: (c, s) => rust_buildFileEdits(c, s),
-        rewriteKeyOf: (c) => rewriteKeyOf(c),
+        rewriteKeyOf: (c) => bazel_shared_rewriteKeyOf(c),
     },
     java: {
         discover: (opts) => java_discover({ moduleBazel: opts.moduleBazel }),
         buildFileEdits: (c, s) => java_buildFileEdits(c, s),
-        rewriteKeyOf: (c) => rewriteKeyOf(c),
+        rewriteKeyOf: (c) => bazel_shared_rewriteKeyOf(c),
     },
     bazel: {
         discover: (opts) => bazel_discover({ moduleBazel: opts.moduleBazel }),
         buildFileEdits: (c, s) => bazel_buildFileEdits(c, s),
-        rewriteKeyOf: (c) => rewriteKeyOf(c),
+        rewriteKeyOf: (c) => bazel_shared_rewriteKeyOf(c),
     },
 };
 /** Read a dep/candidate's versionRef position (java + rust + bazel share this shape). */
@@ -97760,212 +98097,6 @@ function constantKeyOf(dep, realpaths) {
         return null;
     const file = realpaths?.get(dep.file) ?? dep.file;
     return `${file}::${vr.nodeStart}::${vr.nodeEnd}`;
-}
-/**
- * A Starlark constant (e.g. JACKSON_VERSION in MODULE.bazel) may be referenced by
- * multiple artifact/crate/module coords — potentially across ecosystems (e.g. a constant
- * shared by a maven.install artifact and a bazel_dep). All referencing deps must be able
- * to take the proposed target version before the upgrade is presented to the user.
- *
- * Groups by constant identity (file + literal offsets) across ALL Starlark ecosystems in
- * a single pass. Each missing dep is validated with the existence check appropriate for
- * its own ecosystem, so cross-ecosystem constants are correctly guarded.
- *
- * Mutates `candidates` in place — drops entries whose constant group is unresolvable.
- */
-async function reconcileConstantGroups(candidates, filteredDeps, existenceChecks, registries) {
-    const starlarkDeps = filteredDeps.filter((d) => STARLARK_ECOSYSTEMS.has(d.ecosystem));
-    if (starlarkDeps.length === 0)
-        return;
-    // Pre-resolve realpaths for all Starlark dep files so constantKeyOf agrees with
-    // Pass 9b's realpath-based edit merge. Without this, the same physical MODULE.bazel
-    // reachable via two different relative paths (e.g. via resolveModuleFiles includes)
-    // would produce different keys and bypass cross-ecosystem existence validation.
-    const fileRealpaths = await resolveDepRealpaths(starlarkDeps);
-    // Group all versionRef deps by constant identity (file + offsets of the literal)
-    // across all Starlark ecosystems so cross-ecosystem shared constants are caught.
-    const constantGroups = new Map();
-    for (const dep of starlarkDeps) {
-        const key = constantKeyOf(dep, fileRealpaths);
-        if (!key)
-            continue;
-        const vr = versionRefOf(dep);
-        let group = constantGroups.get(key);
-        if (!group) {
-            group = { deps: [], constantName: vr.constantName, hasReadOnlySiblings: false };
-            constantGroups.set(key, group);
-        }
-        if (vr.readOnly) {
-            // This dep is a read-only rpartition sibling — it derives its effective version from
-            // the shared constant via a lossy transform (e.g. CONST.rpartition(".")[0]).  We cannot
-            // validate the derived value without knowing the separator and the downstream package
-            // name, so mark the whole group unsafe to bump.
-            group.hasReadOnlySiblings = true;
-        }
-        group.deps.push(dep);
-    }
-    const droppedKeys = new Set();
-    for (const [key, group] of constantGroups) {
-        // Guard: if the deps sharing this constant use different templatePrefix/templateSuffix, the
-        // "reconcile in two value-spaces" bug is triggered — resolveLatest returns different full
-        // versions (prefix+value+suffix) per dep, so the semver-min of full versions is in a
-        // different space from the semver-min of stripped constant values. The written constant
-        // value may yield an effective version for some dep that was never existence-checked.
-        // Fail-safe: if templates diverge, drop the group rather than silently pick a wrong value.
-        const templates = new Set(group.deps.map((d) => {
-            const vr = versionRefOf(d);
-            return `${vr?.templatePrefix ?? ""}::${vr?.templateSuffix ?? ""}`;
-        }));
-        if (templates.size > 1) {
-            const constLabel = group.constantName ?? key;
-            lib_core.warning(`[lisan] Shared constant "${constLabel}": deps use different interpolation templates ` +
-                `(${[...templates].join(", ")}); cannot safely pick one constant value for all referencing deps — dropping group.`);
-            droppedKeys.add(key);
-            continue;
-        }
-        // M1: Guard against rpartition-derived read-only sibling refs.  If the constant is shared
-        // with a dep whose effective version is derived via CONST.rpartition(SEP)[N], bumping the
-        // constant produces a new derived value (e.g. "2.20" from "2.20.7") that was never
-        // existence-checked.  We cannot safely validate the derived value without knowing the
-        // separator and downstream package name, so drop the group rather than risk writing a
-        // version that doesn't exist or is too young.
-        if (group.hasReadOnlySiblings) {
-            const constLabel = group.constantName ?? key;
-            lib_core.warning(`[lisan] Shared constant "${constLabel}" is referenced by a read-only rpartition sibling dep ` +
-                `whose derived version cannot be validated — dropping group to avoid writing an unchecked version.`);
-            droppedKeys.add(key);
-            continue;
-        }
-        const groupCandidates = candidates.filter((c) => {
-            if (!STARLARK_ECOSYSTEMS.has(c.dep.ecosystem))
-                return false;
-            return constantKeyOf(c.dep, fileRealpaths) === key;
-        });
-        if (groupCandidates.length === 0)
-            continue;
-        // Proposed target: semver-minimum of all candidates (matches reconcileConstantRewrites).
-        // Use semver.coerce so 2-segment versions ("4.13", "2.21") compare correctly —
-        // semver.valid rejects them and would fall through to the arbitrary [0].latest fallback.
-        // When coerce returns null for all candidates (no comparable version), drop the group
-        // rather than blindly writing groupCandidates[0].latest which may not exist elsewhere.
-        // Use pickSemverMin (same impl as reconcileConstantRewrites) so the "highest
-        // version safe for all referencing deps" selection is a single code path.
-        // M2: Precondition — every candidate's latest must be coercible to semver before calling
-        // pickSemverMin.  pickSemverMin silently skips non-coercible entries and returns the min
-        // of the rest, so if one candidate's latest is non-semver the returned minimum may exceed
-        // what that dep accepts.  Uses the shared allVersionsComparable predicate from bazel-shared.ts
-        // so this check and resolveConflictingReplaces's check are the same code path.
-        if (!allVersionsComparable(groupCandidates.map((c) => c.latest))) {
-            const constLabel = group.constantName ?? key;
-            lib_core.warning(`[lisan] Shared constant "${constLabel}": some candidates have non-coercible versions ` +
-                `(${groupCandidates.map((c) => c.latest).join(", ")}); cannot safely pick a semver minimum — dropping group.`);
-            droppedKeys.add(key);
-            continue;
-        }
-        // Filter out prerelease candidates before picking the semver minimum —
-        // a prerelease minimum would break stable-dep consumers that don't accept pre-releases.
-        const stableGroupCandidates = groupCandidates.filter((c) => !isPrerelease(c.latest));
-        const candidatesForMin = stableGroupCandidates.length > 0 ? stableGroupCandidates : groupCandidates;
-        const minCandidate = pickSemverMin(candidatesForMin, (c) => c.latest);
-        if (minCandidate === null) {
-            // No comparable version — can't safely pick a minimum.
-            const constLabel = group.constantName ?? key;
-            lib_core.warning(`[lisan] Shared constant "${constLabel}": all candidates have non-semver versions ` +
-                `(${groupCandidates.map((c) => c.latest).join(", ")}); dropping group.`);
-            droppedKeys.add(key);
-            continue;
-        }
-        const proposedVersion = minCandidate.latest;
-        // Find referencing deps that produced no candidate — they weren't validated by resolveLatest.
-        // Key on the full DepRef identity (ecosystem + name + file) to avoid false matches when
-        // two different ecosystems happen to share a dep name (e.g. "com.example:foo" in both
-        // java and rust contexts — unlikely but theoretically possible with custom ecosystems).
-        const depIdentityKey = (d) => `${d.ecosystem}|||${d.name}|||${d.file}`;
-        const depsWithCandidate = new Set(groupCandidates.map((c) => depIdentityKey(c.dep)));
-        const missingDeps = group.deps.filter((d) => !depsWithCandidate.has(depIdentityKey(d)));
-        // Also validate candidates whose own `latest` differs from `proposedVersion` (the
-        // semver-minimum) — a cross-ecosystem scenario where rust and java both have candidates
-        // but resolved to different versions means the minimum may not exist in one registry.
-        const candidatesWithDifferentLatest = groupCandidates.filter((c) => c.latest !== proposedVersion);
-        const depsToValidate = [
-            ...missingDeps,
-            ...candidatesWithDifferentLatest.map((c) => c.dep),
-        ];
-        if (depsToValidate.length === 0)
-            continue;
-        // Confirm the proposed version actually exists for each dep that wasn't validated
-        // at proposedVersion, using the existence check appropriate for that dep's ecosystem.
-        // Wrap each check in try/catch — a transient registry error must fail-closed
-        // (treat the version as non-existent and drop the group) rather than propagating
-        // out of reconcileConstantGroups and aborting the entire update run.
-        const unresolvable = [];
-        // Run existence checks concurrently — JS is single-threaded so concurrent
-        // pushes to `unresolvable` are safe; order of results is irrelevant here.
-        await concurrency_runBatched(depsToValidate.map((dep) => async () => {
-            const check = existenceChecks.get(dep.ecosystem);
-            if (!check) {
-                // No existence check registered for this ecosystem — fail-closed: treat as non-existent
-                // rather than silently approving the dep. In practice STARLARK_ECOSYSTEMS and
-                // existenceChecks are kept in sync; this guard fires only if they drift.
-                unresolvable.push(dep.name);
-                return;
-            }
-            // The maven repos fallback only applies to java — rust/bazel existence checks
-            // ignore the repos parameter entirely.
-            const repos = dep.ecosystem === "java"
-                ? (dep.repositories?.length ? dep.repositories : [registries.maven])
-                : (dep.repositories ?? []);
-            try {
-                const exists = await check(dep.name, proposedVersion, repos, registries);
-                if (!exists)
-                    unresolvable.push(dep.name);
-            }
-            catch (err) {
-                lib_core.warning(`[lisan] reconcileConstantGroups: existence check failed for ` +
-                    `${dep.ecosystem}:${dep.name}@${proposedVersion}: ` +
-                    `${err instanceof Error ? err.message : String(err)} — treating as non-existent`);
-                unresolvable.push(dep.name);
-            }
-        }), RESOLVE_CONCURRENCY);
-        if (unresolvable.length > 0) {
-            const constLabel = group.constantName ?? key;
-            const listing = groupCandidates.map((c) => `${c.dep.name}: ${c.dep.current} → ${proposedVersion}`).join(", ");
-            lib_core.warning(`[lisan] Shared constant "${constLabel}" not bumped: ` +
-                `${unresolvable.join(", ")} has no version ${proposedVersion}. ` +
-                `Dropping: ${listing}`);
-            droppedKeys.add(key);
-        }
-    }
-    // Remove candidates whose constant was dropped (iterate in reverse to safely splice)
-    if (droppedKeys.size > 0) {
-        for (let i = candidates.length - 1; i >= 0; i--) {
-            const c = candidates[i];
-            if (!STARLARK_ECOSYSTEMS.has(c.dep.ecosystem))
-                continue;
-            const key = constantKeyOf(c.dep, fileRealpaths);
-            if (key && droppedKeys.has(key))
-                candidates.splice(i, 1);
-        }
-    }
-}
-/** Maven existence check for the java ecosystem. */
-const javaExistenceCheck = (name, version, repos, registries) => {
-    const [g, a] = name.split(":");
-    if (!g || !a)
-        return Promise.resolve(false);
-    return mavenArtifactExists(g, a, version, repos, registries);
-};
-/** crates.io existence check for the rust ecosystem. */
-const rustExistenceCheck = async (name, version, _repos, registries) => {
-    const versions = await cratesVersions(name, registries);
-    return versions.some((v) => v.version === version);
-};
-/** Build a BCR existence check for the bazel ecosystem bound to a token + URL. */
-function makeBazelExistenceCheck(token, bcrUrl) {
-    return async (name, version) => {
-        const versions = await bcrVersions(name, token, bcrUrl);
-        return versions.some((v) => v.version === version);
-    };
 }
 /**
  * Return a composite `"offset:length"` key identifying the OffsetRewrite a candidate
@@ -98001,324 +98132,37 @@ function expectedSearchStringOf(candidate) {
     const raw = pos?.artifactRaw;
     return typeof raw === "string" ? raw : undefined;
 }
-// ── buildAndApplyEdits phases ─────────────────────────────────────────────────
-//
-// The write pipeline is decomposed into five independently-testable helpers.
-// buildAndApplyEdits (the orchestrator, ~30 lines) calls them in order.
-/**
- * Phase 1: build FileEdits per ecosystem.
- * Multiple ecosystems (rust/java/bazel) may edit the same MODULE.bazel — they are
- * merged later; this phase just collects all edits and records build failures.
- * A co-targeting warning is emitted when a build-failed ecosystem shares source
- * files with a successful one (the file will still be written by the other ecosystem).
- */
-async function buildEditsByEcosystem(selected, style) {
-    const allEdits = [];
-    const failed = [];
-    const byEcosystem = new Map();
-    for (const candidate of selected) {
-        const eco = candidate.dep.ecosystem;
-        const arr = byEcosystem.get(eco) ?? [];
-        arr.push(candidate);
-        byEcosystem.set(eco, arr);
-    }
-    for (const [eco, ecoCandidates] of byEcosystem) {
-        try {
-            const dispatch = ECOSYSTEM_DISPATCH[eco];
-            if (!dispatch) {
-                lib_core.warning(`[lisan] no buildFileEdits for ecosystem: ${eco}`);
-                continue;
-            }
-            allEdits.push(...await dispatch.buildFileEdits(ecoCandidates, style));
-        }
-        catch (err) {
-            lib_core.warning(`[lisan] failed to build edits for ${eco}: ${err instanceof Error ? err.message : String(err)}`);
-            failed.push(...ecoCandidates);
-        }
-    }
-    if (failed.length > 0) {
-        const failedFiles = new Set(failed.map((c) => c.dep.file));
-        const successFiles = new Set(allEdits.map((e) => e.file));
-        for (const f of failedFiles) {
-            if (successFiles.has(f)) {
-                lib_core.warning(`[lisan] (${f}) will be written by a co-targeting ecosystem despite ` +
-                    `a build failure in another — review the resulting diff carefully`);
-            }
-        }
-    }
-    return { allEdits, failed, buildFailedSet: new Set(failed) };
+/** Resolve a file's realpath, falling back to the given path itself if the syscall fails
+ * (e.g. the file doesn't exist yet, or a permissions issue) — realpath resolution is an
+ * optimization for collapsing symlink aliases, not a correctness requirement. */
+async function realpathOr(file) {
+    return promises_namespaceObject.realpath(file).catch(() => file);
 }
 /**
- * Phase 2: group edits by realpath so multiple ecosystems targeting the same
- * physical file have their rewrites merged into a single write operation.
- * Also builds fileToRealpath for later candidate classification without extra syscalls.
+ * Resolve filesystem realpaths for all Starlark-ecosystem dep files.
+ * Shared by run() and reconcileConstantGroups so both use identical keys.
+ * Only Starlark deps are processed; non-Starlark entries are ignored.
  */
-async function mergeEditsByRealpath(allEdits) {
-    const editsByRealpath = new Map();
-    const fileToRealpath = new Map();
-    for (const edit of allEdits) {
-        const realpath = await promises_namespaceObject.realpath(edit.file).catch(() => edit.file);
-        fileToRealpath.set(edit.file, realpath);
-        const existing = editsByRealpath.get(realpath);
-        if (existing) {
-            existing.rewrites = [...existing.rewrites, ...edit.rewrites];
+async function resolveDepRealpaths(deps) {
+    const depRealpaths = new Map();
+    await Promise.all(deps
+        .filter((d) => STARLARK_ECOSYSTEMS.has(d.ecosystem))
+        .map(async (d) => {
+        if (!depRealpaths.has(d.file)) {
+            depRealpaths.set(d.file, await realpathOr(d.file));
         }
-        else {
-            editsByRealpath.set(realpath, { file: edit.file, rewrites: [...edit.rewrites] });
-        }
-    }
-    return { editsByRealpath, fileToRealpath };
+    }));
+    return depRealpaths;
 }
-/**
- * Phase 3: validate and build content strings in memory.
- * Calls reconcileConstantRewrites (dedup/conflict-resolution for cross-ecosystem
- * rewrites on the same constant), then buildFileContent (bounds/overlap/stale-offset).
- * If ANY file fails, it is recorded in failedRealpaths; computedContents contains
- * only the files that passed. No disk writes happen here — failures abort in Phase 5.
- */
-async function computeAndReconcileEdits(editsByRealpath) {
-    const computedContents = new Map();
-    const failedRealpaths = new Set();
-    for (const [realpath, { file, rewrites }] of editsByRealpath) {
-        try {
-            // reconcileConstantRewrites deduplicates offset-based rewrites from different
-            // ecosystems targeting the same constant literal, picking the semver-minimum on
-            // conflict. buildBazelVersionEdits already calls it for single-ecosystem dedup;
-            // this second call (idempotent for size-1 groups) handles cross-ecosystem cases
-            // where rust + java + bazel each emit a rewrite for the same MODULE.bazel constant.
-            const { rewrites: merged } = reconcileConstantRewrites(rewrites, file);
-            const { content, appliedSearches } = await buildFileContent({ file, rewrites: merged });
-            computedContents.set(realpath, { file, content, rewrites: merged, appliedSearches });
-        }
-        catch (err) {
-            lib_core.warning(`[lisan] failed to build edits for ${file}: ${err instanceof Error ? err.message : String(err)}`);
-            failedRealpaths.add(realpath);
-        }
-    }
-    return { computedContents, failedRealpaths };
-}
-/**
- * Phase 4: attribute surviving rewrites back to candidates (post-reconcile).
- * Must run AFTER Phase 3 so offsets dropped by reconcileConstantRewrites correctly
- * demote their candidates to noEdits rather than being misclassified as applied via
- * a sibling dep's write on the same file.
- *
- * Tracks by "offset:length" composite keys (OffsetRewrite) or search strings
- * (StringRewrite — java inline literals). A bare offset key would falsely attribute
- * a candidate whose rewrite was dropped if an unrelated rewrite at the same start
- * offset (but different length) survived in the same file.
- */
-function attributeRewrites(selected, computedContents, fileToRealpath, buildFailedSet) {
-    const survivingOffsetKeysByRealpath = new Map();
-    const survivingSearchesByRealpath = new Map();
-    for (const [realpath, { rewrites: survived, appliedSearches }] of computedContents) {
-        const offsetKeys = new Set();
-        for (const r of survived) {
-            if ("offset" in r)
-                offsetKeys.add(`${r.offset}:${r.length}`);
-        }
-        survivingOffsetKeysByRealpath.set(realpath, offsetKeys);
-        // Use appliedSearches from buildFileContent — reflects searches that were actually
-        // applied (not skipped due to ambiguity). Building from `survived` (merged rewrites
-        // before apply) would incorrectly mark ambiguous-skipped candidates as "applied".
-        survivingSearchesByRealpath.set(realpath, appliedSearches);
-    }
-    const candidatesWithAnyEdit = new Set();
-    for (const c of selected) {
-        if (buildFailedSet.has(c))
-            continue;
-        const realpath = fileToRealpath.get(c.dep.file) ?? c.dep.file;
-        const offsetKey = expectedOffsetKeyOf(c);
-        if (offsetKey !== undefined) {
-            if (survivingOffsetKeysByRealpath.get(realpath)?.has(offsetKey))
-                candidatesWithAnyEdit.add(c);
-            continue;
-        }
-        const search = expectedSearchStringOf(c);
-        if (search !== undefined) {
-            if (survivingSearchesByRealpath.get(realpath)?.has(search))
-                candidatesWithAnyEdit.add(c);
-            continue;
-        }
-        // Unknown position type (future ecosystems): add conservatively so the file-written
-        // check in the orchestrator still applies rather than silently routing to noEdits.
-        candidatesWithAnyEdit.add(c);
-    }
-    return candidatesWithAnyEdit;
-}
-/**
- * Phase 5: write validated content strings to disk atomically.
- *   5a — stage each file to a temp in the same directory (same filesystem → fast rename).
- *        If ANY staging fails (ENOSPC/EACCES/RO mount), clean up all staged temps and abort.
- *   5b — commit each staged temp via rename. Near-instant on same filesystem; if a
- *        rename fails mid-commit, surface a "partially applied" error with `git diff` hint.
- *
- * If `initialFailedRealpaths` is non-empty, skips all writes (validation already failed).
- */
-async function stageAndCommitEdits(computedContents, initialFailedRealpaths) {
-    const failedRealpaths = new Set(initialFailedRealpaths);
-    const writtenRealpaths = new Set();
-    if (failedRealpaths.size > 0) {
-        lib_core.warning(`[lisan] aborting all writes — ${failedRealpaths.size} file(s) failed validation`);
-        for (const realpath of computedContents.keys())
-            failedRealpaths.add(realpath);
-        return { writtenRealpaths, failedRealpaths };
-    }
-    // 5a: stage — also snapshot original file bytes for rollback if 5b fails mid-commit.
-    const staged = new Map();
-    const snapshots = new Map();
-    let stagingFailed = false;
-    for (const [realpath, { file, content }] of computedContents) {
-        try {
-            // B2: Distinguish ENOENT (new file → snapshot as "") from other errors like EACCES/EISDIR.
-            // Previously `catch(() => "")` treated any read error as "new file". If the file
-            // existed but was unreadable (EACCES), rollback would write "" → truncate the file.
-            // Now: only ENOENT is treated as "new file"; other errors skip snapshotting entirely
-            // so a failing rollback cannot corrupt the file.
-            // Read as Buffer so a leading UTF-8 BOM is not silently stripped on decode.
-            // Buffer.toString("utf8") preserves \uFEFF; fs.readFile(path,"utf8") drops it.
-            const originalContent = await promises_namespaceObject.readFile(file).then((buf) => buf.toString("utf8"), (err) => {
-                if (err instanceof Error && err.code === "ENOENT")
-                    return "";
-                // Not a new file — skip snapshotting to avoid a truncating rollback on EACCES/EISDIR.
-                return null;
-            });
-            const tmp = await stageTemp(file, content);
-            staged.set(realpath, { tmp, file });
-            if (originalContent !== null) {
-                snapshots.set(realpath, { file, originalContent });
-            }
-        }
-        catch (err) {
-            lib_core.warning(`[lisan] failed to stage ${file}: ${err instanceof Error ? err.message : String(err)}`);
-            failedRealpaths.add(realpath);
-            stagingFailed = true;
-        }
-    }
-    if (stagingFailed) {
-        lib_core.warning(`[lisan] aborting all writes — staging failed for ${failedRealpaths.size} file(s); cleaning up staged temps`);
-        for (const { tmp } of staged.values())
-            await promises_namespaceObject.unlink(tmp).catch(() => undefined);
-        for (const realpath of computedContents.keys()) {
-            if (!failedRealpaths.has(realpath))
-                failedRealpaths.add(realpath);
-        }
-        return { writtenRealpaths, failedRealpaths };
-    }
-    // 5b: commit
-    let commitFailed = false;
-    for (const [realpath, { tmp, file }] of staged) {
-        try {
-            await commitTemp(tmp, file);
-            writtenRealpaths.add(realpath);
-        }
-        catch (err) {
-            lib_core.warning(`[lisan] failed to commit ${file}: ${err instanceof Error ? err.message : String(err)}`);
-            failedRealpaths.add(realpath);
-            commitFailed = true;
-            // Best-effort rollback of already-committed files to avoid a partially-applied changeset.
-            for (const committedRealpath of writtenRealpaths) {
-                const snap = snapshots.get(committedRealpath);
-                if (!snap)
-                    continue;
-                try {
-                    await writeFileContent(snap.file, snap.originalContent);
-                    lib_core.warning(`[lisan] rolled back ${snap.file} to original content`);
-                }
-                catch {
-                    lib_core.warning(`[lisan] rollback failed for ${snap.file} — tree may be partially mutated; ` +
-                        `run "git diff" and "git checkout ${snap.file}" to restore`);
-                }
-            }
-            // B1: Unlink staged temps that were not successfully committed.
-            // This covers two cases:
-            //   (a) files whose commitTemp threw (their tmp was not renamed, still on disk)
-            //   (b) files whose commitTemp was never called (loop exited via `break` before
-            //       reaching them — their tmp is also still on disk)
-            // Without this cleanup, both cases leave orphaned `.lisan-tmp-*` files.
-            // The correct guard is: any staged temp that is NOT in writtenRealpaths
-            // (i.e. commitTemp never successfully completed for it).
-            for (const [remainingRp, { tmp }] of staged) {
-                if (!writtenRealpaths.has(remainingRp)) {
-                    await promises_namespaceObject.unlink(tmp).catch(() => undefined);
-                }
-            }
-            break; // stop committing further files after failure
-        }
-    }
-    if (commitFailed) {
-        lib_core.warning(`[lisan] partially applied — ${writtenRealpaths.size} of ${staged.size} file(s) written; ` +
-            `run "git diff" to inspect the partial state`);
-    }
-    return { writtenRealpaths, failedRealpaths };
-}
-// ── orchestrator ───────────────────────────────────────────────────────────────
-/**
- * Build per-ecosystem FileEdits for the selected candidates, merge edits that
- * target the same physical file (resolving symlinks), reconcile shared-constant
- * conflicts, and write each merged edit to disk.
- *
- * Calls the five phase helpers above in sequence. Returns the candidates whose
- * file was successfully written (`actuallyApplied`) and those that failed (`failed`).
- */
-async function buildAndApplyEdits(selected, style, dryRun) {
-    const actuallyApplied = [];
-    const failed = [];
-    const noEdits = [];
-    if (selected.length === 0)
-        return { actuallyApplied, failed, noEdits };
-    const { allEdits, failed: buildFailed, buildFailedSet } = await buildEditsByEcosystem(selected, style);
-    failed.push(...buildFailed);
-    const { editsByRealpath, fileToRealpath } = await mergeEditsByRealpath(allEdits);
-    const { computedContents, failedRealpaths: validationFailed } = await computeAndReconcileEdits(editsByRealpath);
-    const candidatesWithAnyEdit = attributeRewrites(selected, computedContents, fileToRealpath, buildFailedSet);
-    // In dry-run mode, skip the file-write phase but still classify candidates so that
-    // noEdits is accurately populated. This ensures the dry-run preview omits candidates
-    // that an actual run would silently skip (multi-line FROM, template-incompatible
-    // constant, reconcile-dropped shared constant, unresolvable digest), rather than
-    // falsely listing them as "would be applied".
-    if (dryRun) {
-        for (const c of selected) {
-            if (buildFailedSet.has(c))
-                continue;
-            if (!candidatesWithAnyEdit.has(c))
-                noEdits.push(c);
-        }
-        return { actuallyApplied, failed, noEdits };
-    }
-    const { writtenRealpaths, failedRealpaths } = await stageAndCommitEdits(computedContents, validationFailed);
-    // Classify each candidate that wasn't already recorded as a build failure.
-    for (const c of selected) {
-        if (buildFailedSet.has(c))
-            continue;
-        if (!candidatesWithAnyEdit.has(c)) {
-            // buildFileEdits produced no rewrite — known benign reasons: unresolvable digest,
-            // template mismatch, reconcile-dropped shared constant, multi-line FROM. The ecosystem
-            // module already emitted a warning for each. Distinct from `failed` (no write attempted)
-            // and from `skipped` (these were positively selected). Under --yes, this is not an error
-            // — the ecosystem module's warning is sufficient for operator awareness.
-            noEdits.push(c);
-            continue;
-        }
-        const realpath = fileToRealpath.get(c.dep.file)
-            ?? await promises_namespaceObject.realpath(c.dep.file).catch(() => c.dep.file);
-        if (writtenRealpaths.has(realpath)) {
-            actuallyApplied.push(c);
-        }
-        else if (failedRealpaths.has(realpath)) {
-            failed.push(c);
-        }
-        else {
-            // candidatesWithAnyEdit but not in writtenRealpaths or failedRealpaths —
-            // should not happen by construction. Counts as a failure: the user selected this
-            // candidate (or --yes did) and expected a write; treat as unexpected to surface exit 1.
-            lib_core.warning(`[lisan] unexpected: ${c.dep.name} (${c.dep.file}) produced an edit but was not ` +
-                `written or recorded as failed — check for a file-system or symlink issue`);
-            failed.push(c);
-        }
-    }
-    return { actuallyApplied, failed, noEdits };
-}
+//# sourceMappingURL=dispatch.js.map
+;// CONCATENATED MODULE: ./out/update/candidates.js
+
+
+
+
+
+
+
 /**
  * Build the initial UpdateCandidate list from resolved versions, applying the
  * downgrade policy and (interactively) logging skipped/downgrade decisions.
@@ -98441,6 +98285,13 @@ function buildVersionBumpCandidate(dep, latestEntry, currentTagPart, currentAgeD
         direction,
     };
 }
+// N1: buildCandidates and its helpers above call clack.log.*/core.* directly, gated by
+// `isJson`, rather than going through an injected logger sink like dedupeAndResolve does.
+// A prior attempt to unify these behind one logger interface would have silently rerouted
+// the core.info/core.warning calls in buildPinInPlaceCandidate through clack — losing their
+// GitHub Actions annotation semantics (::notice::/::warning::) in favor of TUI-only styling.
+// Preserving the two distinct channels correctly needs a logger interface with parity for
+// both, which is more machinery than this nit warrants; left as direct calls.
 function buildCandidates(filteredDeps, versionCache, opts) {
     const { mode, minAgeDays, allowDowngrade, json: isJson } = opts;
     const candidates = [];
@@ -98466,275 +98317,635 @@ function buildCandidates(filteredDeps, versionCache, opts) {
     }
     return candidates;
 }
+//# sourceMappingURL=candidates.js.map
+;// CONCATENATED MODULE: ./out/update/reconcile-groups.js
+
+
+
+
+
+
+
+
+
+
 /**
- * Resolve the SHA (actions) or OCI digest (docker/kubernetes) each pin-eligible
- * candidate should be pinned to, populating `pinCache` and assigning `pinnedTo`
- * on every matching candidate. OCI digests are always resolved; actions SHAs are
- * only resolved under "sha" style.
+ * Pure (non-async, no registry calls) guards on a constant group that decide whether it's
+ * even safe to attempt picking a semver-minimum target version: divergent interpolation
+ * templates, an unvalidatable read-only rpartition sibling, non-coercible candidate
+ * versions, or every candidate being a prerelease. Returns the candidate to propose as the
+ * group's target version (semver-minimum of stable candidates) on success, or the warning
+ * message to emit when the group must be dropped before ever reaching the async
+ * existence/age check below. Caller must ensure `groupCandidates.length > 0`.
  */
-async function resolvePins(candidates, pinCache, opts) {
-    const { style, token, minAgeDays } = opts;
-    if (candidates.length === 0)
-        return;
-    // Collect unique keys and their representative candidate for resolution.
-    // Use resolveCacheKey (||| separator) to avoid collisions on names containing ":" or "@"
-    // (e.g. digest-pinned OCI images like "registry/repo:tag@sha256:...").
-    const uniquePinKeys = new Map();
-    for (const candidate of candidates) {
-        const eco = candidate.dep.ecosystem;
-        if (eco === "actions" && style !== "sha")
-            continue; // actions SHA only under sha style
-        if (eco !== "actions" && eco !== "docker" && eco !== "kubernetes")
-            continue;
-        const cacheKey = resolveCacheKey(eco, candidate.dep.name, candidate.latest);
-        if (!uniquePinKeys.has(cacheKey))
-            uniquePinKeys.set(cacheKey, candidate);
+function groupDropReason(group, groupCandidates, key) {
+    const constLabel = group.constantName ?? key;
+    // Guard: if the deps sharing this constant use different templatePrefix/templateSuffix, the
+    // "reconcile in two value-spaces" bug is triggered — resolveLatest returns different full
+    // versions (prefix+value+suffix) per dep, so the semver-min of full versions is in a
+    // different space from the semver-min of stripped constant values. The written constant
+    // value may yield an effective version for some dep that was never existence-checked.
+    // Fail-safe: if templates diverge, drop the group rather than silently pick a wrong value.
+    const templates = new Set(group.deps.map((d) => {
+        const vr = versionRefOf(d);
+        return `${vr?.templatePrefix ?? ""}::${vr?.templateSuffix ?? ""}`;
+    }));
+    if (templates.size > 1) {
+        return {
+            reason: `Shared constant "${constLabel}": deps use different interpolation templates ` +
+                `(${[...templates].join(", ")}); cannot safely pick one constant value for all referencing deps — dropping group.`,
+        };
     }
-    // Stores age metadata refreshed when a tag moves between resolve and pin time.
-    // Keyed by the same cacheKey used in pinCache so the final fan-out loop can
-    // propagate it to ALL candidates sharing that key, not just the representative.
-    const refreshedAgeByKey = new Map();
-    const resolvePinTasks = [...uniquePinKeys.entries()].map(([cacheKey, candidate]) => async () => {
-        // Wrap the entire body in try/catch so that a thrown registry call (ociDigestForTag,
-        // fetchImagePublishDate, resolveRefToSha) sets pinCache.set(key, null) instead of
-        // leaving the key absent — an absent key lets the candidate keep its buildCandidates
-        // pre-resolved digest, which contradicts the fail-closed intent.
-        try {
-            const eco = candidate.dep.ecosystem;
-            let resolvedPin = null;
-            if (eco === "actions") {
-                // Use the shared cached resolver from the verify path (single code path, per-run cache).
-                const ownerRepo = ownerRepoOf(candidate.dep.name); // strip subpath → "owner/repo"
-                const slashIdx = ownerRepo.indexOf("/");
-                const owner = ownerRepo.slice(0, slashIdx);
-                const repo = ownerRepo.slice(slashIdx + 1);
-                resolvedPin = await resolveRefToSha(owner, repo, candidate.latest, token);
-                if (resolvedPin === null) {
-                    lib_core.warning(`[lisan] actions: could not resolve SHA for ${candidate.dep.name}@${candidate.latest}; ` +
-                        `pinning as tag instead of commit SHA (sha style requested but GitHub API returned no SHA). ` +
-                        `This will be reflected in the summary as a tag-pinned update.`);
-                }
-            }
-            else if (eco === "docker" || eco === "kubernetes") {
-                const ref = parseImageRef(candidate.dep.name);
-                if (ref) {
-                    const preResolved = candidate.pinnedTo; // set by buildCandidates from resolveLatest
-                    if (preResolved) {
-                        // Reuse the digest already resolved in resolveLatest (single round-trip, no TOCTOU).
-                        // If the tag moved between resolve and pin (digest changed), re-fetch the new
-                        // digest's publish date and gate it — the new content might be brand-new.
-                        const freshDigest = await ociDigestForTag(ref.registry, ref.repository, candidate.latest, opts.dockerhubMirror);
-                        if (freshDigest && freshDigest !== preResolved) {
-                            // Tag moved upstream; gate the new digest's age before accepting it (fail-closed).
-                            // For a previously-unpinned ref under pinUnpinned=true, we still pin with a
-                            // warning rather than nulling out — the user already opted into pinning
-                            // unverified images. For already-pinned refs the gate stays fail-closed:
-                            // those refs have an existing digest and we must not swap in a too-young one.
-                            // Shared helper: fetchImagePublishDate → computeAgeDays (single code path
-                            // with the verify-side age computation via ecosystems/image.ts).
-                            const { publishDate: d, ageDays: freshAge } = await fetchImageAgeFromDigest(ref.registry, ref.repository, freshDigest, candidate.latest);
-                            // Helper: propagate the fresh digest's age to both the representative candidate and
-                            // the shared map so ALL candidates sharing this cacheKey stay in sync below
-                            // (duplicate images referenced in multiple files keep stale age without this).
-                            const propagateRefreshedAge = (pin) => {
-                                if (pin !== null) {
-                                    candidate.ageDays = freshAge;
-                                    candidate.publishDate = d;
-                                    refreshedAgeByKey.set(cacheKey, { ageDays: freshAge, publishDate: d });
-                                }
-                                resolvedPin = pin;
-                            };
-                            // Build ageClause once — used in both the accept and the skip warning paths.
-                            const ageClause = formatAgeClause(freshAge, minAgeDays);
-                            if (!meetsMinAge(freshAge, minAgeDays)) {
-                                const wasUnpinned = wasUnpinnedRef(candidate.dep);
-                                if (shouldBypassAgeGate(wasUnpinned, opts.pinUnpinned)) {
-                                    lib_core.warning(`[lisan] ${eco}: ${candidate.dep.name}:${candidate.latest} tag moved upstream; ` +
-                                        `new digest is ${ageClause} but pinning previously-unpinned image anyway ` +
-                                        `(--pin-unpinned); pass --no-pin-unpinned to skip`);
-                                    propagateRefreshedAge(freshDigest);
-                                }
-                                else {
-                                    lib_core.warning(`[lisan] ${eco}: ${candidate.dep.name}:${candidate.latest} tag moved upstream but new ` +
-                                        `digest is ${ageClause}; skipping pin to avoid introducing a too-young image`);
-                                    propagateRefreshedAge(null);
-                                }
-                            }
-                            else {
-                                propagateRefreshedAge(freshDigest);
-                            }
-                        }
-                        else {
-                            resolvedPin = freshDigest ?? preResolved; // tag hasn't moved; use pre-resolved
-                        }
-                    }
-                    else {
-                        resolvedPin = await ociDigestForTag(ref.registry, ref.repository, candidate.latest, opts.dockerhubMirror);
-                    }
-                }
-                if (resolvedPin === null) {
-                    lib_core.warning(`[lisan] ${eco}: could not resolve digest for ${candidate.dep.name}:${candidate.latest}; ` +
-                        `skipping — not writing a mutable ref without a digest`);
-                }
-            }
-            pinCache.set(cacheKey, resolvedPin);
-        }
-        catch (err) {
-            // Fail-closed: a thrown registry call must not leave the key absent (absent → candidate
-            // keeps its buildCandidates pre-resolved digest instead of being skipped). Set null so
-            // the candidate is filtered out in the pinCache.has() fan-out loop below.
-            lib_core.warning(`[lisan] ${candidate.dep.ecosystem}: pin resolution threw for ${candidate.dep.name}; ` +
-                `failing closed — ${err instanceof Error ? err.message : String(err)}`);
-            pinCache.set(cacheKey, null);
-        }
-    });
-    await concurrency_runBatched(resolvePinTasks, RESOLVE_CONCURRENCY, (m) => lib_core.warning(m));
-    // Apply resolved pins to all matching candidates.
-    // Using pinCache.has() rather than a truthiness check so that null (meaning
-    // "resolution ran and decided to skip this pin — e.g. moved tag too young")
-    // is honoured instead of silently falling back to the pre-resolved digest
-    // that buildCandidates() set earlier. Without this, a null resolvedPin would
-    // be a no-op and the candidate would survive the `!c.pinnedTo` filter with a
-    // stale digest, contradicting the explicit "skip" decision.
-    //
-    // Also propagate refreshed age metadata to ALL candidates sharing a cacheKey,
-    // not just the representative candidate updated in resolvePinTasks above.
-    // Duplicate candidates (same image referenced in multiple files) would otherwise
-    // keep stale ageDays/publishDate from buildCandidates() in --json / hints.
-    for (const candidate of candidates) {
-        const eco = candidate.dep.ecosystem;
-        if (eco !== "actions" && eco !== "docker" && eco !== "kubernetes")
-            continue;
-        const cacheKey = resolveCacheKey(eco, candidate.dep.name, candidate.latest);
-        if (pinCache.has(cacheKey)) {
-            const pin = pinCache.get(cacheKey);
-            candidate.pinnedTo = pin ?? undefined;
-        }
-        const refreshedAge = refreshedAgeByKey.get(cacheKey);
-        if (refreshedAge) {
-            candidate.ageDays = refreshedAge.ageDays;
-            candidate.publishDate = refreshedAge.publishDate;
-        }
+    // M1: Guard against rpartition-derived read-only sibling refs.  If the constant is shared
+    // with a dep whose effective version is derived via CONST.rpartition(SEP)[N], bumping the
+    // constant produces a new derived value (e.g. "2.20" from "2.20.7") that was never
+    // existence-checked.  We cannot safely validate the derived value without knowing the
+    // separator and downstream package name, so drop the group rather than risk writing a
+    // version that doesn't exist or is too young.
+    if (group.hasReadOnlySiblings) {
+        return {
+            reason: `Shared constant "${constLabel}" is referenced by a read-only rpartition sibling dep ` +
+                `whose derived version cannot be validated — dropping group to avoid writing an unchecked version.`,
+        };
     }
+    // Proposed target: semver-minimum of all candidates (matches reconcileConstantRewrites).
+    // Use semver.coerce so 2-segment versions ("4.13", "2.21") compare correctly —
+    // semver.valid rejects them and would fall through to the arbitrary [0].latest fallback.
+    // When coerce returns null for all candidates (no comparable version), drop the group
+    // rather than blindly writing groupCandidates[0].latest which may not exist elsewhere.
+    // Use pickSemverMin (same impl as reconcileConstantRewrites) so the "highest
+    // version safe for all referencing deps" selection is a single code path.
+    // M2: Precondition — every candidate's latest must be coercible to semver before calling
+    // pickSemverMin.  pickSemverMin silently skips non-coercible entries and returns the min
+    // of the rest, so if one candidate's latest is non-semver the returned minimum may exceed
+    // what that dep accepts.  Uses the shared allVersionsComparable predicate from bazel-shared.ts
+    // so this check and resolveConflictingReplaces's check are the same code path.
+    if (!allVersionsComparable(groupCandidates.map((c) => c.latest))) {
+        return {
+            reason: `Shared constant "${constLabel}": some candidates have non-coercible versions ` +
+                `(${groupCandidates.map((c) => c.latest).join(", ")}); cannot safely pick a semver minimum — dropping group.`,
+        };
+    }
+    // Filter out prerelease candidates before picking the semver minimum —
+    // a prerelease minimum would break stable-dep consumers that don't accept pre-releases.
+    // If EVERY candidate sharing the constant is a prerelease, there is no safe stable
+    // value to pick — drop the group entirely rather than falling back to the prerelease
+    // set, which would write the exact prerelease minimum this filter exists to prevent.
+    const stableGroupCandidates = groupCandidates.filter((c) => !isPrerelease(c.latest));
+    if (stableGroupCandidates.length === 0) {
+        return {
+            reason: `Shared constant "${constLabel}": all candidates are prerelease versions ` +
+                `(${groupCandidates.map((c) => c.latest).join(", ")}); cannot safely pick a stable minimum — dropping group.`,
+        };
+    }
+    const minCandidate = pickSemverMin(stableGroupCandidates, (c) => c.latest);
+    if (minCandidate === null) {
+        // No comparable version — can't safely pick a minimum.
+        return {
+            reason: `Shared constant "${constLabel}": all candidates have non-semver versions ` +
+                `(${groupCandidates.map((c) => c.latest).join(", ")}); dropping group.`,
+        };
+    }
+    return { minCandidate };
 }
 /**
- * Fetch current/new licenses for each version-bumping candidate and apply the
- * license policy, annotating each candidate's licenseCurrent/licenseNew/
- * licenseRegresses/licenseBlocked fields in place. `licenseMap` is populated with
- * the fetched raw license strings (keyed eco|||name|||version).
- */
-async function applyLicensePolicy(candidates, licenseMap, opts) {
-    const { licensePolicy, registries, token, bcrUrl, json: isJson } = opts;
-    if (licensePolicy === "off")
-        return;
-    const javaRepoMap = new Map();
-    for (const c of candidates) {
-        if (c.dep.ecosystem === "java" && c.dep.repositories) {
-            javaRepoMap.set(c.dep.name, c.dep.repositories);
-        }
-    }
-    // Candidates eligible for license checking (version-bumping ecosystems only).
-    const licenseEligible = candidates.filter((c) => !isOciEcosystem(c.dep.ecosystem));
-    // Extract the tag portion of a version — only strip @sha256: suffix for OCI ecosystems.
-    const currentVersionOf = (c) => currentTagOf(c.dep);
-    // Deduplicate fetches using resolveCacheKey (||| separator, safe for all name/version forms).
-    const uniqueFetches = new Map();
-    for (const c of licenseEligible) {
-        const curVer = currentVersionOf(c);
-        const curKey = resolveCacheKey(c.dep.ecosystem, c.dep.name, curVer);
-        const newKey = resolveCacheKey(c.dep.ecosystem, c.dep.name, c.latest);
-        if (!uniqueFetches.has(curKey))
-            uniqueFetches.set(curKey, { ecosystem: c.dep.ecosystem, name: c.dep.name, version: curVer });
-        if (!uniqueFetches.has(newKey))
-            uniqueFetches.set(newKey, { ecosystem: c.dep.ecosystem, name: c.dep.name, version: c.latest });
-    }
-    // Track which cache keys had a registry fetch error — distinct from `null` (no license declared).
-    // Used to fail-closed under `block` policy when the new version's license cannot be confirmed.
-    const licenseFetchErrors = new Set();
-    const licenseFetchTasks = [...uniqueFetches.entries()].map(([key, spec]) => async () => {
-        try {
-            const raw = await fetchLicense(spec, registries, javaRepoMap, token, bcrUrl);
-            licenseMap.set(key, raw);
-        }
-        catch (err) {
-            // Log the error so the operator knows which fetch failed and why, rather than silently
-            // treating a transient 5xx/timeout as "no license declared".
-            lib_core.warning(`[lisan] license: fetch failed for ${spec.ecosystem}:${spec.name}@${spec.version} — ` +
-                `${err instanceof Error ? err.message : String(err)}`);
-            licenseFetchErrors.add(key);
-            licenseMap.set(key, null);
-        }
-    });
-    const spin = isJson ? null : ft();
-    spin?.start("Checking license permissiveness…");
-    await concurrency_runBatched(licenseFetchTasks, RESOLVE_CONCURRENCY, (m) => lib_core.warning(m));
-    spin?.stop("Done.");
-    for (const c of licenseEligible) {
-        const curVer = currentVersionOf(c);
-        c.licenseCurrent = normalizeSpdxId(licenseMap.get(resolveCacheKey(c.dep.ecosystem, c.dep.name, curVer)) ?? null);
-        c.licenseNew = normalizeSpdxId(licenseMap.get(resolveCacheKey(c.dep.ecosystem, c.dep.name, c.latest)) ?? null);
-        const newKey = resolveCacheKey(c.dep.ecosystem, c.dep.name, c.latest);
-        const { keep, regresses, verified } = decideLicense({
-            currentLicense: c.licenseCurrent,
-            newLicense: c.licenseNew,
-            policy: licensePolicy,
-            newLicenseFetchFailed: licenseFetchErrors.has(newKey),
-        });
-        c.licenseRegresses = verified ? regresses : undefined;
-        c.licenseBlocked = !keep;
-        if (!isJson) {
-            if (!keep) {
-                const reason = licenseFetchErrors.has(newKey)
-                    ? `new license could not be confirmed (registry fetch error); skipping (--license-policy=block)`
-                    : `license tightens ${c.licenseCurrent} → ${c.licenseNew}; skipping (--license-policy=block)`;
-                dist_R.warn(`${c.dep.name}: ${reason}`);
-            }
-            else if (regresses && verified) {
-                dist_R.warn(`${c.dep.name}: license tightens ${c.licenseCurrent} → ${c.licenseNew} (--license-policy=warn)`);
-            }
-        }
-    }
-    // Blocked candidates remain in the list for JSON/RunResult visibility;
-    // they are excluded from selection in Step 8.
-}
-/**
- * Discover all dependency refs across the requested ecosystems.
- * Per-ecosystem discover() failures are logged as warnings and do not abort
- * discovery for other ecosystems — mirrors the verify action's resilience in main.ts.
+ * Confirm a single dep exists — and meets the age gate — at `proposedVersion`, using the
+ * existence/age checks appropriate for its ecosystem. Returns null when the dep is validated
+ * (or a cache hit already proves it), or the reason string to record as unresolvable.
  *
- * Throws when every requested ecosystem both (a) has a registered dispatch and
- * (b) threw during discover(), because that state is indistinguishable from a
- * clean repo (allDeps is empty, run() would report "no updates") but is actually
- * a misconfiguration (bad --module-bazel path, missing workflow dir, etc.).  A
- * partial failure (some ecosystems succeed, some fail) is still just a warning.
+ * A cache hit against this dep's own resolveLatest cache is a sound substitute for a fresh
+ * existence+age round-trip (that entry only exists because resolveEager/resolveLazy already
+ * confirmed it exists AND passed meetsMinAge against this same minAgeDays) — a cache miss
+ * still falls through to the live check, never the inverse.
+ *
+ * A transient registry error must fail-closed (treat the version as non-existent/too-young)
+ * rather than propagating out and aborting the entire reconcile pass.
  */
-async function discoverDeps(opts) {
-    const { ecosystems } = opts;
-    const allDeps = [];
-    let dispatchedCount = 0;
-    let errorCount = 0;
-    for (const eco of ecosystems) {
-        const dispatch = ECOSYSTEM_DISPATCH[eco];
-        if (!dispatch) {
-            console.warn(`[lisan] unknown ecosystem: ${eco}`);
+async function validateDepAtVersion(dep, proposedVersion, existenceChecks, ageChecks, registries, minAgeDays, versionCache) {
+    const cacheKey = resolveCacheKey(dep.ecosystem, dep.name, dep.current);
+    const cachedVersions = versionCache?.get(cacheKey)?.versions;
+    if (cachedVersions?.some((v) => v.version === proposedVersion))
+        return null;
+    const check = existenceChecks.get(dep.ecosystem);
+    if (!check) {
+        // No existence check registered for this ecosystem — fail-closed: treat as non-existent
+        // rather than silently approving the dep. In practice STARLARK_ECOSYSTEMS and
+        // existenceChecks are kept in sync; this guard fires only if they drift.
+        return dep.name;
+    }
+    // The maven repos fallback only applies to java — rust/bazel existence checks
+    // ignore the repos parameter entirely.
+    const repos = dep.ecosystem === "java"
+        ? (dep.repositories?.length ? dep.repositories : [registries.maven])
+        : (dep.repositories ?? []);
+    try {
+        const exists = await check(dep.name, proposedVersion, repos, registries);
+        if (!exists)
+            return dep.name;
+        // Existence alone is not enough: the same version string can have a different
+        // publish date per registry (e.g. a maven.install artifact and a crate.spec
+        // sharing one constant), so re-vet this non-winning dep against the age gate
+        // it would otherwise hit when verify later re-checks it — without this, the
+        // shared-constant feature could silently promote a too-young version for it.
+        const ageCheck = ageChecks.get(dep.ecosystem);
+        if (!ageCheck) {
+            // No age check registered for this ecosystem — fail-closed, same rationale
+            // as the missing-existence-check case above.
+            return dep.name;
+        }
+        const ageDays = await ageCheck(dep.name, proposedVersion, repos, registries);
+        if (!meetsMinAge(ageDays, minAgeDays)) {
+            return `${dep.name} (${formatAgeClause(ageDays, minAgeDays)})`;
+        }
+        return null;
+    }
+    catch (err) {
+        lib_core.warning(`[lisan] reconcileConstantGroups: existence/age check failed for ` +
+            `${dep.ecosystem}:${dep.name}@${proposedVersion}: ` +
+            `${err instanceof Error ? err.message : String(err)} — treating as non-existent`);
+        return dep.name;
+    }
+}
+/**
+ * A Starlark constant (e.g. JACKSON_VERSION in MODULE.bazel) may be referenced by
+ * multiple artifact/crate/module coords — potentially across ecosystems (e.g. a constant
+ * shared by a maven.install artifact and a bazel_dep). All referencing deps must be able
+ * to take the proposed target version before the upgrade is presented to the user.
+ *
+ * Groups by constant identity (file + literal offsets) across ALL Starlark ecosystems in
+ * a single pass. Each missing dep is validated with the existence check appropriate for
+ * its own ecosystem, so cross-ecosystem constants are correctly guarded.
+ *
+ * Mutates `candidates` in place — drops entries whose constant group is unresolvable.
+ */
+async function reconcileConstantGroups(candidates, filteredDeps, existenceChecks, ageChecks, registries, minAgeDays, versionCache) {
+    const starlarkDeps = filteredDeps.filter((d) => STARLARK_ECOSYSTEMS.has(d.ecosystem));
+    if (starlarkDeps.length === 0)
+        return;
+    // Pre-resolve realpaths for all Starlark dep files so constantKeyOf agrees with
+    // Pass 9b's realpath-based edit merge. Without this, the same physical MODULE.bazel
+    // reachable via two different relative paths (e.g. via resolveModuleFiles includes)
+    // would produce different keys and bypass cross-ecosystem existence validation.
+    const fileRealpaths = await resolveDepRealpaths(starlarkDeps);
+    // Group all versionRef deps by constant identity (file + offsets of the literal)
+    // across all Starlark ecosystems so cross-ecosystem shared constants are caught.
+    const constantGroups = new Map();
+    for (const dep of starlarkDeps) {
+        const key = constantKeyOf(dep, fileRealpaths);
+        if (!key)
+            continue;
+        const vr = versionRefOf(dep);
+        let group = constantGroups.get(key);
+        if (!group) {
+            group = { deps: [], constantName: vr.constantName, hasReadOnlySiblings: false };
+            constantGroups.set(key, group);
+        }
+        if (vr.readOnly) {
+            // This dep is a read-only rpartition sibling — it derives its effective version from
+            // the shared constant via a lossy transform (e.g. CONST.rpartition(".")[0]).  We cannot
+            // validate the derived value without knowing the separator and the downstream package
+            // name, so mark the whole group unsafe to bump.
+            group.hasReadOnlySiblings = true;
+        }
+        group.deps.push(dep);
+    }
+    const droppedKeys = new Set();
+    for (const [key, group] of constantGroups) {
+        const groupCandidates = candidates.filter((c) => {
+            if (!STARLARK_ECOSYSTEMS.has(c.dep.ecosystem))
+                return false;
+            return constantKeyOf(c.dep, fileRealpaths) === key;
+        });
+        if (groupCandidates.length === 0)
+            continue;
+        const dropCheck = groupDropReason(group, groupCandidates, key);
+        if ("reason" in dropCheck) {
+            lib_core.warning(`[lisan] ${dropCheck.reason}`);
+            droppedKeys.add(key);
             continue;
         }
-        dispatchedCount++;
+        const proposedVersion = dropCheck.minCandidate.latest;
+        // Find referencing deps that produced no candidate — they weren't validated by resolveLatest.
+        // Key on the full DepRef identity (ecosystem + name + file) to avoid false matches when
+        // two different ecosystems happen to share a dep name (e.g. "com.example:foo" in both
+        // java and rust contexts — unlikely but theoretically possible with custom ecosystems).
+        const depIdentityKey = (d) => `${d.ecosystem}|||${d.name}|||${d.file}`;
+        const depsWithCandidate = new Set(groupCandidates.map((c) => depIdentityKey(c.dep)));
+        const missingDeps = group.deps.filter((d) => !depsWithCandidate.has(depIdentityKey(d)));
+        // Also validate candidates whose own `latest` differs from `proposedVersion` (the
+        // semver-minimum) — a cross-ecosystem scenario where rust and java both have candidates
+        // but resolved to different versions means the minimum may not exist in one registry.
+        const candidatesWithDifferentLatest = groupCandidates.filter((c) => c.latest !== proposedVersion);
+        const depsToValidate = [
+            ...missingDeps,
+            ...candidatesWithDifferentLatest.map((c) => c.dep),
+        ];
+        if (depsToValidate.length === 0)
+            continue;
+        // Confirm the proposed version actually exists — AND meets the age gate — for each
+        // dep that wasn't validated at proposedVersion, using the checks appropriate for that
+        // dep's ecosystem. Run checks concurrently — JS is single-threaded so concurrent pushes
+        // to `unresolvable` are safe; order of results is irrelevant here.
+        const unresolvable = [];
+        await runBatched(depsToValidate.map((dep) => async () => {
+            const reason = await validateDepAtVersion(dep, proposedVersion, existenceChecks, ageChecks, registries, minAgeDays, versionCache);
+            if (reason !== null)
+                unresolvable.push(reason);
+        }), RESOLVE_CONCURRENCY);
+        if (unresolvable.length > 0) {
+            const constLabel = group.constantName ?? key;
+            const listing = groupCandidates.map((c) => `${c.dep.name}: ${c.dep.current} → ${proposedVersion}`).join(", ");
+            lib_core.warning(`[lisan] Shared constant "${constLabel}" not bumped: ` +
+                `${unresolvable.join(", ")} has no version ${proposedVersion}. ` +
+                `Dropping: ${listing}`);
+            droppedKeys.add(key);
+        }
+    }
+    // Remove candidates whose constant was dropped (iterate in reverse to safely splice)
+    if (droppedKeys.size > 0) {
+        for (let i = candidates.length - 1; i >= 0; i--) {
+            const c = candidates[i];
+            if (!STARLARK_ECOSYSTEMS.has(c.dep.ecosystem))
+                continue;
+            const key = constantKeyOf(c.dep, fileRealpaths);
+            if (key && droppedKeys.has(key))
+                candidates.splice(i, 1);
+        }
+    }
+}
+/** Maven existence check for the java ecosystem. */
+const javaExistenceCheck = (name, version, repos, registries) => {
+    const [g, a] = name.split(":");
+    if (!g || !a)
+        return Promise.resolve(false);
+    return mavenArtifactExists(g, a, version, repos, registries);
+};
+/** crates.io existence check for the rust ecosystem. */
+const rustExistenceCheck = async (name, version, _repos, registries) => {
+    const versions = await cratesVersions(name, registries);
+    return versions.some((v) => v.version === version);
+};
+/** Build a BCR existence check for the bazel ecosystem bound to a token + URL. */
+function makeBazelExistenceCheck(token, bcrUrl) {
+    return async (name, version) => {
+        const versions = await bcrVersions(name, token, bcrUrl);
+        return versions.some((v) => v.version === version);
+    };
+}
+/**
+ * Maven age check for the java ecosystem — used by {@link reconcileConstantGroups} to
+ * age-gate (not just existence-check) a shared-constant's proposed version for every
+ * referencing dep, since publish dates differ per registry for the same version string.
+ */
+const javaAgeCheck = async (name, version, repos, registries) => {
+    const [g, a] = name.split(":");
+    if (!g || !a)
+        return null;
+    return computeAgeDays(await mavenPublishDate(g, a, version, repos, registries));
+};
+/** crates.io age check for the rust ecosystem. */
+const rustAgeCheck = async (name, version, _repos, registries) => {
+    const versions = await cratesVersions(name, registries);
+    const entry = versions.find((v) => v.version === version);
+    return entry ? computeAgeDays(entry.publishDate) : null;
+};
+/** Build a BCR age check for the bazel ecosystem bound to a token + URL. */
+function makeBazelAgeCheck(token, bcrUrl) {
+    return async (name, version) => computeAgeDays(await bcrPublishDate(name, version, token, bcrUrl));
+}
+//# sourceMappingURL=reconcile-groups.js.map
+;// CONCATENATED MODULE: ./out/update/write-pipeline.js
+
+
+
+
+
+// ── buildAndApplyEdits phases ─────────────────────────────────────────────────
+//
+// The write pipeline is decomposed into five independently-testable helpers.
+// buildAndApplyEdits (the orchestrator, ~30 lines) calls them in order.
+/**
+ * Phase 1: build FileEdits per ecosystem.
+ * Multiple ecosystems (rust/java/bazel) may edit the same MODULE.bazel — they are
+ * merged later; this phase just collects all edits and records build failures.
+ * A co-targeting warning is emitted when a build-failed ecosystem shares source
+ * files with a successful one (the file will still be written by the other ecosystem).
+ */
+async function buildEditsByEcosystem(selected, style) {
+    const allEdits = [];
+    const failed = [];
+    const byEcosystem = new Map();
+    for (const candidate of selected) {
+        const eco = candidate.dep.ecosystem;
+        const arr = byEcosystem.get(eco) ?? [];
+        arr.push(candidate);
+        byEcosystem.set(eco, arr);
+    }
+    for (const [eco, ecoCandidates] of byEcosystem) {
         try {
-            const discovered = await dispatch.discover(opts);
-            allDeps.push(...discovered);
+            const dispatch = ECOSYSTEM_DISPATCH[eco];
+            if (!dispatch) {
+                lib_core.warning(`[lisan] no buildFileEdits for ecosystem: ${eco}`);
+                continue;
+            }
+            allEdits.push(...await dispatch.buildFileEdits(ecoCandidates, style));
         }
         catch (err) {
-            errorCount++;
-            console.warn(`[lisan] discover failed for ecosystem ${eco}: ${err instanceof Error ? err.message : String(err)}`);
+            lib_core.warning(`[lisan] failed to build edits for ${eco}: ${err instanceof Error ? err.message : String(err)}`);
+            failed.push(...ecoCandidates);
         }
     }
-    if (dispatchedCount > 0 && errorCount === dispatchedCount) {
-        throw new Error(`[lisan] all ${dispatchedCount} requested ecosystem(s) failed during discovery ` +
-            `(check --module-bazel path and other file inputs). ` +
-            `This is a configuration error, not an empty repo.`);
+    if (failed.length > 0) {
+        const failedFiles = new Set(failed.map((c) => c.dep.file));
+        const successFiles = new Set(allEdits.map((e) => e.file));
+        for (const f of failedFiles) {
+            if (successFiles.has(f)) {
+                lib_core.warning(`[lisan] (${f}) will be written by a co-targeting ecosystem despite ` +
+                    `a build failure in another — review the resulting diff carefully`);
+            }
+        }
     }
-    return allDeps;
+    return { allEdits, failed, buildFailedSet: new Set(failed) };
+}
+/**
+ * Phase 2: group edits by realpath so multiple ecosystems targeting the same
+ * physical file have their rewrites merged into a single write operation.
+ * Also builds fileToRealpath for later candidate classification without extra syscalls.
+ */
+async function mergeEditsByRealpath(allEdits) {
+    const editsByRealpath = new Map();
+    const fileToRealpath = new Map();
+    for (const edit of allEdits) {
+        const realpath = await realpathOr(edit.file);
+        fileToRealpath.set(edit.file, realpath);
+        const existing = editsByRealpath.get(realpath);
+        if (existing) {
+            existing.rewrites = [...existing.rewrites, ...edit.rewrites];
+        }
+        else {
+            editsByRealpath.set(realpath, { file: edit.file, rewrites: [...edit.rewrites] });
+        }
+    }
+    return { editsByRealpath, fileToRealpath };
+}
+/**
+ * Phase 3: validate and build content strings in memory.
+ * Calls reconcileConstantRewrites (dedup/conflict-resolution for cross-ecosystem
+ * rewrites on the same constant), then buildFileContent (bounds/overlap/stale-offset).
+ * If ANY file fails, it is recorded in failedRealpaths; computedContents contains
+ * only the files that passed. No disk writes happen here — failures abort in Phase 5.
+ */
+async function computeAndReconcileEdits(editsByRealpath) {
+    const computedContents = new Map();
+    const failedRealpaths = new Set();
+    for (const [realpath, { file, rewrites }] of editsByRealpath) {
+        try {
+            // reconcileConstantRewrites deduplicates offset-based rewrites from different
+            // ecosystems targeting the same constant literal, picking the semver-minimum on
+            // conflict. buildBazelVersionEdits already calls it for single-ecosystem dedup;
+            // this second call (idempotent for size-1 groups) handles cross-ecosystem cases
+            // where rust + java + bazel each emit a rewrite for the same MODULE.bazel constant.
+            const { rewrites: merged } = reconcileConstantRewrites(rewrites, file);
+            const { content, appliedSearches } = await buildFileContent({ file, rewrites: merged });
+            computedContents.set(realpath, { file, content, rewrites: merged, appliedSearches });
+        }
+        catch (err) {
+            lib_core.warning(`[lisan] failed to build edits for ${file}: ${err instanceof Error ? err.message : String(err)}`);
+            failedRealpaths.add(realpath);
+        }
+    }
+    return { computedContents, failedRealpaths };
+}
+/**
+ * Phase 4: attribute surviving rewrites back to candidates (post-reconcile).
+ * Must run AFTER Phase 3 so offsets dropped by reconcileConstantRewrites correctly
+ * demote their candidates to noEdits rather than being misclassified as applied via
+ * a sibling dep's write on the same file.
+ *
+ * Tracks by "offset:length" composite keys (OffsetRewrite) or search strings
+ * (StringRewrite — java inline literals). A bare offset key would falsely attribute
+ * a candidate whose rewrite was dropped if an unrelated rewrite at the same start
+ * offset (but different length) survived in the same file.
+ */
+function attributeRewrites(selected, computedContents, fileToRealpath, buildFailedSet) {
+    const survivingOffsetKeysByRealpath = new Map();
+    const survivingSearchesByRealpath = new Map();
+    for (const [realpath, { rewrites: survived, appliedSearches }] of computedContents) {
+        const offsetKeys = new Set();
+        for (const r of survived) {
+            if ("offset" in r)
+                offsetKeys.add(`${r.offset}:${r.length}`);
+        }
+        survivingOffsetKeysByRealpath.set(realpath, offsetKeys);
+        // Use appliedSearches from buildFileContent — reflects searches that were actually
+        // applied (not skipped due to ambiguity). Building from `survived` (merged rewrites
+        // before apply) would incorrectly mark ambiguous-skipped candidates as "applied".
+        survivingSearchesByRealpath.set(realpath, appliedSearches);
+    }
+    const candidatesWithAnyEdit = new Set();
+    for (const c of selected) {
+        if (buildFailedSet.has(c))
+            continue;
+        const realpath = fileToRealpath.get(c.dep.file) ?? c.dep.file;
+        const offsetKey = expectedOffsetKeyOf(c);
+        if (offsetKey !== undefined) {
+            if (survivingOffsetKeysByRealpath.get(realpath)?.has(offsetKey))
+                candidatesWithAnyEdit.add(c);
+            continue;
+        }
+        const search = expectedSearchStringOf(c);
+        if (search !== undefined) {
+            if (survivingSearchesByRealpath.get(realpath)?.has(search))
+                candidatesWithAnyEdit.add(c);
+            continue;
+        }
+        // Unknown position type (future ecosystems): add conservatively so the file-written
+        // check in the orchestrator still applies rather than silently routing to noEdits.
+        candidatesWithAnyEdit.add(c);
+    }
+    return candidatesWithAnyEdit;
+}
+/**
+ * Phase 5: write validated content strings to disk atomically.
+ *   5a — stage each file to a temp in the same directory (same filesystem → fast rename).
+ *        If ANY staging fails (ENOSPC/EACCES/RO mount), clean up all staged temps and abort.
+ *   5b — commit each staged temp via rename. Near-instant on same filesystem; if a
+ *        rename fails mid-commit, surface a "partially applied" error with `git diff` hint.
+ *
+ * If `initialFailedRealpaths` is non-empty, skips all writes (validation already failed).
+ */
+async function stageAndCommitEdits(computedContents, initialFailedRealpaths) {
+    const failedRealpaths = new Set(initialFailedRealpaths);
+    const writtenRealpaths = new Set();
+    if (failedRealpaths.size > 0) {
+        lib_core.warning(`[lisan] aborting all writes — ${failedRealpaths.size} file(s) failed validation`);
+        for (const realpath of computedContents.keys())
+            failedRealpaths.add(realpath);
+        return { writtenRealpaths, failedRealpaths };
+    }
+    // 5a: stage — also snapshot original file bytes for rollback if 5b fails mid-commit.
+    const staged = new Map();
+    const snapshots = new Map();
+    let stagingFailed = false;
+    for (const [realpath, { file, content }] of computedContents) {
+        try {
+            // B2: Distinguish ENOENT (new file → snapshot as "") from other errors like EACCES/EISDIR.
+            // Previously `catch(() => "")` treated any read error as "new file". If the file
+            // existed but was unreadable (EACCES), rollback would write "" → truncate the file.
+            // Now: only ENOENT is treated as "new file"; other errors skip snapshotting entirely
+            // so a failing rollback cannot corrupt the file.
+            // Read as Buffer so a leading UTF-8 BOM is not silently stripped on decode.
+            // Buffer.toString("utf8") preserves the BOM char; fs.readFile(path,"utf8") drops it.
+            const originalContent = await promises_namespaceObject.readFile(file).then((buf) => buf.toString("utf8"), (err) => {
+                if (err instanceof Error && err.code === "ENOENT")
+                    return "";
+                // Not a new file — skip snapshotting to avoid a truncating rollback on EACCES/EISDIR.
+                return null;
+            });
+            const tmp = await stageTemp(file, content);
+            staged.set(realpath, { tmp, file });
+            if (originalContent !== null) {
+                snapshots.set(realpath, { file, originalContent });
+            }
+        }
+        catch (err) {
+            lib_core.warning(`[lisan] failed to stage ${file}: ${err instanceof Error ? err.message : String(err)}`);
+            failedRealpaths.add(realpath);
+            stagingFailed = true;
+        }
+    }
+    if (stagingFailed) {
+        lib_core.warning(`[lisan] aborting all writes — staging failed for ${failedRealpaths.size} file(s); cleaning up staged temps`);
+        for (const { tmp } of staged.values())
+            await promises_namespaceObject.unlink(tmp).catch(() => undefined);
+        for (const realpath of computedContents.keys()) {
+            if (!failedRealpaths.has(realpath))
+                failedRealpaths.add(realpath);
+        }
+        return { writtenRealpaths, failedRealpaths };
+    }
+    // 5b: commit
+    let commitFailed = false;
+    for (const [realpath, { tmp, file }] of staged) {
+        try {
+            await commitTemp(tmp, file);
+            writtenRealpaths.add(realpath);
+        }
+        catch (err) {
+            lib_core.warning(`[lisan] failed to commit ${file}: ${err instanceof Error ? err.message : String(err)}`);
+            failedRealpaths.add(realpath);
+            commitFailed = true;
+            // Best-effort rollback of already-committed files to avoid a partially-applied changeset.
+            for (const committedRealpath of writtenRealpaths) {
+                const snap = snapshots.get(committedRealpath);
+                if (!snap)
+                    continue;
+                try {
+                    await writeFileContent(snap.file, snap.originalContent);
+                    lib_core.warning(`[lisan] rolled back ${snap.file} to original content`);
+                }
+                catch {
+                    lib_core.warning(`[lisan] rollback failed for ${snap.file} — tree may be partially mutated; ` +
+                        `run "git diff" and "git checkout ${snap.file}" to restore`);
+                }
+            }
+            // B1: Unlink staged temps that were not successfully committed.
+            // This covers two cases:
+            //   (a) files whose commitTemp threw (their tmp was not renamed, still on disk)
+            //   (b) files whose commitTemp was never called (loop exited via `break` before
+            //       reaching them — their tmp is also still on disk)
+            // Without this cleanup, both cases leave orphaned `.lisan-tmp-*` files.
+            // The correct guard is: any staged temp that is NOT in writtenRealpaths
+            // (i.e. commitTemp never successfully completed for it).
+            for (const [remainingRp, { tmp }] of staged) {
+                if (!writtenRealpaths.has(remainingRp)) {
+                    await promises_namespaceObject.unlink(tmp).catch(() => undefined);
+                }
+            }
+            break; // stop committing further files after failure
+        }
+    }
+    if (commitFailed) {
+        lib_core.warning(`[lisan] partially applied — ${writtenRealpaths.size} of ${staged.size} file(s) written; ` +
+            `run "git diff" to inspect the partial state`);
+    }
+    return { writtenRealpaths, failedRealpaths };
+}
+/**
+ * Build per-ecosystem FileEdits for the selected candidates, merge edits that
+ * target the same physical file (resolving symlinks), reconcile shared-constant
+ * conflicts, and write each merged edit to disk.
+ *
+ * Calls the five phase helpers above in sequence. Returns the candidates whose
+ * file was successfully written (`actuallyApplied`) and those that failed (`failed`).
+ */
+async function buildAndApplyEdits(selected, style, dryRun) {
+    const actuallyApplied = [];
+    const failed = [];
+    const noEdits = [];
+    if (selected.length === 0)
+        return { actuallyApplied, failed, noEdits };
+    const { allEdits, failed: buildFailed, buildFailedSet } = await buildEditsByEcosystem(selected, style);
+    failed.push(...buildFailed);
+    const { editsByRealpath, fileToRealpath } = await mergeEditsByRealpath(allEdits);
+    const { computedContents, failedRealpaths: validationFailed } = await computeAndReconcileEdits(editsByRealpath);
+    const candidatesWithAnyEdit = attributeRewrites(selected, computedContents, fileToRealpath, buildFailedSet);
+    // In dry-run mode, skip the file-write phase but still classify candidates so that
+    // noEdits is accurately populated. This ensures the dry-run preview omits candidates
+    // that an actual run would silently skip (multi-line FROM, template-incompatible
+    // constant, reconcile-dropped shared constant, unresolvable digest), rather than
+    // falsely listing them as "would be applied".
+    if (dryRun) {
+        for (const c of selected) {
+            if (buildFailedSet.has(c))
+                continue;
+            if (!candidatesWithAnyEdit.has(c))
+                noEdits.push(c);
+        }
+        return { actuallyApplied, failed, noEdits };
+    }
+    const { writtenRealpaths, failedRealpaths } = await stageAndCommitEdits(computedContents, validationFailed);
+    // Classify each candidate that wasn't already recorded as a build failure.
+    for (const c of selected) {
+        if (buildFailedSet.has(c))
+            continue;
+        if (!candidatesWithAnyEdit.has(c)) {
+            // buildFileEdits produced no rewrite — known benign reasons: unresolvable digest,
+            // template mismatch, reconcile-dropped shared constant, multi-line FROM. The ecosystem
+            // module already emitted a warning for each. Distinct from `failed` (no write attempted)
+            // and from `skipped` (these were positively selected). Under --yes, this is not an error
+            // — the ecosystem module's warning is sufficient for operator awareness.
+            noEdits.push(c);
+            continue;
+        }
+        const realpath = fileToRealpath.get(c.dep.file)
+            ?? await realpathOr(c.dep.file);
+        if (writtenRealpaths.has(realpath)) {
+            actuallyApplied.push(c);
+        }
+        else if (failedRealpaths.has(realpath)) {
+            failed.push(c);
+        }
+        else {
+            // candidatesWithAnyEdit but not in writtenRealpaths or failedRealpaths —
+            // should not happen by construction. Counts as a failure: the user selected this
+            // candidate (or --yes did) and expected a write; treat as unexpected to surface exit 1.
+            lib_core.warning(`[lisan] unexpected: ${c.dep.name} (${c.dep.file}) produced an edit but was not ` +
+                `written or recorded as failed — check for a file-system or symlink issue`);
+            failed.push(c);
+        }
+    }
+    return { actuallyApplied, failed, noEdits };
+}
+//# sourceMappingURL=write-pipeline.js.map
+;// CONCATENATED MODULE: ./out/update/select.js
+
+
+
+
+/** Thrown when the user cancels the interactive prompt — callers should exit 0, not 1. */
+class UserCancelledError extends Error {
+    constructor() { super("Cancelled."); this.name = "UserCancelledError"; }
 }
 /**
  * Build the option groups for the interactive multi-select prompt.
@@ -98845,21 +99056,310 @@ async function selectCandidates(applyableCandidates, depRealpaths) {
     // Each option value is UpdateCandidate[] (singleton or collapsed group); flatten to a flat list.
     return result.flat();
 }
+//# sourceMappingURL=select.js.map
+;// CONCATENATED MODULE: ./out/update/ecosystems.js
 /**
- * Resolve filesystem realpaths for all Starlark-ecosystem dep files.
- * Shared by run() and reconcileConstantGroups so both use identical keys.
- * Only Starlark deps are processed; non-Starlark entries are ignored.
+ * Ecosystems supported by the update CLI. Kept in a leaf module so the verify
+ * action can import this set without pulling in the rest of the updater.
+ *
+ * Re-exported from ecosystem-registry.ts, which is the single source of truth.
  */
-async function resolveDepRealpaths(deps) {
-    const depRealpaths = new Map();
-    await Promise.all(deps
-        .filter((d) => STARLARK_ECOSYSTEMS.has(d.ecosystem))
-        .map(async (d) => {
-        if (!depRealpaths.has(d.file)) {
-            depRealpaths.set(d.file, await promises_namespaceObject.realpath(d.file).catch(() => d.file));
+
+//# sourceMappingURL=ecosystems.js.map
+;// CONCATENATED MODULE: ./out/update/run.js
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/**
+ * When an OCI tag has moved between resolve and pin time (the freshly-fetched digest differs
+ * from the pre-resolved one), re-fetch the new digest's publish date and gate it before
+ * accepting it (fail-closed) — the new content might be brand-new. For a previously-unpinned
+ * ref under `pinUnpinned=true`, still pins with a warning rather than nulling out (the user
+ * already opted into pinning unverified images); already-pinned refs stay fail-closed.
+ * Returns the digest to pin (or `null` to skip) plus the refreshed age metadata to propagate
+ * to every candidate sharing this pin's cache key, or `null` when the digest was rejected.
+ */
+async function reGateMovedTag(eco, dep, latest, ref, freshDigest, minAgeDays, pinUnpinned) {
+    const { publishDate: d, ageDays: freshAge } = await fetchImageAgeFromDigest(ref.registry, ref.repository, freshDigest, latest);
+    const ageClause = formatAgeClause(freshAge, minAgeDays);
+    if (!meetsMinAge(freshAge, minAgeDays)) {
+        const wasUnpinned = wasUnpinnedRef(dep);
+        if (shouldBypassAgeGate(wasUnpinned, pinUnpinned)) {
+            lib_core.warning(`[lisan] ${eco}: ${dep.name}:${latest} tag moved upstream; ` +
+                `new digest is ${ageClause} but pinning previously-unpinned image anyway ` +
+                `(--pin-unpinned); pass --no-pin-unpinned to skip`);
+            return { pin: freshDigest, refreshedAge: { ageDays: freshAge, publishDate: d } };
         }
-    }));
-    return depRealpaths;
+        lib_core.warning(`[lisan] ${eco}: ${dep.name}:${latest} tag moved upstream but new ` +
+            `digest is ${ageClause}; skipping pin to avoid introducing a too-young image`);
+        return { pin: null, refreshedAge: null };
+    }
+    return { pin: freshDigest, refreshedAge: { ageDays: freshAge, publishDate: d } };
+}
+/**
+ * Resolve the SHA (actions) or OCI digest (docker/kubernetes) each pin-eligible
+ * candidate should be pinned to, populating `pinCache` and assigning `pinnedTo`
+ * on every matching candidate. OCI digests are always resolved; actions SHAs are
+ * only resolved under "sha" style.
+ */
+async function resolvePins(candidates, pinCache, opts) {
+    const { style, token, minAgeDays } = opts;
+    if (candidates.length === 0)
+        return;
+    // Collect unique keys and their representative candidate for resolution.
+    // Use resolveCacheKey (||| separator) to avoid collisions on names containing ":" or "@"
+    // (e.g. digest-pinned OCI images like "registry/repo:tag@sha256:...").
+    const uniquePinKeys = new Map();
+    for (const candidate of candidates) {
+        const eco = candidate.dep.ecosystem;
+        if (eco === "actions" && style !== "sha")
+            continue; // actions SHA only under sha style
+        if (eco !== "actions" && eco !== "docker" && eco !== "kubernetes")
+            continue;
+        const cacheKey = resolveCacheKey(eco, candidate.dep.name, candidate.latest);
+        if (!uniquePinKeys.has(cacheKey))
+            uniquePinKeys.set(cacheKey, candidate);
+    }
+    // Stores age metadata refreshed when a tag moves between resolve and pin time.
+    // Keyed by the same cacheKey used in pinCache so the final fan-out loop can
+    // propagate it to ALL candidates sharing that key, not just the representative.
+    const refreshedAgeByKey = new Map();
+    const resolvePinTasks = [...uniquePinKeys.entries()].map(([cacheKey, candidate]) => async () => {
+        // Wrap the entire body in try/catch so that a thrown registry call (ociDigestForTag,
+        // fetchImagePublishDate, resolveRefToSha) sets pinCache.set(key, null) instead of
+        // leaving the key absent — an absent key lets the candidate keep its buildCandidates
+        // pre-resolved digest, which contradicts the fail-closed intent.
+        try {
+            const eco = candidate.dep.ecosystem;
+            let resolvedPin = null;
+            if (eco === "actions") {
+                // Use the shared cached resolver from the verify path (single code path, per-run cache).
+                const ownerRepo = ownerRepoOf(candidate.dep.name); // strip subpath → "owner/repo"
+                const slashIdx = ownerRepo.indexOf("/");
+                const owner = ownerRepo.slice(0, slashIdx);
+                const repo = ownerRepo.slice(slashIdx + 1);
+                resolvedPin = await resolveRefToSha(owner, repo, candidate.latest, token);
+                if (resolvedPin === null) {
+                    lib_core.warning(`[lisan] actions: could not resolve SHA for ${candidate.dep.name}@${candidate.latest}; ` +
+                        `pinning as tag instead of commit SHA (sha style requested but GitHub API returned no SHA). ` +
+                        `This will be reflected in the summary as a tag-pinned update.`);
+                }
+            }
+            else if (eco === "docker" || eco === "kubernetes") {
+                const ref = parseImageRef(candidate.dep.name);
+                if (ref) {
+                    const preResolved = candidate.pinnedTo; // set by buildCandidates from resolveLatest
+                    if (preResolved) {
+                        // Reuse the digest already resolved in resolveLatest (single round-trip, no TOCTOU).
+                        // If the tag moved between resolve and pin (digest changed), re-fetch the new
+                        // digest's publish date and gate it — the new content might be brand-new.
+                        const freshDigest = await ociDigestForTag(ref.registry, ref.repository, candidate.latest, opts.dockerhubMirror);
+                        if (freshDigest && freshDigest !== preResolved) {
+                            // Shared helper: fetchImagePublishDate → computeAgeDays (single code path
+                            // with the verify-side age computation via ecosystems/image.ts).
+                            const { pin, refreshedAge } = await reGateMovedTag(eco, candidate.dep, candidate.latest, ref, freshDigest, minAgeDays, opts.pinUnpinned);
+                            resolvedPin = pin;
+                            // Propagate the fresh digest's age to both the representative candidate and the
+                            // shared map so ALL candidates sharing this cacheKey stay in sync below (duplicate
+                            // images referenced in multiple files keep stale age without this).
+                            if (refreshedAge !== null) {
+                                candidate.ageDays = refreshedAge.ageDays;
+                                candidate.publishDate = refreshedAge.publishDate;
+                                refreshedAgeByKey.set(cacheKey, refreshedAge);
+                            }
+                        }
+                        else {
+                            // tag hasn't moved (freshDigest === preResolved) or the re-check failed (freshDigest null).
+                            // A failed re-check must not silently reuse the pre-resolved digest — treat as unresolved,
+                            // matching the fail-closed posture of the sibling branch above.
+                            resolvedPin = freshDigest === preResolved ? freshDigest : null;
+                        }
+                    }
+                    else {
+                        resolvedPin = await ociDigestForTag(ref.registry, ref.repository, candidate.latest, opts.dockerhubMirror);
+                    }
+                }
+                if (resolvedPin === null) {
+                    lib_core.warning(`[lisan] ${eco}: could not resolve digest for ${candidate.dep.name}:${candidate.latest}; ` +
+                        `skipping — not writing a mutable ref without a digest`);
+                }
+            }
+            pinCache.set(cacheKey, resolvedPin);
+        }
+        catch (err) {
+            // Fail-closed: a thrown registry call must not leave the key absent (absent → candidate
+            // keeps its buildCandidates pre-resolved digest instead of being skipped). Set null so
+            // the candidate is filtered out in the pinCache.has() fan-out loop below.
+            lib_core.warning(`[lisan] ${candidate.dep.ecosystem}: pin resolution threw for ${candidate.dep.name}; ` +
+                `failing closed — ${err instanceof Error ? err.message : String(err)}`);
+            pinCache.set(cacheKey, null);
+        }
+    });
+    await runBatched(resolvePinTasks, RESOLVE_CONCURRENCY, (m) => lib_core.warning(m));
+    // Apply resolved pins to all matching candidates.
+    // Using pinCache.has() rather than a truthiness check so that null (meaning
+    // "resolution ran and decided to skip this pin — e.g. moved tag too young")
+    // is honoured instead of silently falling back to the pre-resolved digest
+    // that buildCandidates() set earlier. Without this, a null resolvedPin would
+    // be a no-op and the candidate would survive the `!c.pinnedTo` filter with a
+    // stale digest, contradicting the explicit "skip" decision.
+    //
+    // Also propagate refreshed age metadata to ALL candidates sharing a cacheKey,
+    // not just the representative candidate updated in resolvePinTasks above.
+    // Duplicate candidates (same image referenced in multiple files) would otherwise
+    // keep stale ageDays/publishDate from buildCandidates() in --json / hints.
+    for (const candidate of candidates) {
+        const eco = candidate.dep.ecosystem;
+        if (eco !== "actions" && eco !== "docker" && eco !== "kubernetes")
+            continue;
+        const cacheKey = resolveCacheKey(eco, candidate.dep.name, candidate.latest);
+        if (pinCache.has(cacheKey)) {
+            const pin = pinCache.get(cacheKey);
+            candidate.pinnedTo = pin ?? undefined;
+        }
+        const refreshedAge = refreshedAgeByKey.get(cacheKey);
+        if (refreshedAge) {
+            candidate.ageDays = refreshedAge.ageDays;
+            candidate.publishDate = refreshedAge.publishDate;
+        }
+    }
+}
+/**
+ * Fetch current/new licenses for each version-bumping candidate and apply the
+ * license policy, annotating each candidate's licenseCurrent/licenseNew/
+ * licenseRegresses/licenseBlocked fields in place. `licenseMap` is populated with
+ * the fetched raw license strings (keyed eco|||name|||version).
+ */
+async function applyLicensePolicy(candidates, licenseMap, opts) {
+    const { licensePolicy, registries, token, bcrUrl, json: isJson } = opts;
+    if (licensePolicy === "off")
+        return;
+    const javaRepoMap = new Map();
+    for (const c of candidates) {
+        if (c.dep.ecosystem === "java" && c.dep.repositories) {
+            javaRepoMap.set(c.dep.name, c.dep.repositories);
+        }
+    }
+    // Candidates eligible for license checking (version-bumping ecosystems only).
+    const licenseEligible = candidates.filter((c) => !isOciEcosystem(c.dep.ecosystem));
+    // Deduplicate fetches using resolveCacheKey (||| separator, safe for all name/version forms).
+    // currentTagOf strips the @sha256: suffix for OCI ecosystems — only strip for those.
+    const uniqueFetches = new Map();
+    for (const c of licenseEligible) {
+        const curVer = currentTagOf(c.dep);
+        const curKey = resolveCacheKey(c.dep.ecosystem, c.dep.name, curVer);
+        const newKey = resolveCacheKey(c.dep.ecosystem, c.dep.name, c.latest);
+        if (!uniqueFetches.has(curKey))
+            uniqueFetches.set(curKey, { ecosystem: c.dep.ecosystem, name: c.dep.name, version: curVer });
+        if (!uniqueFetches.has(newKey))
+            uniqueFetches.set(newKey, { ecosystem: c.dep.ecosystem, name: c.dep.name, version: c.latest });
+    }
+    // Track which cache keys had a registry fetch error — distinct from `null` (no license declared).
+    // Used to fail-closed under `block` policy when the new version's license cannot be confirmed.
+    const licenseFetchErrors = new Set();
+    const licenseFetchTasks = [...uniqueFetches.entries()].map(([key, spec]) => async () => {
+        try {
+            const raw = await fetchLicense(spec, registries, javaRepoMap, token, bcrUrl);
+            licenseMap.set(key, raw);
+        }
+        catch (err) {
+            // Log the error so the operator knows which fetch failed and why, rather than silently
+            // treating a transient 5xx/timeout as "no license declared".
+            lib_core.warning(`[lisan] license: fetch failed for ${spec.ecosystem}:${spec.name}@${spec.version} — ` +
+                `${err instanceof Error ? err.message : String(err)}`);
+            licenseFetchErrors.add(key);
+            licenseMap.set(key, null);
+        }
+    });
+    const spin = isJson ? null : ft();
+    spin?.start("Checking license permissiveness…");
+    await runBatched(licenseFetchTasks, RESOLVE_CONCURRENCY, (m) => lib_core.warning(m));
+    spin?.stop("Done.");
+    for (const c of licenseEligible) {
+        const curVer = currentTagOf(c.dep);
+        c.licenseCurrent = normalizeSpdxId(licenseMap.get(resolveCacheKey(c.dep.ecosystem, c.dep.name, curVer)) ?? null);
+        c.licenseNew = normalizeSpdxId(licenseMap.get(resolveCacheKey(c.dep.ecosystem, c.dep.name, c.latest)) ?? null);
+        const newKey = resolveCacheKey(c.dep.ecosystem, c.dep.name, c.latest);
+        const { keep, regresses, verified } = decideLicense({
+            currentLicense: c.licenseCurrent,
+            newLicense: c.licenseNew,
+            policy: licensePolicy,
+            newLicenseFetchFailed: licenseFetchErrors.has(newKey),
+        });
+        c.licenseRegresses = verified ? regresses : undefined;
+        c.licenseBlocked = !keep;
+        if (!isJson) {
+            if (!keep) {
+                const reason = licenseFetchErrors.has(newKey)
+                    ? `new license could not be confirmed (registry fetch error); skipping (--license-policy=block)`
+                    : `license tightens ${c.licenseCurrent} → ${c.licenseNew}; skipping (--license-policy=block)`;
+                dist_R.warn(`${c.dep.name}: ${reason}`);
+            }
+            else if (regresses && verified) {
+                dist_R.warn(`${c.dep.name}: license tightens ${c.licenseCurrent} → ${c.licenseNew} (--license-policy=warn)`);
+            }
+        }
+    }
+    // Blocked candidates remain in the list for JSON/RunResult visibility;
+    // they are excluded from selection in Step 8.
+}
+/**
+ * Discover all dependency refs across the requested ecosystems.
+ * Per-ecosystem discover() failures are logged as warnings and do not abort
+ * discovery for other ecosystems — mirrors the verify action's resilience in main.ts.
+ *
+ * Throws when every requested ecosystem both (a) has a registered dispatch and
+ * (b) threw during discover(), because that state is indistinguishable from a
+ * clean repo (allDeps is empty, run() would report "no updates") but is actually
+ * a misconfiguration (bad --module-bazel path, missing workflow dir, etc.).  A
+ * partial failure (some ecosystems succeed, some fail) is still just a warning.
+ */
+async function discoverDeps(opts) {
+    const { ecosystems } = opts;
+    const allDeps = [];
+    let dispatchedCount = 0;
+    let errorCount = 0;
+    for (const eco of ecosystems) {
+        const dispatch = ECOSYSTEM_DISPATCH[eco];
+        if (!dispatch) {
+            lib_core.warning(`[lisan] unknown ecosystem: ${eco}`);
+            continue;
+        }
+        dispatchedCount++;
+        try {
+            const discovered = await dispatch.discover(opts);
+            allDeps.push(...discovered);
+        }
+        catch (err) {
+            errorCount++;
+            lib_core.warning(`[lisan] discover failed for ecosystem ${eco}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+    if (dispatchedCount > 0 && errorCount === dispatchedCount) {
+        throw new Error(`[lisan] all ${dispatchedCount} requested ecosystem(s) failed during discovery ` +
+            `(check --module-bazel path and other file inputs). ` +
+            `This is a configuration error, not an empty repo.`);
+    }
+    return allDeps;
 }
 /**
  * Split OCI pin-in-place candidates into those with resolved digests and those that
@@ -98879,6 +99379,54 @@ function filterResolvedDigests(candidates) {
         return existingDigest !== c.pinnedTo;
     });
     return { resolved, digestDropped };
+}
+/**
+ * Route digest-unresolvable OCI candidates to `skipped` or `failed` depending on whether
+ * this is a report-only invocation (`--json`, `--dry-run`) or a real apply run. Report-only
+ * modes never write files, so an unresolvable digest is advisory (skipped); a real apply run
+ * couldn't write that candidate, so it's a genuine failure. Centralizes the rule that was
+ * previously re-derived at each of the three `run()` return points.
+ */
+function routeDigestDropped(digestDropped, isReportOnly) {
+    return isReportOnly
+        ? { skippedExtra: digestDropped, failedExtra: [] }
+        : { skippedExtra: [], failedExtra: digestDropped };
+}
+/**
+ * Build the final RunResult so both the --json early-return and the normal apply-run return
+ * point share one shape. `digestDropped` candidates are folded back into `candidates` here —
+ * `resolvedCandidates` (computed by filterResolvedDigests) excludes them, so without this a
+ * candidate that ends up in `failed`/`skipped` via routeDigestDropped would be invisible to a
+ * consumer rendering `result.candidates`, despite a non-zero exit code on a real apply run.
+ */
+function assembleResult(opts) {
+    return {
+        candidates: [...opts.resolvedCandidates, ...opts.digestDropped],
+        applied: opts.applied,
+        skipped: opts.skipped,
+        failed: opts.failed,
+        noEdits: opts.noEdits,
+    };
+}
+/**
+ * Collapse the duplicated JSON-early-return vs. apply-path final-return finalization logic
+ * (routeDigestDropped + assembleResult) into one call. `isReportOnly` selects whether
+ * digest-unresolvable candidates are advisory (skipped, for --json/--dry-run) or genuine
+ * failures (a real apply run that couldn't write them). `skippedBase`/`failedBase` are the
+ * base arrays each call site folds `skippedExtra`/`failedExtra` into — they differ between
+ * the two call sites (see run()) but the merge order and shape are otherwise identical.
+ */
+function finalize(opts) {
+    const { skippedExtra, failedExtra } = routeDigestDropped(opts.digestDropped, opts.isReportOnly);
+    return assembleResult({
+        resolvedCandidates: opts.resolvedCandidates,
+        digestDropped: opts.digestDropped,
+        applied: opts.applied,
+        skipped: [...opts.skippedBase, ...skippedExtra],
+        // failedExtra MUST come first — matches the original ordering exactly at both call sites.
+        failed: [...failedExtra, ...opts.failedBase],
+        noEdits: opts.noEdits,
+    });
 }
 /**
  * Identify shared-constant literal keys where any member candidate is license-blocked.
@@ -98941,7 +99489,7 @@ async function run(opts) {
     // and skipped during candidate building.
     const spin = isJson ? null : ft();
     spin?.start("Resolving latest versions…");
-    const rawVersionCache = await dedupeAndResolve(filteredDeps, (dep) => resolveCacheKey(dep.ecosystem, dep.name, dep.current), (dep) => resolveLatest(dep, {
+    const rawVersionCache = await resolve_dedupeAndResolve(filteredDeps, (dep) => resolveCacheKey(dep.ecosystem, dep.name, dep.current), (dep) => resolveLatest(dep, {
         mode,
         minAgeDays,
         token,
@@ -98973,7 +99521,11 @@ async function run(opts) {
         ["java", javaExistenceCheck],
         ["rust", rustExistenceCheck],
         ["bazel", makeBazelExistenceCheck(token, bcrUrl)],
-    ]), registries);
+    ]), new Map([
+        ["java", javaAgeCheck],
+        ["rust", rustAgeCheck],
+        ["bazel", makeBazelAgeCheck(token, bcrUrl)],
+    ]), registries, minAgeDays, versionCache);
     // Filter OCI (docker/kubernetes) pin-in-place candidates:
     // - Drop if no digest could be resolved (would emit nothing and confuse the UI).
     //   Candidates dropped for this reason are accumulated into digestDropped and
@@ -98998,13 +99550,24 @@ async function run(opts) {
     // Step 9 — JSON output
     if (isJson) {
         const output = buildJsonOutput(resolvedCandidates, depRealpaths, blockedConstantKeys);
-        console.log(JSON.stringify(output, null, 2));
-        // Nothing is written in JSON/dry-run mode, so `applied` is empty and `failed` is also
-        // empty — digestDropped candidates are moved to `skipped` so that report-only invocations
-        // (`--json`, `--dry-run`) exit 0 even when some digests couldn't be resolved. Unresolvable
-        // digests are surfaced in the printed JSON via `pinnedTo: null` entries in the output array,
-        // so consumers can still identify them without relying on a non-zero exit code.
-        return { candidates: resolvedCandidates, applied: [], skipped: [...resolvedCandidates, ...digestDropped], failed: [], noEdits: [] };
+        // Bypass installActionsCommandFilter (installed by update/cli.ts) so this payload
+        // always reaches the real stdout, even though @actions/core warnings fired earlier
+        // in this same run are being redirected to stderr by that same filter.
+        writeRawStdout(JSON.stringify(output, null, 2) + "\n");
+        // Nothing is written in JSON mode, so `applied` is empty — digestDropped candidates are
+        // routed via routeDigestDropped (report-only → skipped) so that `--json` exits 0 even when
+        // some digests couldn't be resolved. Unresolvable digests are surfaced in the printed JSON
+        // via `pinnedTo: null` entries in the output array, so consumers can still identify them
+        // without relying on a non-zero exit code.
+        return finalize({
+            resolvedCandidates,
+            digestDropped,
+            isReportOnly: true,
+            applied: [],
+            skippedBase: resolvedCandidates,
+            failedBase: [],
+            noEdits: [],
+        });
     }
     // Step 10 — Selection
     // depRealpaths and blockedConstantKeys already computed before the JSON block above.
@@ -99027,29 +99590,27 @@ async function run(opts) {
     // that WOULD have been applied: selected minus benign-skip noEdits and build failures.
     // This makes the dry-run preview truthful — it no longer overstates by including
     // candidates that would silently produce no file edits in a real run.
-    const dryRunApplied = dryRun
-        ? (() => {
-            const excluded = new Set([...noEdits, ...failed]);
-            return selected.filter((c) => !excluded.has(c));
-        })()
-        : null;
-    return {
-        candidates: resolvedCandidates,
-        applied: dryRun ? dryRunApplied : actuallyApplied,
-        // In dry-run mode, unresolvable-digest candidates are advisory (skipped), not failures,
-        // mirroring the --json early-return. Only a real apply run can meaningfully fail them.
-        skipped: dryRun
-            ? [...resolvedCandidates.filter((c) => !selected.includes(c)), ...digestDropped]
-            : resolvedCandidates.filter((c) => !selected.includes(c)),
-        failed: dryRun ? failed : [...digestDropped, ...failed],
+    const applied = dryRun
+        ? selected.filter((c) => !noEdits.includes(c) && !failed.includes(c))
+        : actuallyApplied;
+    // In dry-run mode, unresolvable-digest candidates are advisory (skipped), not failures,
+    // mirroring the --json early-return. Only a real apply run can meaningfully fail them.
+    return finalize({
+        resolvedCandidates,
+        digestDropped,
+        isReportOnly: dryRun,
+        applied,
+        skippedBase: resolvedCandidates.filter((c) => !selected.includes(c)),
+        failedBase: failed,
         noEdits,
-    };
+    });
 }
 //# sourceMappingURL=run.js.map
 ;// CONCATENATED MODULE: ./out/update/version.js
 const CLI_VERSION = "1.0.0";
 //# sourceMappingURL=version.js.map
 ;// CONCATENATED MODULE: ./out/update/cli.js
+
 
 
 
@@ -99072,18 +99633,24 @@ class ValidationError extends Error {
 /**
  * Determine the process exit code from a RunResult.
  * - Exit 1 when any update failed to apply.
- * - Exit 1 when all selections produced no file edits (applied=0 and noEdits>0):
- *   the user positively selected packages but nothing was written — indicates a build-phase
- *   failure and should be flagged regardless of interactive vs --yes mode.
- * - Exit 1 under --yes when any selected update produced no file edits (partial no-op
- *   is also unexpected in non-interactive mode).
+ * - In report-only modes (--dry-run, --json), `noEdits` only describes what a real
+ *   apply run *would* skip — no files were ever written or attempted, so a benign
+ *   no-op (e.g. a multi-line FROM, a template-incompatible version constant) must
+ *   not fail the preview. Only `failed` (a hard error discovered while building the
+ *   report) can exit non-zero in this mode.
+ * - Otherwise (an actual apply run) under --yes: exit 1 when any selected update
+ *   produced no file edits — a non-interactive run has no human to notice the
+ *   warning above, so a partial (or total) no-op must be flagged via exit code.
+ * - Otherwise (an actual apply run, interactive): a benign no-op is not an error —
+ *   the user positively selected exactly the candidates that couldn't produce an
+ *   edit, saw the warning printed above, and made an informed choice. Exit 0.
  * - Exit 0 otherwise (including when the user intentionally selects nothing).
  */
-function computeExitCode(result, yes) {
+function computeExitCode(result, yes, isDryRun) {
     if (result.failed.length > 0)
         return 1;
-    if (result.applied.length === 0 && result.noEdits.length > 0)
-        return 1;
+    if (isDryRun)
+        return 0;
     if (yes && result.noEdits.length > 0)
         return 1;
     return 0;
@@ -99263,7 +99830,7 @@ cli
                     ? `Updated ${result.applied.length} package(s).`
                     : "No updates applied.");
         }
-        const exitCode = computeExitCode(result, runOpts.yes);
+        const exitCode = computeExitCode(result, runOpts.yes, isDryRun);
         if (exitCode !== 0)
             process.exit(exitCode);
     }
@@ -99282,8 +99849,15 @@ cli
 });
 cli.help();
 cli.version(CLI_VERSION);
-// Guard: do not invoke argument parsing when imported from tests (vitest sets VITEST=true).
+// Guard: do not invoke argument parsing, nor patch process.stdout.write, when this
+// module is imported from tests (vitest sets VITEST=true) rather than run as a CLI.
+// installActionsCommandFilter intercepts @actions/core's stdout ::commands
+// (core.warning/core.info/etc. fire unconditionally from deep inside run(), not just
+// under --json) and renders them on stderr instead, so `--json`'s stdout stays pure
+// JSON regardless of what warnings fire during the run — see run.ts's JSON output
+// step, which writes via writeRawStdout() to bypass this filter for the payload itself.
 if (!process.env["VITEST"]) {
+    installActionsCommandFilter();
     cli.parse();
 }
 //# sourceMappingURL=cli.js.map

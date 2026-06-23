@@ -34,6 +34,9 @@ export interface ResolveLatestOpts {
   javaRepositories?: string[];  // for java ecosystem
   bcrUrl?: string;              // for bazel ecosystem, default "https://bcr.bazel.build"
   dockerhubMirror?: string;     // Docker Hub mirror tried as fallback on rate-limit during digest resolution
+  /** Downgrade policy — propagated to resolveLazy so it can collect the full version list when
+   *  a downgrade target may exist (vs. the fast "break after first qualifying" path for "no"). */
+  allowDowngrade?: AllowDowngrade;
 }
 
 // Tokens that indicate a stable (non-prerelease) release qualifier.
@@ -553,7 +556,13 @@ async function resolveLazy(
     const entry = candidates.find((v) => v.version === dep.current);
     if (!entry) return null;
     if (entry.publishDate) return computeAgeDays(entry.publishDate);
-    return computeAgeDays(await dateResolver(dep.name, dep.current, registries));
+    try {
+      return computeAgeDays(await dateResolver(dep.name, dep.current, registries));
+    } catch {
+      // Transient registry failure while fetching the current version's age — null is safe
+      // (only used by decideDowngrade for an advisory; must not suppress upgrade candidates).
+      return null;
+    }
   })();
 
   const withAge = candidates.map((v) => ({
@@ -568,6 +577,10 @@ async function resolveLazy(
   );
 
   const gated: VersionInfo[] = [];
+  // When a downgrade is allowed (allow/only), we must inspect the full age-gated list so
+  // buildCandidates can find the best lower-version target. For the default "no" policy,
+  // break after the first qualifying version (the newest) to avoid N extra round-trips.
+  const needFullList = opts.allowDowngrade !== undefined && opts.allowDowngrade !== "no";
   for (const v of modeFiltered) {
     let ageDays = v.ageDays;
     if (ageDays === null) {
@@ -584,7 +597,7 @@ async function resolveLazy(
     // meetsMinAge is fail-closed: versions whose date cannot be resolved are skipped.
     if (meetsMinAge(ageDays, minAgeDays)) {
       gated.push({ ...v, ageDays });
-      break; // only the newest qualifying version is needed
+      if (!needFullList) break; // fast path: only the newest qualifying version is needed
     }
   }
   return { versions: gated, currentAgeDays };
@@ -699,7 +712,7 @@ export async function resolveLatest(
         } else {
           if (pinResult.publishDate === null) {
             core.info(
-              `${dep.ecosystem}: ${dep.name}:${currentTag} publish date unavailable; skipping pin`,
+              `${dep.ecosystem}: ${dep.name}:${currentTag} publish date unavailable (age unconfirmable)`,
             );
           }
           currentAgeDays = pinResult.ageDays;

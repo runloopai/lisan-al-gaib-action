@@ -68,6 +68,21 @@ export interface RunOpts {
   bcrUrl: string;
   /** Docker Hub mirror URL (e.g. mirror.gcr.io) — tried as fallback when Docker Hub rate-limits digest resolution, matching the verify path's mirror strategy. */
   dockerhubMirror?: string;
+  /**
+   * When true (default), pin a previously-unpinned (tag-only) docker/kubernetes image to its
+   * current digest even when the image fails the age gate (too young or publish date
+   * unconfirmable). A warning is always emitted in this case.
+   *
+   * Rationale: pinning a mutable tag to the digest it resolves to *today* introduces no new
+   * content — it freezes what the user is already running. The age gate's purpose is to prevent
+   * a *newer*, unvetted image from sneaking in, which is not relevant here.
+   *
+   * Already-pinned images whose tag moved to a too-young digest are NOT bypassed — that case
+   * is the protective one and stays fail-closed regardless of this flag.
+   *
+   * Set to false (--no-pin-unpinned) to restore the original fail-closed behavior.
+   */
+  pinUnpinned: boolean;
 }
 
 export interface RunResult {
@@ -160,6 +175,11 @@ export async function resolvePins(
 
   const resolvePinTasks = [...uniquePinKeys.entries()].map(
     ([cacheKey, candidate]) => async () => {
+      // Wrap the entire body in try/catch so that a thrown registry call (ociDigestForTag,
+      // fetchImagePublishDate, resolveRefToSha) sets pinCache.set(key, null) instead of
+      // leaving the key absent — an absent key lets the candidate keep its buildCandidates
+      // pre-resolved digest, which contradicts the fail-closed intent.
+      try {
       const eco = candidate.dep.ecosystem;
       let resolvedPin: string | null = null;
 
@@ -220,6 +240,16 @@ export async function resolvePins(
       }
 
       pinCache.set(cacheKey, resolvedPin);
+      } catch (err) {
+        // Fail-closed: a thrown registry call must not leave the key absent (absent → candidate
+        // keeps its buildCandidates pre-resolved digest instead of being skipped). Set null so
+        // the candidate is filtered out in the pinCache.has() fan-out loop below.
+        core.warning(
+          `[lisan] ${candidate.dep.ecosystem}: pin resolution threw for ${candidate.dep.name}; ` +
+          `failing closed — ${err instanceof Error ? err.message : String(err)}`,
+        );
+        pinCache.set(cacheKey, null);
+      }
     },
   );
 
@@ -686,7 +716,7 @@ export async function run(opts: RunOpts): Promise<RunResult> {
   const { actuallyApplied, failed, noEdits } = await buildAndApplyEdits(selected, style, dryRun);
 
   if (failed.length > 0) {
-    console.error(
+    core.warning(
       `[lisan] ${failed.length} update(s) could not be written: ` +
       failed.map((c) => `${c.dep.name} (${c.dep.file})`).join(", "),
     );
