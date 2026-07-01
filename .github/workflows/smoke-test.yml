@@ -1,0 +1,51 @@
+name: Smoke Test Binaries
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  smoke:
+    runs-on: ubuntu-slim
+    steps:
+      - uses: runloopai/checkout@main
+      - uses: runloopai/setup-node@main
+        with:
+          node-version-file: package.json
+      - name: Smoke test update CLI — version
+        run: |
+          OUTPUT=$(node cli-dist/index.js --version)
+          if ! echo "$OUTPUT" | grep -qE '[0-9]+\.[0-9]+'; then
+            echo "ERROR: --version output '$OUTPUT' does not look like a version number"
+            exit 1
+          fi
+      - name: Smoke test update CLI — actions dry-run
+        run: node cli-dist/index.js actions --dry-run --json
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Smoke test update CLI — bazel dry-run (exercises wasm load)
+        # When MODULE.bazel is absent, readModuleFilesSafe() catches the resolveModuleFiles()
+        # throw and returns [] — discover() returns [] (no deps, no error thrown).
+        # discoverDeps() sees errorCount=0, so the run exits 0 (no deps found, not an error).
+        # Exit 1 would only occur if every requested ecosystem failed during discovery (config
+        # error path in discoverDeps). Exit > 1 signals a crash (e.g. WASM load failure).
+        # This repo has no MODULE.bazel, so exit 0 is always expected here.
+        run: |
+          node cli-dist/index.js bazel --dry-run --json; EXIT=$?
+          if [ "$EXIT" -gt 1 ]; then
+            echo "ERROR: CLI crashed with exit code $EXIT (possible WASM load failure)"
+            exit "$EXIT"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Smoke test update CLI — unknown ecosystem exits non-zero
+        run: "! node cli-dist/index.js unknown-eco --dry-run --json"

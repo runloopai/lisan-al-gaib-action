@@ -16,7 +16,7 @@ vi.mock("@actions/github", () => ({
 
 import * as exec from "@actions/exec";
 import * as github from "@actions/github";
-import { checkBypass, isPrEvent } from "../src/bypass.js";
+import { checkBypass, isPrEvent, INTERACTIVE_PUSH_EVENTS } from "../src/bypass.js";
 
 function setEvent(
   eventName: string,
@@ -131,6 +131,30 @@ describe("checkBypass — pull_request_target event", () => {
   });
 });
 
+describe("checkBypass — unattended events (schedule / workflow_dispatch / workflow_run / merge_group)", () => {
+  // M6: pre-planted commit messages must not bypass on unattended triggers. Only the
+  // label path (PR label) is checked; git log must never be called for these events.
+  for (const eventName of ["schedule", "workflow_dispatch", "workflow_run", "merge_group"]) {
+    it(`${eventName}: does NOT fire commit-message bypass even if keyword is in commit`, async () => {
+      setEvent(eventName);
+      // If git log were called it would return the bypass keyword — but it must not be called.
+      vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
+        opts?.listeners?.stdout?.(Buffer.from("cve-fix\n"));
+        return 0;
+      });
+      const result = await checkBypass("cve-fix", "token");
+      expect(result).toBe(false);
+      expect(exec.exec).not.toHaveBeenCalled();
+    });
+
+    it(`${eventName}: returns false (no PR labels to check)`, async () => {
+      setEvent(eventName);
+      expect(await checkBypass("cve-fix", "")).toBe(false);
+      expect(exec.exec).not.toHaveBeenCalled();
+    });
+  }
+});
+
 describe("checkBypass — push event (non-PR)", () => {
   it("returns true when keyword is on its own line in commit message", async () => {
     setEvent("push");
@@ -193,5 +217,49 @@ describe("checkBypass — push event (non-PR)", () => {
     vi.mocked(exec.exec).mockRejectedValueOnce(new Error("git not found"));
     mockOctokit([{ labels: [{ name: "cve-fix" }] }]);
     expect(await checkBypass("cve-fix", "token")).toBe(true);
+  });
+});
+
+// A5: INTERACTIVE_PUSH_EVENTS — ensures the export drives the three-way bypass hint in main.ts
+describe("INTERACTIVE_PUSH_EVENTS", () => {
+  it("contains 'push' (the only event where commit-message bypass is accepted)", () => {
+    expect(INTERACTIVE_PUSH_EVENTS.has("push")).toBe(true);
+  });
+
+  it("does not contain unattended events — commit-message bypass must not fire on them", () => {
+    for (const event of ["schedule", "workflow_dispatch", "workflow_run"]) {
+      expect(INTERACTIVE_PUSH_EVENTS.has(event)).toBe(false);
+    }
+  });
+
+  it("does not contain PR events — those use the label-only path", () => {
+    for (const event of ["pull_request", "pull_request_target"]) {
+      expect(INTERACTIVE_PUSH_EVENTS.has(event)).toBe(false);
+    }
+  });
+
+  // Regression: the three-way hint logic used in main.ts must map events correctly.
+  // isPrEvent() → label-only hint
+  // INTERACTIVE_PUSH_EVENTS.has(event) → commit-or-label hint
+  // else → label-only hint with note that commit bypass is disabled
+  it("three-way hint logic: isPrEvent() and INTERACTIVE_PUSH_EVENTS partition events correctly", () => {
+    const prEvents = ["pull_request", "pull_request_target"];
+    const pushEvents = [...INTERACTIVE_PUSH_EVENTS];
+    const unattended = ["schedule", "workflow_dispatch", "workflow_run", "merge_group"];
+
+    // No overlap between the three categories
+    for (const e of prEvents) {
+      expect(INTERACTIVE_PUSH_EVENTS.has(e)).toBe(false);
+    }
+    for (const e of pushEvents) {
+      // push events should not be PR events
+      setEvent(e);
+      expect(isPrEvent()).toBe(false);
+    }
+    for (const e of unattended) {
+      expect(INTERACTIVE_PUSH_EVENTS.has(e)).toBe(false);
+      setEvent(e);
+      expect(isPrEvent()).toBe(false);
+    }
   });
 });

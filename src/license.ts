@@ -1,4 +1,5 @@
 import * as core from "@actions/core";
+import { dedupeAndResolve } from "./update/resolve.js";
 import * as exec from "@actions/exec";
 import * as github from "@actions/github";
 import * as fs from "node:fs/promises";
@@ -16,6 +17,23 @@ import tar from "tar-stream";
 import type { RegistryUrls, LicenseOverrides } from "./inputs.js";
 import type { CheckResult, ParsedImageRef } from "./ecosystems/types.js";
 import { fetchImageLabels } from "./registry.js";
+import { fetchWithRetry, FETCH_TIMEOUT_MS } from "./http.js";
+
+/**
+ * Thrown by license sub-fetchers when a registry call fails transiently
+ * (HTTP 429 / 5xx / network timeout) to distinguish "license unavailable due
+ * to registry error" from "no license declared" (null return).
+ *
+ * applyLicensePolicy catches this and marks the candidate's new-license fetch
+ * as failed so --license-policy=block can fail closed instead of promoting an
+ * update whose license cannot be confirmed.
+ */
+export class LicenseFetchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LicenseFetchError";
+  }
+}
 
 /** Quote a string for YAML if needed, using js-yaml's serializer. */
 function yamlQuote(s: string): string {
@@ -273,11 +291,6 @@ export function normalizeLicense(raw: string): string {
   if (lower === "zpl" || lower === "zpl 2.0" || lower === "zope public license") return "ZPL-2.0";
   if (lower === "zpl 2.1") return "ZPL-2.1";
 
-  // EDL (Eclipse Distribution License) — BSD-3-Clause
-  if (lower === "edl 1.0" || lower === "eclipse distribution license 1.0"
-    || lower === "eclipse distribution license - v 1.0"
-    || lower === "eclipse distribution license v. 1.0") return "BSD-3-Clause";
-
   // GPL w/ Classpath Exception variants (common in Jakarta/javax POMs)
   if (((lower.includes("gpl") || lower.includes("general public license")) && lower.includes("classpath"))
     || lower === "gpl2 w/ cpe" || lower === "gplv2+ce") {
@@ -523,6 +536,110 @@ export function isCompatibleWith(
   return false;
 }
 
+// Numeric restrictiveness levels used by isLicenseMoreRestrictiveThan.
+// Lower = more permissive. "unknown" is deliberately excluded from the key type (handled
+// by callers as fail-open) — every OTHER LicenseCategory member is required here by the
+// `Record<Exclude<...>, number>` type, so adding a new category to the union without also
+// giving it a level is a compile error, not a silent runtime drift.
+const RESTRICTIVENESS_LEVEL: Record<Exclude<LicenseCategory, "unknown">, number> = {
+  permissive: 0,
+  "apache-2.0": 1,
+  "lgpl-2.0": 2, "lgpl-2.1": 2, "lgpl-3.0": 2,
+  "mpl-2.0": 2, "epl-1.0": 2, "epl-2.0": 2, "cddl-1.0": 2,
+  "gpl-2.0-only": 3, "gpl-2.0-or-later": 3,
+  "gpl-3.0-only": 3, "gpl-3.0-or-later": 3,
+  "agpl-3.0": 4,
+};
+
+/**
+ * Compute the effective restrictiveness level of a potentially compound SPDX
+ * expression.
+ *
+ * This is a deliberately separate evaluator from `licenseLevel`/`licenseLevelFromNode`
+ * below: that one walks a real `spdx-expression-parse` AST (handles parens, returns a
+ * 3-bucket permissive/copyleft/unknown classification) but has no notion of *ordering*
+ * between two arbitrary expressions, which `isLicenseMoreRestrictiveThan` needs. Rather
+ * than extend the AST walker with a numeric-level return type used by only one caller,
+ * this string-split evaluator gives `isLicenseMoreRestrictiveThan` its own minimal,
+ * narrowly-scoped (and explicitly fail-open on parens, see below) ordering logic.
+ *
+ *   - `A OR B`  → most-permissive (minimum) level: the user can choose the least
+ *                 restrictive alternative, so the combined requirement is the lowest.
+ *   - `A AND B` → most-restrictive (maximum) level: both licenses must be honored,
+ *                 so the combined requirement is the highest.
+ *   - `A WITH X` → treated as the base identifier `A` (exception clauses don't
+ *                  change the fundamental restriction category).
+ *
+ * SPDX operator precedence: AND binds tighter than OR (SPDX 2.x spec §10).
+ * We therefore split on OR first (lowest precedence, outermost), then on AND
+ * within each OR-clause (higher precedence, inner), then strip WITH at the leaf.
+ *
+ * Returns `undefined` when any component maps to "unknown", preserving the
+ * existing fail-open contract for unrecognized licenses.
+ *
+ * Note: parenthesized sub-expressions (e.g. `(A OR B) AND C`) are not parsed;
+ * they will contain residual `(`/`)` chars and typically categorize as "unknown",
+ * which is fail-open (safe). Simple non-nested compound expressions are handled.
+ */
+function licenseLevelOrd(spdx: string): number | undefined {
+  // OR has lower precedence than AND — split OR first (outermost operator).
+  // `A OR B AND C` ≡ `A OR (B AND C)` per SPDX spec.
+  if (spdx.includes(" OR ")) {
+    const parts = spdx.split(" OR ").map((s) => s.trim());
+    const levels = parts.map(licenseLevelOrd);
+    if (levels.some((l) => l === undefined)) return undefined;
+    return Math.min(...(levels as number[]));
+  }
+
+  // AND has higher precedence than OR — split next.
+  if (spdx.includes(" AND ")) {
+    const parts = spdx.split(" AND ").map((s) => s.trim());
+    const levels = parts.map(licenseLevelOrd);
+    if (levels.some((l) => l === undefined)) return undefined;
+    return Math.max(...(levels as number[]));
+  }
+
+  // WITH clause at the leaf level: evaluate the base license only.
+  const withIdx = spdx.indexOf(" WITH ");
+  if (withIdx !== -1) return licenseLevelOrd(spdx.slice(0, withIdx).trim());
+
+  const category = categorize(spdx);
+  if (category === "unknown") return undefined;
+  return RESTRICTIVENESS_LEVEL[category];
+}
+
+/**
+ * Returns true when `newLicense` is strictly MORE restrictive than `currentLicense`
+ * (e.g. newLicense=GPL-3.0-only, currentLicense=MIT → true; new→MIT, current→GPL → false).
+ * Returns false (fail-open) when either license maps to "unknown".
+ * Handles compound SPDX expressions (OR/AND/WITH): OR takes the most-permissive
+ * level, AND takes the most-restrictive, WITH evaluates the base license.
+ * Use this instead of isCompatibleWith when ordering permissiveness, not checking mixing.
+ */
+export function isLicenseMoreRestrictiveThan(
+  newLicense: string,
+  currentLicense: string,
+): boolean {
+  const newLevel = licenseLevelOrd(newLicense);
+  const curLevel = licenseLevelOrd(currentLicense);
+  if (newLevel === undefined || curLevel === undefined) return false;
+  return newLevel > curLevel;
+}
+
+/**
+ * Normalize a raw registry license string to a corrected SPDX identifier.
+ * Returns null on null/empty input or if normalization throws.
+ */
+export function normalizeSpdxId(raw: string | null): string | null {
+  if (!raw) return null;
+  try {
+    const n = normalizeLicense(raw);
+    return spdxCorrect(n) ?? n;
+  } catch {
+    return null;
+  }
+}
+
 function fallbackCheck(depLicense: string, targetLicense: string): boolean {
   // Try spdx-satisfies
   try {
@@ -655,6 +772,69 @@ export function isLicenseCompatible(
 }
 
 /**
+ * Classify a single SPDX license identifier as permissive, copyleft, or unknown.
+ * Used by licenseLevelFromNode for AST-based compound expression evaluation.
+ */
+function classifySingleLicense(id: string): "permissive" | "copyleft" | "unknown" {
+  if (PERMISSIVE.has(id)) return "permissive";
+  const upper = id.toUpperCase();
+  if (
+    upper.startsWith("GPL-") || upper.startsWith("AGPL-") ||
+    upper.startsWith("LGPL-") || upper.startsWith("MPL-") ||
+    upper.startsWith("EPL-") || upper.startsWith("CDDL-") ||
+    upper.startsWith("EUPL-") || upper.startsWith("OSL-") ||
+    upper.startsWith("RPSL-") || upper.startsWith("SISSL")
+  ) return "copyleft";
+  // Apache-2.0 is permissive-leaning but treat as permissive for level purposes
+  if (upper === "APACHE-2.0") return "permissive";
+  if (upper === "BSL-1.0" || upper === "ARTISTIC-2.0" || upper === "ZPL-2.0" || upper === "ZPL-2.1") return "permissive";
+  return "unknown";
+}
+
+/**
+ * Walk an spdx-expression-parse AST node and return the most restrictive
+ * license level for the expression:
+ *   OR  → most permissive wins (any permissive branch → permissive)
+ *   AND → most restrictive wins (any copyleft branch → copyleft)
+ */
+function licenseLevelFromNode(node: ReturnType<typeof spdxParse>): "permissive" | "copyleft" | "unknown" {
+  if ("license" in node) {
+    return classifySingleLicense(node.license);
+  }
+  const left = licenseLevelFromNode((node as { conjunction: string; left: ReturnType<typeof spdxParse>; right: ReturnType<typeof spdxParse> }).left);
+  const right = licenseLevelFromNode((node as { conjunction: string; left: ReturnType<typeof spdxParse>; right: ReturnType<typeof spdxParse> }).right);
+  if ((node as { conjunction: string }).conjunction === "or") {
+    // OR: most permissive wins
+    if (left === "permissive" || right === "permissive") return "permissive";
+    if (left === "copyleft" || right === "copyleft") return "copyleft";
+    return "unknown";
+  }
+  // AND: most restrictive wins
+  if (left === "copyleft" || right === "copyleft") return "copyleft";
+  if (left === "permissive" || right === "permissive") return "permissive";
+  return "unknown";
+}
+
+/**
+ * Return a coarse license level for a compound SPDX expression.
+ * Parses the full AST (handles parentheses, AND, OR) via spdx-expression-parse.
+ * Returns "permissive", "copyleft", or "unknown".
+ *
+ * Unlike `licenseLevelOrd` above, this handles parenthesized sub-expressions correctly
+ * (it walks a real AST rather than splitting strings) — see `licenseLevelOrd`'s docstring
+ * for why the two evaluators aren't unified.
+ */
+export function licenseLevel(expr: string): "permissive" | "copyleft" | "unknown" {
+  try {
+    const corrected = spdxCorrect(expr) ?? expr;
+    const parsed = spdxParse(corrected);
+    return licenseLevelFromNode(parsed);
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
  * Fetch the license for an npm package from the registry.
  */
 /**
@@ -676,12 +856,13 @@ export async function fetchNpmLicense(
   licenseHeuristics: boolean = true,
 ): Promise<string | null> {
   try {
-    const resp = await fetch(`${registries.npm}/${name}/${version}`);
-    if (!resp.ok) return null;
-    const data = (await resp.json()) as {
+    const result = await fetchWithRetry<{
       license?: string;
       repository?: { url?: string } | string;
-    };
+    }>(`${registries.npm}/${name}/${version}`);
+    if (result.kind === "not_found") return null;
+    if (result.kind !== "ok") throw new LicenseFetchError(`npm registry ${result.kind} for ${name}@${version}`);
+    const data = result.data;
     const rawLicense = data.license ?? null;
     if (rawLicense && !isNonStandardLicense(rawLicense)) return rawLicense;
 
@@ -699,7 +880,8 @@ export async function fetchNpmLicense(
     }
     // Return original non-standard string as last resort (e.g., "SEE LICENSE IN ...")
     return rawLicense;
-  } catch {
+  } catch (err) {
+    if (err instanceof LicenseFetchError) throw err;
     return null;
   }
 }
@@ -710,7 +892,7 @@ export async function fetchNpmLicense(
  */
 async function extractLicenseFromTarball(tarballUrl: string): Promise<string | null> {
   try {
-    const resp = await fetch(tarballUrl);
+    const resp = await fetch(tarballUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     if (!resp.ok || !resp.body) return null;
 
     const extract = tar.extract();
@@ -764,7 +946,7 @@ async function extractLicenseFromTarball(tarballUrl: string): Promise<string | n
  */
 async function extractLicenseFromSdist(sdistUrl: string): Promise<string | null> {
   try {
-    const resp = await fetch(sdistUrl);
+    const resp = await fetch(sdistUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     if (!resp.ok || !resp.body) return null;
 
     const extract = tar.extract();
@@ -842,16 +1024,17 @@ export async function fetchPypiLicense(
   licenseHeuristics: boolean = true,
 ): Promise<string | null> {
   try {
-    const resp = await fetch(`${registries.pypi}/pypi/${name}/${version}/json`);
-    if (!resp.ok) return null;
-    const data = (await resp.json()) as {
+    const result = await fetchWithRetry<{
       info?: {
         license?: string;
         license_expression?: string;
         classifiers?: string[];
       };
       urls?: Array<{ packagetype?: string; url?: string }>;
-    };
+    }>(`${registries.pypi}/pypi/${name}/${version}/json`);
+    if (result.kind === "not_found") return null;
+    if (result.kind !== "ok") throw new LicenseFetchError(`PyPI registry ${result.kind} for ${name}@${version}`);
+    const data = result.data;
     // PEP 639: try license_expression first (new standard field)
     if (data.info?.license_expression && data.info.license_expression !== "UNKNOWN") {
       return data.info.license_expression;
@@ -898,7 +1081,8 @@ export async function fetchPypiLicense(
       }
     }
     return null;
-  } catch {
+  } catch (err) {
+    if (err instanceof LicenseFetchError) throw err;
     return null;
   }
 }
@@ -916,29 +1100,41 @@ export async function fetchCrateLicense(
   const headers = { "User-Agent": "lisan-al-gaib-action" };
   // Try exact version first
   try {
-    const resp = await fetch(`${registries.crates}/api/v1/crates/${name}/${version}`, { headers });
-    if (resp.ok) {
-      const data = (await resp.json()) as { version?: { license?: string } };
-      if (data.version?.license) return data.version.license;
+    const result = await fetchWithRetry<{ version?: { license?: string } }>(
+      `${registries.crates}/api/v1/crates/${name}/${version}`,
+      headers,
+    );
+    if (result.kind === "ok" && result.data.version?.license) {
+      return result.data.version.license;
     }
-  } catch {
+    if (result.kind === "rate_limited" || result.kind === "error") {
+      throw new LicenseFetchError(`crates.io ${result.kind} for ${name}@${version}`);
+    }
+    // not_found or ok-but-no-license: fall through to crate-level lookup
+  } catch (err) {
+    if (err instanceof LicenseFetchError) throw err;
     // fall through
   }
   // Fall back to crate-level metadata (latest version's license)
   try {
-    const resp = await fetch(`${registries.crates}/api/v1/crates/${name}`, { headers });
-    if (!resp.ok) return null;
-    const data = (await resp.json()) as { versions?: Array<{ license?: string }> };
-    if (data.versions?.length && data.versions[0].license) {
-      return data.versions[0].license;
-    }
+    const result = await fetchWithRetry<{ versions?: Array<{ license?: string }> }>(
+      `${registries.crates}/api/v1/crates/${name}`,
+      headers,
+    );
+    if (result.kind === "not_found") return null;
+    if (result.kind !== "ok") throw new LicenseFetchError(`crates.io ${result.kind} for ${name}`);
+    const versions = result.data.versions;
+    if (versions?.length && versions[0].license) return versions[0].license;
     return null;
-  } catch {
+  } catch (err) {
+    if (err instanceof LicenseFetchError) throw err;
     return null;
   }
 }
 
-const xmlParser = new XMLParser();
+// parseTagValue/parseAttributeValue disabled so numeric-looking license/version
+// text is preserved verbatim as strings rather than coerced to numbers.
+const xmlParser = new XMLParser({ parseTagValue: false, parseAttributeValue: false, processEntities: false });
 
 interface PomXml {
   project?: {
@@ -961,6 +1157,8 @@ interface PomXml {
 
 /**
  * Fetch POM XML from Maven repositories.
+ * Uses AbortSignal.timeout to enforce the shared fetch timeout, matching the
+ * behavior of the JSON-fetching helpers (fetchJson/fetchWithRetry).
  */
 async function fetchPom(
   groupId: string,
@@ -973,11 +1171,13 @@ async function fetchPom(
     const base = repo.replace(/\/$/, "");
     const pomUrl = `${base}/${groupPath}/${artifactId}/${version}/${artifactId}-${version}.pom`;
     try {
-      const resp = await fetch(pomUrl);
-      if (!resp.ok) continue;
+      const resp = await fetch(pomUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      if (resp.status === 404 || resp.status === 410) continue; // not in this repo, try next
+      if (!resp.ok) throw new LicenseFetchError(`Maven HTTP ${resp.status} for ${pomUrl}`);
       const text = await resp.text();
       return xmlParser.parse(text) as PomXml;
-    } catch {
+    } catch (err) {
+      if (err instanceof LicenseFetchError) throw err;
       continue;
     }
   }
@@ -1096,6 +1296,7 @@ export async function batchFetchGitHubLicenses(
           "User-Agent": "lisan-al-gaib-action",
         },
         body: JSON.stringify({ query }),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
       if (!resp.ok) continue;
       const data = (await resp.json()) as { data?: Record<string, { licenseInfo?: { spdxId?: string } } | null> };
@@ -1139,7 +1340,7 @@ export async function fetchGitHubRepoLicense(
   try {
     const resp = await fetch(
       `https://api.github.com/repos/${owner}/${repo}/license`,
-      { headers },
+      { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
     );
     if (!resp.ok) return null;
     const data = (await resp.json()) as {
@@ -1177,8 +1378,9 @@ export async function fetchBcrLicense(
   const bcrGitHub = "https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main";
   try {
     const url = `${bcrGitHub}/modules/${encodeURIComponent(name)}/metadata.json`;
-    const resp = await fetch(url);
-    if (!resp.ok) return null;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    if (resp.status === 404 || resp.status === 410) return null; // module not in BCR
+    if (!resp.ok) throw new LicenseFetchError(`BCR HTTP ${resp.status} for ${name}`);
     const data = (await resp.json()) as {
       licenses?: string[];
       homepage?: string;
@@ -1203,7 +1405,7 @@ export async function fetchBcrLicense(
     // Try source.json for this version — may have a GitHub URL
     try {
       const sourceUrl = `${bcrGitHub}/modules/${encodeURIComponent(name)}/${encodeURIComponent(version)}/source.json`;
-      const sourceResp = await fetch(sourceUrl);
+      const sourceResp = await fetch(sourceUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
       if (sourceResp.ok) {
         const sourceData = (await sourceResp.json()) as { url?: string };
         if (sourceData.url) {
@@ -1219,7 +1421,8 @@ export async function fetchBcrLicense(
     }
 
     return null;
-  } catch {
+  } catch (err) {
+    if (err instanceof LicenseFetchError) throw err;
     return null;
   }
 }
@@ -1242,7 +1445,7 @@ async function fetchMultitoolLicense(
 
   // Follow redirects (HEAD request) to check if final URL is on github.com
   try {
-    const resp = await fetch(url, { method: "HEAD", redirect: "follow" });
+    const resp = await fetch(url, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     const finalUrl = resp.url;
     const redirectMatch = finalUrl.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\//);
     if (redirectMatch) {
@@ -1357,9 +1560,6 @@ export async function checkLicenses(
   kubernetesImageRefs: Map<string, ParsedImageRef> = new Map(),
   dockerImageRefs: Map<string, ParsedImageRef> = new Map(),
 ): Promise<LicenseResult[]> {
-  // Cache: "ecosystem:name@version" → raw license string | null
-  const licenseCache = new Map<string, string | null>();
-
   // Identify deps that need fetching (not overridden, not cached)
   const depsToCheck = results.filter(({ dep }) => {
     const ecoTargets = getEcosystemTargetLicenses(targetLicenseMap, dep.ecosystem);
@@ -1369,27 +1569,19 @@ export async function checkLicenses(
     return true;
   });
 
-  // Deduplicate and fetch licenses in batches of 10
-  const toFetch: Array<{ dep: CheckResult["dep"]; cacheKey: string }> = [];
-  const seen = new Set<string>();
-  for (const { dep } of depsToCheck) {
-    const override = overrides?.get(dep.ecosystem)?.get(dep.name);
-    if (override) continue;
-    const cacheKey = `${dep.ecosystem}:${dep.name}@${dep.version}`;
-    if (licenseCache.has(cacheKey) || seen.has(cacheKey)) continue;
-    seen.add(cacheKey);
-    toFetch.push({ dep, cacheKey });
-  }
-  for (let i = 0; i < toFetch.length; i += 10) {
-    const batch = toFetch.slice(i, i + 10);
-    const settled = await Promise.allSettled(
-      batch.map(({ dep }) => fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics, kubernetesImageRefs, dockerImageRefs)),
-    );
-    batch.forEach(({ cacheKey }, idx) => {
-      const result = settled[idx];
-      licenseCache.set(cacheKey, result.status === "fulfilled" ? result.value : null);
-    });
-  }
+  // Dedupe-and-batch-fetch via the same leaf helper the updater uses (src/update/resolve.ts)
+  // so the "dedupe by cache key → runBatched → catch-per-task → null" pattern isn't
+  // hand-rolled twice. Pass core.warning so a failed license fetch is visible as a GitHub
+  // annotation rather than silently resolving to "no license declared".
+  const toFetch = depsToCheck.filter(({ dep }) => !overrides?.get(dep.ecosystem)?.get(dep.name));
+  const LICENSE_FETCH_CONCURRENCY = 10;
+  const licenseCache = await dedupeAndResolve(
+    toFetch,
+    ({ dep }) => `${dep.ecosystem}:${dep.name}@${dep.version}`,
+    ({ dep }) => fetchLicense(dep, registries, javaRepoMap, githubToken, bcrUrl, licenseHeuristics, kubernetesImageRefs, dockerImageRefs),
+    LICENSE_FETCH_CONCURRENCY,
+    core.warning,
+  );
 
   // Process results
   const licenseResults: LicenseResult[] = [];
@@ -1424,7 +1616,7 @@ export async function checkLicenses(
  * Get the workflow file path from GITHUB_WORKFLOW_REF.
  * Format: {owner}/{repo}/{path}@{ref}
  */
-function getWorkflowFile(): string | null {
+export function getWorkflowFile(): string | null {
   const workflowRef = process.env.GITHUB_WORKFLOW_REF;
   if (!workflowRef) return null;
   try {
@@ -1455,14 +1647,10 @@ function buildOverridesYaml(
 }
 
 /**
- * Show a colored git diff of the workflow file with license-overrides added.
- * Writes the suggestion to the file, runs git diff --color, then restores it.
- */
-/**
- * Find the insertion point in the workflow file for license-overrides.
+ * Find the insertion point in the workflow file for an input block under the action's `with:`.
  * Returns the line index to insert at, or -1 if not found.
  */
-function findOverrideInsertIdx(allLines: string[]): number {
+export function findWorkflowInsertIdx(allLines: string[]): number {
   const actionPattern = /uses:.*lisan-al-gaib/;
   const actionLineIdx = allLines.findIndex((l) => actionPattern.test(l));
   if (actionLineIdx === -1) return -1;
@@ -1563,7 +1751,7 @@ async function showOverrideDiff(
       modified.splice(endIdx, 0, ...newLines);
       await showGroupedDiff(workflowFile, original, modified.join("\n"), groupName);
     } else {
-      const insertIdx = findOverrideInsertIdx(allLines);
+      const insertIdx = findWorkflowInsertIdx(allLines);
       if (insertIdx === -1) return;
 
       const block = buildOverrideBlock(theOverrides);

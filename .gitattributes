@@ -3,3 +3,8 @@ dist/**/*.js -diff -merge linguist-generated=true
 dist/**/*.wasm linguist-generated=true
 dist/**/*.json -merge linguist-vendored=true
 
+# Mark cli-dist folder as generated
+cli-dist/**/*.js -diff -merge linguist-generated=true
+cli-dist/**/*.wasm linguist-generated=true
+cli-dist/**/*.json -merge linguist-vendored=true
+

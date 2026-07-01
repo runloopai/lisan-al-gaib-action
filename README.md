@@ -56,7 +56,7 @@ You can always override with the `base-ref` input.
 | `dockerfiles` | No | auto-detect | Newline-separated glob patterns for Dockerfile/Containerfile paths (for docker ecosystem). Auto-detect matches any changed file whose basename is exactly `Dockerfile` or `Containerfile` (case-insensitive). Use this input for non-standard names (`myapp.Dockerfile`, `Dockerfile.prod`, etc.). |
 | `dockerhub-mirror` | No | `""` | Docker Hub mirror hostname (e.g. `mirror.gcr.io`) to use as a fallback when the primary Docker Hub check is rate-limited (HTTP 429) while resolving `COPY --from` / `RUN --mount=from` references. |
 | `strict-third-party` | No | `false` | Fail (instead of warn) on archive overrides without `Last-Modified` and third-party branch-pinned actions |
-| `bypass-keyword` | No | `""` | If the PR body contains this string on a line by itself, failures are downgraded to warnings |
+| `bypass-keyword` | No | `""` | If set, failures are downgraded to warnings when this exact string is used as a bypass (PR label on `pull_request` events; HEAD commit message or associated-PR label on `push` events; PR label only on unattended events — commit-message bypass is disabled for `schedule`/`workflow_dispatch`/`workflow_run`) |
 | `check-all-on-new-workflow` | No | `true` | Check all packages (not just changed) when the workflow file is newly added |
 | `github-token` | No | `${{ github.token }}` | GitHub token for API queries (actions and bazel ecosystems) |
 | `npm-registry-url` | No | `https://registry.npmjs.org` | npm registry URL |
@@ -362,26 +362,29 @@ If you need to merge a PR with a dependency that fails the age gate (e.g., a cri
     bypass-keyword: "DEPENDENCY-AGE-BYPASS"
 ```
 
-The bypass is detected from any of the following (whichever matches first):
+The bypass mechanism is **event-aware**:
 
-1. **PR body** — include the keyword on its own line:
-   ```
-   This PR updates lodash to fix CVE-2025-XXXX.
+**On `pull_request` / `pull_request_target` events** — only a matching PR label is accepted. The PR body and commit messages are contributor-editable, so accepting them would allow self-approved bypasses without maintainer involvement. Add the label named exactly `DEPENDENCY-AGE-BYPASS` to the PR, and add `labeled`/`unlabeled` to your event types so the action re-runs when labels change:
 
-   DEPENDENCY-AGE-BYPASS
-   ```
-2. **PR label** — add a label named exactly `DEPENDENCY-AGE-BYPASS` to the PR
-3. **Commit message** — include the keyword on its own line in the HEAD commit message (useful for `push`, `workflow_dispatch`, and other non-PR events)
+```yaml
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+```
+
+**On `push` events** — include the keyword on its own line in the HEAD commit message:
+
+```
+This commit updates lodash to fix CVE-2025-XXXX.
+
+DEPENDENCY-AGE-BYPASS
+```
+
+Or add it as a label on any PR associated with the HEAD commit.
+
+**On unattended events** (`schedule`, `workflow_dispatch`, `workflow_run`) — commit-message bypass is **disabled**. A pre-planted keyword in a commit message would silently skip every future unattended run, so the action ignores it. Only a PR label associated with the HEAD commit is accepted on these events.
 
 The action will still report the failures as warnings but will not fail the check.
-
-> **Note:** If using label-based bypass, add `labeled` and `unlabeled` to the `pull_request` event types so the workflow re-runs when labels change:
-> ```yaml
-> on:
->   pull_request:
->     types: [opened, reopened, synchronize, edited, labeled, unlabeled]
-> ```
-> The `edited` type ensures the workflow re-runs when the PR body is changed to add the keyword.
 
 ## Running locally
 
@@ -424,6 +427,48 @@ You can also run directly with Node after building:
 ```bash
 pnpm build
 node out/cli.js --ecosystems npm --diff
+```
+
+> **Note:** `verify` is not a standalone public CLI command. Local verification is done via
+> `pnpm local` (which compiles and runs `node out/cli.js`) or by running the action in CI
+> via `action.yml`.
+
+## Updating dependencies (update CLI)
+
+The `update` command is an interactive CLI that proposes age-gated dependency upgrades and applies them to your lockfiles and config files.
+
+```bash
+# Run via npx (no install needed)
+npx -p github:runloopai/lisan-al-gaib-action update <ecosystems>
+
+# Examples
+npx -p github:runloopai/lisan-al-gaib-action update npm
+npx -p github:runloopai/lisan-al-gaib-action update npm,python,actions
+npx -p github:runloopai/lisan-al-gaib-action update docker,kubernetes --mode minor --dry-run
+```
+
+Supported ecosystems: `npm`, `python`, `rust`, `java`, `actions`, `docker`, `kubernetes`.
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mode <major\|minor\|patch>` | `major` | Semver level ceiling for candidates |
+| `--style <sha\|preserve>` | `sha` | How to write updated refs (SHA-pinned or tag-preserved) |
+| `--min-age <days>` | `14` | Minimum publish age in days before a version is eligible |
+| `--allow-downgrade <no\|allow\|only>` | `no` | Whether to propose version downgrades |
+| `--license-policy <block\|warn\|off>` | `off` | Action to take on license regressions |
+| `--pin-unpinned / --no-pin-unpinned` | `true` | Pin tag-only OCI images to their current digest even when the age gate would otherwise skip them |
+| `--dry-run` | `false` | Preview changes without writing files |
+| `--yes` | `false` | Accept all proposals non-interactively |
+| `--json` | `false` | Emit machine-readable JSON result |
+
+### GitHub token
+
+The `actions` and `bazel` ecosystems call the GitHub API to resolve commit SHAs and release dates. Without a token you are limited to 60 API requests per hour:
+
+```bash
+GITHUB_TOKEN=ghp_… npx -p github:runloopai/lisan-al-gaib-action update actions
 ```
 
 ## Etymology

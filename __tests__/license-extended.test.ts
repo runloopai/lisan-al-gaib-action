@@ -13,6 +13,7 @@ import {
   fetchPypiLicense,
   fetchCrateLicense,
   fetchMavenLicense,
+  LicenseFetchError,
   fetchGitHubRepoLicense,
   fetchBcrLicense,
   fetchLicense,
@@ -39,9 +40,11 @@ describe("fetchNpmLicense", () => {
     expect(await fetchNpmLicense("pkg", "1.0.0", registries)).toBe("MIT");
   });
 
-  it("returns null on error", async () => {
-    vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("fail"));
-    expect(await fetchNpmLicense("pkg", "1.0.0", registries)).toBeNull();
+  it("throws LicenseFetchError on transient error (fail-closed for --license-policy=block)", async () => {
+    // A1: fetchers must throw (not return null) on transient 5xx/429/network so
+    // applyLicensePolicy's licenseFetchErrors tracking can engage and block promotes.
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("fail"));
+    await expect(fetchNpmLicense("pkg", "1.0.0", registries)).rejects.toThrow(LicenseFetchError);
   });
 
   it("returns null on 404", async () => {
@@ -82,6 +85,11 @@ describe("fetchPypiLicense", () => {
     );
     expect(await fetchPypiLicense("pkg", "1.0.0", registries)).toBeNull();
   });
+
+  it("throws LicenseFetchError on transient error (fail-closed for --license-policy=block)", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network fail"));
+    await expect(fetchPypiLicense("pkg", "1.0.0", registries)).rejects.toThrow(LicenseFetchError);
+  });
 });
 
 describe("fetchCrateLicense", () => {
@@ -94,8 +102,17 @@ describe("fetchCrateLicense", () => {
     expect(await fetchCrateLicense("serde", "1.0.0", registries)).toBe("MIT/Apache-2.0");
   });
 
-  it("returns null on error", async () => {
-    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("fail"));
+  it("throws LicenseFetchError on transient error (fail-closed for --license-policy=block)", async () => {
+    // A1: fetchers must throw (not return null) on transient 5xx/429/network so
+    // applyLicensePolicy's licenseFetchErrors tracking can engage and block promotes.
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network fail"));
+    await expect(fetchCrateLicense("serde", "1.0.0", registries)).rejects.toThrow(LicenseFetchError);
+  });
+
+  it("returns null on 404 (package not in registry)", async () => {
+    // 404 = package genuinely absent — not a transient error; return null, not throw.
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 404 }));
     expect(await fetchCrateLicense("serde", "1.0.0", registries)).toBeNull();
   });
 });
@@ -130,6 +147,15 @@ describe("fetchMavenLicense", () => {
     expect(
       await fetchMavenLicense("com.example:lib", "1.0", [], registries),
     ).toBeNull();
+  });
+
+  it("throws LicenseFetchError on transient error (fail-closed for --license-policy=block)", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response("server error", { status: 500 }),
+    );
+    await expect(
+      fetchMavenLicense("com.example:lib", "1.0", [], registries),
+    ).rejects.toThrow(LicenseFetchError);
   });
 });
 
@@ -189,6 +215,15 @@ describe("fetchBcrLicense", () => {
     expect(
       await fetchBcrLicense("mod", "1.0", "https://bcr.bazel.build"),
     ).toBeNull();
+  });
+
+  it("throws LicenseFetchError on transient error (fail-closed for --license-policy=block)", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response("server error", { status: 500 }),
+    );
+    await expect(
+      fetchBcrLicense("mod", "1.0", "https://bcr.bazel.build"),
+    ).rejects.toThrow(LicenseFetchError);
   });
 });
 

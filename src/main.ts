@@ -1,6 +1,6 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
-import { checkBypass, isPrEvent } from "./bypass.js";
+import { checkBypass, isPrEvent, INTERACTIVE_PUSH_EVENTS } from "./bypass.js";
 import { getInputs } from "./inputs.js";
 import { resolveBaseRef, makeBaseRefDiffable, EMPTY_TREE } from "./base-ref.js";
 import { gitDiffFiltered, setDiffSource } from "./diff.js";
@@ -15,6 +15,7 @@ import * as docker from "./ecosystems/docker.js";
 import * as multitool from "./ecosystems/multitool.js";
 import * as kubernetes from "./ecosystems/kubernetes.js";
 import { bcrPublishDate, gitCommitDate, archiveDate } from "./registry.js";
+import { computeAgeDays } from "./age.js";
 import type { BazelOverride, ParsedImageRef } from "./ecosystems/types.js";
 import {
   determineStatus,
@@ -28,30 +29,13 @@ import {
   checkLicenses,
   emitLicenseAnnotations,
   fetchLicense,
+  getWorkflowFile,
 } from "./license.js";
 import type { ChangedDep, CheckResult } from "./ecosystems/types.js";
-
-const DAY_MS = 86_400_000;
-
-/**
- * Parse GITHUB_WORKFLOW_REF to extract the workflow file path.
- * Format: {owner}/{repo}/{path}@{ref}
- * We strip {owner}/{repo}/ prefix and @{ref} suffix.
- */
-function getWorkflowFilePath(): string | null {
-  const workflowRef = process.env.GITHUB_WORKFLOW_REF;
-  if (!workflowRef) return null;
-
-  const repo = github.context.repo;
-  const prefix = `${repo.owner}/${repo.repo}/`;
-  if (!workflowRef.startsWith(prefix)) return null;
-
-  const rest = workflowRef.slice(prefix.length);
-  const atIdx = rest.lastIndexOf("@");
-  if (atIdx === -1) return null;
-
-  return rest.slice(0, atIdx);
-}
+import { SUPPORTED_ECOSYSTEMS as UPDATE_CLI_ECOSYSTEMS } from "./update/ecosystems.js";
+import type { ECOSYSTEM_REGISTRY } from "./update/ecosystem-registry.js";
+import { resolveCacheKey } from "./update/cache-key.js";
+import { dedupeAndResolve, RESOLVE_CONCURRENCY } from "./update/resolve.js";
 
 /**
  * Check if the workflow file that triggered this run was newly added.
@@ -63,7 +47,7 @@ async function resolveEffectiveBaseRef(
 ): Promise<string> {
   if (!checkAllOnNewWorkflow) return baseRef;
 
-  const workflowPath = getWorkflowFilePath();
+  const workflowPath = getWorkflowFile();
   if (!workflowPath) return baseRef;
 
   core.info(`Workflow file: ${workflowPath}`);
@@ -81,6 +65,7 @@ async function resolveEffectiveBaseRef(
 }
 
 
+// ECOSYSTEM_SYNC: keep in sync with ECOSYSTEM_DISPATCH in src/update/run.ts and resolveLatest switch in src/update/latest.ts
 async function lookupPublishDate(
   dep: ChangedDep,
   inputs: ReturnType<typeof getInputs>,
@@ -128,7 +113,7 @@ async function lookupPublishDate(
     }
     case "actions": {
       const publishDate = await actions.getPublishDate(dep.name, dep.version, inputs.githubToken);
-      const isSha = /^[0-9a-f]{40}$/.test(dep.version);
+      const isSha = actions.isCommitSha(dep.version);
       if (publishDate === null && !isSha) {
         const actionOwner = dep.name.split("/")[0];
         let contextOwner = "";
@@ -168,6 +153,16 @@ async function lookupPublishDate(
       return null;
   }
 }
+
+// Compile-time exhaustiveness guard: every ecosystem key in the updater ECOSYSTEM_REGISTRY
+// must have an explicit `case` in the lookupPublishDate switch above. If a new ecosystem is
+// added to ECOSYSTEM_REGISTRY without a corresponding case here, the Exclude below becomes
+// non-never and TypeScript flags this line as a type error.
+// When adding a new ecosystem: (1) add the case, (2) extend the union here.
+(null as unknown as Exclude<
+  keyof typeof ECOSYSTEM_REGISTRY,
+  "actions" | "docker" | "kubernetes" | "rust" | "java" | "bazel"
+>) satisfies never;
 
 async function run(): Promise<void> {
   const inputs = getInputs();
@@ -236,62 +231,79 @@ async function run(): Promise<void> {
 
     let deps: ChangedDep[];
 
-    switch (eco) {
-      case "npm":
-        deps = await npm.getChangedDeps(baseRef, inputs.nodeLockfiles);
-        break;
-      case "python":
-        deps = await python.getChangedDeps(baseRef, inputs.pythonLockfiles);
-        break;
-      case "rust":
-        deps = await rust.getChangedDeps(baseRef, inputs.moduleBazel);
-        break;
-      case "java": {
-        const result = await java.getChangedDeps(baseRef, inputs.moduleBazel);
-        deps = result.deps;
-        javaRepoMap = result.repositories;
-        break;
+    try {
+      switch (eco) {
+        case "npm":
+          deps = await npm.getChangedDeps(baseRef, inputs.nodeLockfiles);
+          break;
+        case "python":
+          deps = await python.getChangedDeps(baseRef, inputs.pythonLockfiles);
+          break;
+        case "rust":
+          deps = await rust.getChangedDeps(baseRef, inputs.moduleBazel);
+          break;
+        case "java": {
+          const result = await java.getChangedDeps(baseRef, inputs.moduleBazel);
+          deps = result.deps;
+          javaRepoMap = result.repositories;
+          break;
+        }
+        case "bazel": {
+          const result = await bazelModule.getChangedDeps(
+            baseRef,
+            inputs.moduleBazel,
+          );
+          deps = result.deps;
+          bazelOverrides = result.overrides;
+          break;
+        }
+        case "actions":
+          deps = await actions.getChangedDeps(baseRef, inputs.workflowFiles, inputs.githubToken);
+          break;
+        case "multitool":
+          deps = await multitool.getChangedDeps(
+            baseRef,
+            inputs.moduleBazel,
+          );
+          break;
+        case "kubernetes": {
+          const result = await kubernetes.getChangedDeps(
+            baseRef,
+            inputs.kubernetesFiles,
+          );
+          deps = result.deps;
+          kubernetesImageRefs = result.imageRefs;
+          break;
+        }
+        case "docker": {
+          const result = await docker.getChangedDeps(
+            baseRef,
+            inputs.dockerfiles,
+            inputs.dockerhubMirror,
+          );
+          deps = result.deps;
+          dockerImageRefs = result.imageRefs;
+          break;
+        }
+        default:
+          core.setFailed(`Unknown ecosystem: ${eco}`);
+          core.endGroup();
+          // continue to remaining ecosystems rather than aborting the entire run —
+          // other ecosystems should still be checked even if one is unknown/misspelled.
+          continue;
       }
-      case "bazel": {
-        const result = await bazelModule.getChangedDeps(
-          baseRef,
-          inputs.moduleBazel,
-        );
-        deps = result.deps;
-        bazelOverrides = result.overrides;
-        break;
-      }
-      case "actions":
-        deps = await actions.getChangedDeps(baseRef, inputs.workflowFiles, inputs.githubToken);
-        break;
-      case "multitool":
-        deps = await multitool.getChangedDeps(
-          baseRef,
-          inputs.moduleBazel,
-        );
-        break;
-      case "kubernetes": {
-        const result = await kubernetes.getChangedDeps(
-          baseRef,
-          inputs.kubernetesFiles,
-        );
-        deps = result.deps;
-        kubernetesImageRefs = result.imageRefs;
-        break;
-      }
-      case "docker": {
-        const result = await docker.getChangedDeps(
-          baseRef,
-          inputs.dockerfiles,
-          inputs.dockerhubMirror,
-        );
-        deps = result.deps;
-        dockerImageRefs = result.imageRefs;
-        break;
-      }
-      default:
-        core.setFailed(`Unknown ecosystem: ${eco}`);
-        return;
+    } catch (err) {
+      // A getChangedDeps failure must NOT silently pass (fail-open). Marking the
+      // action failed ensures the PR is blocked while still letting the remaining
+      // ecosystems run. A transient error (registry outage, WASM load failure,
+      // malformed lockfile) skipping one ecosystem would allow new packages in that
+      // ecosystem to bypass the age gate entirely.
+      core.setFailed(
+        `${eco}: getChangedDeps failed — cannot safely check this ecosystem: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+      core.endGroup();
+      continue;
     }
 
     if (deps.length === 0) {
@@ -311,40 +323,29 @@ async function run(): Promise<void> {
       return true;
     });
 
-    // Deduplicate by cache key, then fetch in parallel
-    const uniqueDeps = new Map<string, ChangedDep>();
-    for (const dep of filteredDeps) {
-      const cacheKey = `${dep.ecosystem}:${dep.name}@${dep.version}`;
-      if (!publishDateCache.has(cacheKey) && !uniqueDeps.has(cacheKey)) {
-        uniqueDeps.set(cacheKey, dep);
-      }
-    }
-    const entries = [...uniqueDeps.entries()];
-    // Fetch in batches of 10 to avoid rate limiting
-    for (let i = 0; i < entries.length; i += 10) {
-      const batch = entries.slice(i, i + 10);
-      const results = await Promise.allSettled(
-        batch.map(([, dep]) => lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs, dockerImageRefs)),
-      );
-      batch.forEach(([key], idx) => {
-        const r = results[idx];
-        if (r.status === "fulfilled") {
-          publishDateCache.set(key, r.value);
-        } else {
-          core.warning(`Registry lookup failed for ${key}: ${r.reason}`);
-          publishDateCache.set(key, null);
-        }
-      });
+    // Deduplicate by cache key and resolve publish dates with bounded concurrency.
+    // Skip deps already in the cache (from a previous ecosystem iteration).
+    // dedupeAndResolve returns null for failed resolutions — stored as null in cache
+    // to record "lookup was attempted but failed" (avoids re-fetching on future iterations).
+    const depsForLookup = filteredDeps.filter(
+      (dep) => !publishDateCache.has(resolveCacheKey(dep.ecosystem, dep.name, dep.version)),
+    );
+    const lookupResults = await dedupeAndResolve(
+      depsForLookup,
+      (dep) => resolveCacheKey(dep.ecosystem, dep.name, dep.version),
+      (dep) => lookupPublishDate(dep, inputs, javaRepoMap, bazelOverrides, kubernetesImageRefs, dockerImageRefs),
+      RESOLVE_CONCURRENCY,
+      core.warning,
+    );
+    for (const [key, value] of lookupResults) {
+      publishDateCache.set(key, value);
     }
 
     for (const dep of filteredDeps) {
-      const cacheKey = `${dep.ecosystem}:${dep.name}@${dep.version}`;
+      const cacheKey = resolveCacheKey(dep.ecosystem, dep.name, dep.version);
       const publishDate = publishDateCache.get(cacheKey) ?? null;
 
-      const ageDays =
-        publishDate !== null
-          ? Math.floor((Date.now() - publishDate.getTime()) / DAY_MS)
-          : null;
+      const ageDays = computeAgeDays(publishDate);
 
       const status = determineStatus(
         ageDays,
@@ -435,12 +436,51 @@ async function run(): Promise<void> {
       if (licenseViolations > 0) {
         parts.push(`${licenseViolations} package(s) have incompatible licenses`);
       }
+      if (failures > 0) {
+        // Suggest the update CLI for ecosystems it supports (direct deps only).
+        // npm/python/multitool are excluded — the update CLI does not yet support them.
+        // Bazel deps governed by git/archive/local_path/multiple_version overrides are
+        // also excluded — the updater can only bump bazel_dep()s with a BCR version.
+        const failingByEco = new Map<string, string[]>();
+        for (const r of allResults) {
+          if (r.status !== "fail" || !UPDATE_CLI_ECOSYSTEMS.has(r.dep.ecosystem)) continue;
+          if (r.dep.ecosystem === "bazel") {
+            const override = bazelOverrides.get(r.dep.name);
+            if (override && override.type !== "single_version") continue;
+          }
+          const pkgs = failingByEco.get(r.dep.ecosystem) ?? [];
+          if (!pkgs.includes(r.dep.name)) pkgs.push(r.dep.name);
+          failingByEco.set(r.dep.ecosystem, pkgs);
+        }
+        if (failingByEco.size > 0) {
+          const ecosystemArg = [...failingByEco.keys()].join(",");
+          // Note: the `update` CLI updates ALL age-failing deps in those ecosystems,
+          // not a filtered subset — per-package filtering is not supported in v1.
+          parts.push(
+            `To update these packages interactively, run: npx -p github:runloopai/lisan-al-gaib-action update ${ecosystemArg} --min-age ${inputs.minAgeDays}` +
+            ` (to search for older versions that meet the age gate instead, add: --allow-downgrade only)`,
+          );
+        }
+      }
       if (inputs.bypassKeyword) {
-        parts.push(
-          isPrEvent()
-            ? `To bypass, add "${inputs.bypassKeyword}" as a PR label`
-            : `To bypass, add "${inputs.bypassKeyword}" on its own line in the HEAD commit message, or add it as a label on the associated PR`,
-        );
+        // Four-way hint that matches the actual bypass paths in bypass.ts:
+        //   PR events       → PR label only (commit message is contributor-editable)
+        //   push events     → commit message (HEAD commit, authored by pusher) OR PR label
+        //   merge_group     → PR label only, but checkBypass looks up the label via
+        //                     listPullRequestsAssociatedWithCommit on the merge-queue commit
+        //                     SHA, which usually has no associated PR — the label must be
+        //                     applied to the source PR before it enters the queue.
+        //   other unattended runs → PR label only (commit-message bypass disabled on
+        //                     schedule/workflow_dispatch/etc. to prevent a pre-planted
+        //                     keyword from silently bypassing every future unattended run)
+        const bypassHint = isPrEvent()
+          ? `To bypass, add "${inputs.bypassKeyword}" as a PR label`
+          : INTERACTIVE_PUSH_EVENTS.has(github.context.eventName)
+            ? `To bypass, add "${inputs.bypassKeyword}" on its own line in the HEAD commit message, or add it as a label on the associated PR`
+            : github.context.eventName === "merge_group"
+              ? `To bypass, add "${inputs.bypassKeyword}" as a label on the PR before it enters the merge queue — the merge-queue commit itself usually has no associated PR to label`
+              : `To bypass, add "${inputs.bypassKeyword}" as a label on the associated PR (commit-message bypass is disabled on unattended events)`;
+        parts.push(bypassHint);
       }
       core.setFailed(parts.join(". "));
     }

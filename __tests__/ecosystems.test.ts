@@ -37,14 +37,18 @@ vi.mock("../src/bazel.js", () => ({
   extractOverrides: vi.fn(),
 }));
 
-vi.mock("../src/registry.js", () => ({
-  mavenPublishDate: vi.fn(),
-  cratesPublishDate: vi.fn(),
-  npmPublishDate: vi.fn(),
-  pypiPublishDate: vi.fn(),
-  fetchImagePublishDate: vi.fn(),
-  imageExists: vi.fn(),
-}));
+vi.mock("../src/registry.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/registry.js")>();
+  return {
+    ...actual,
+    mavenPublishDate: vi.fn(),
+    cratesPublishDate: vi.fn(),
+    npmPublishDate: vi.fn(),
+    pypiPublishDate: vi.fn(),
+    fetchImagePublishDate: vi.fn(),
+    imageExists: vi.fn(),
+  };
+});
 
 import * as fs from "node:fs/promises";
 import * as diff from "../src/diff.js";
@@ -498,6 +502,52 @@ describe("bazel-module.getChangedDeps", () => {
     const bazelModule = await import("../src/ecosystems/bazel-module.js");
     const result = await bazelModule.getChangedDeps("HEAD~1", "MODULE.bazel", "MODULE.bazel.lock");
     expect(result.deps).toEqual([]);
+  });
+
+  it("does not trigger when bazel_dep version changes but lockfile resolution is unchanged (overridden dep)", async () => {
+    // Regression: editing the bazel_dep version literal for an overridden module
+    // does not change what Bazel resolves — the lockfile versions are identical.
+    // getChangedDeps must produce no deps for that module.
+    const sameLock = JSON.stringify({
+      moduleDepGraph: {
+        "rules_cc@0.0.9": { name: "rules_cc", version: "0.0.9" },
+      },
+    });
+    vi.mocked(diff.gitDiff).mockResolvedValue("some diff");
+    vi.mocked(diff.gitShowFile).mockResolvedValue(sameLock);
+    vi.mocked(bazel.resolveModuleFiles).mockResolvedValue(["MODULE.bazel"]);
+    vi.mocked(bazel.extractOverrides).mockResolvedValue(
+      new Map([["rules_cc", { type: "single_version" as const, moduleName: "rules_cc", version: "0.0.9" }]]),
+    );
+    vi.mocked(fs.readFile)
+      .mockResolvedValueOnce(sameLock as any)
+      .mockResolvedValueOnce("" as any);
+
+    const bazelModule = await import("../src/ecosystems/bazel-module.js");
+    const result = await bazelModule.getChangedDeps("HEAD~1", "MODULE.bazel");
+    expect(result.deps).toEqual([]);
+  });
+
+  it("triggers when the resolved lockfile version changes (e.g. override itself was updated)", async () => {
+    vi.mocked(diff.gitDiff).mockResolvedValue("some diff");
+    vi.mocked(diff.gitShowFile).mockResolvedValue(
+      JSON.stringify({ moduleDepGraph: { "rules_cc@0.0.9": { name: "rules_cc", version: "0.0.9" } } }),
+    );
+    vi.mocked(bazel.resolveModuleFiles).mockResolvedValue(["MODULE.bazel"]);
+    vi.mocked(bazel.extractOverrides).mockResolvedValue(
+      new Map([["rules_cc", { type: "single_version" as const, moduleName: "rules_cc", version: "0.0.10" }]]),
+    );
+    vi.mocked(fs.readFile)
+      .mockResolvedValueOnce(
+        JSON.stringify({ moduleDepGraph: { "rules_cc@0.0.10": { name: "rules_cc", version: "0.0.10" } } }) as any,
+      )
+      .mockResolvedValueOnce("" as any);
+
+    const bazelModule = await import("../src/ecosystems/bazel-module.js");
+    const result = await bazelModule.getChangedDeps("HEAD~1", "MODULE.bazel");
+    expect(result.deps).toHaveLength(1);
+    expect(result.deps[0].name).toBe("rules_cc");
+    expect(result.deps[0].version).toBe("0.0.10");
   });
 });
 

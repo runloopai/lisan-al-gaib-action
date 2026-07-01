@@ -36,9 +36,23 @@ jobs:
         run: pnpm build
       - name: Check dist is up to date
         run: |
-          if ! git diff --quiet dist/; then
-            echo "::error::dist/ is out of date. Run 'pnpm build' and commit the result."
-            git diff --stat dist/
+          if git status --porcelain dist/ cli-dist/ | grep -q .; then
+            echo "::error::dist/ or cli-dist/ is out of date. Run 'pnpm build' and commit."
+            git status --short dist/ cli-dist/
+            exit 1
+          fi
+      - name: Verify dist/ does not contain TUI deps
+        run: |
+          # Grep for @clack (scoped package name — reliably present in bundles that include it).
+          # The '"cac"' literal was brittle: ncc can inline the module without that exact token.
+          if grep -q "@clack" dist/index.js; then
+            echo "ERROR: dist/index.js (action bundle) contains TUI dependency (clack)"
+            exit 1
+          fi
+          # Symmetric guard: cli-dist/ MUST contain @clack.
+          # A future tree-shake that accidentally removes the TUI from the update bin should be caught.
+          if ! grep -q "@clack" cli-dist/index.js; then
+            echo "ERROR: cli-dist/index.js (update CLI bundle) is missing TUI dependency (clack)"
             exit 1
           fi
 

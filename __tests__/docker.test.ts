@@ -2,8 +2,9 @@
  * Unit tests for parseDockerfileImages — pure, network-free.
  */
 import { describe, it, expect } from "vitest";
-import { parseDockerfileImages } from "../src/ecosystems/docker.js";
+import { parseDockerfileImages, parseDockerfileImagesWithPositions } from "../src/ecosystems/docker.js";
 import { imageIdentity } from "../src/ecosystems/image.js";
+import { lineStartOffsets } from "../src/update/ecosystems/shared.js";
 
 describe("parseDockerfileImages", () => {
   it("FROM nginx:1.25 yields one candidate with source 'from' and tag '1.25'", () => {
@@ -218,5 +219,210 @@ describe("parseDockerfileImages", () => {
       (c) => !baseIdentities.has(imageIdentity(c.ref)),
     );
     expect(newInHead).toHaveLength(0);
+  });
+});
+
+describe("parseDockerfileImagesWithPositions", () => {
+  it("FROM <img> AS <stage>: image range excludes AS clause, instrLineIndex matches FROM line", () => {
+    // The image range must stop before " AS build-nerdctl" so updater rewrites
+    // only cover the ref itself; restOfLine picks up the rest separately.
+    const content = "# comment\nFROM golang:1.24-bookworm AS build-nerdctl\nWORKDIR /src\n";
+    const refs = parseDockerfileImagesWithPositions(content);
+    expect(refs).toHaveLength(1);
+    const ref = refs[0];
+    expect(ref.source).toBe("from");
+    expect(ref.raw).toBe("golang:1.24-bookworm");
+    // lineIndex is 1 (second line, 0-based); instrLineIndex matches it for FROM
+    expect(ref.lineIndex).toBe(1);
+    expect(ref.instrLineIndex).toBe(1);
+    // The image range length must match the raw ref exactly (no AS clause)
+    expect(ref.lineLength).toBe("golang:1.24-bookworm".length);
+    // lineOffset points to 'g' in 'golang' (after "FROM ")
+    expect(ref.lineOffset).toBe("FROM ".length);
+  });
+
+  it("COPY --from=<img>: instrLineIndex is the COPY instruction's line", () => {
+    const content = "FROM alpine:3.23\nCOPY --from=docker:20.10.5-dind \\\n    /usr/bin/docker /usr/bin/docker\n";
+    const refs = parseDockerfileImagesWithPositions(content);
+    // Only COPY --from (copy-from) or plus the FROM (from)
+    const copyRef = refs.find((r) => r.source === "copy-from");
+    expect(copyRef).toBeDefined();
+    expect(copyRef!.instrLineIndex).toBe(1); // COPY is on line 1 (0-based)
+    expect(copyRef!.lineIndex).toBe(1);      // value is on the same line as COPY
+    expect(copyRef!.raw).toBe("docker:20.10.5-dind");
+  });
+
+  it("multi-stage Dockerfile: each FROM gets its own instrLineIndex", () => {
+    const content = [
+      "FROM golang:1.24 AS builder",
+      "RUN make",
+      "FROM alpine:3.23",
+      "COPY --from=builder /app /app",
+    ].join("\n") + "\n";
+    const refs = parseDockerfileImagesWithPositions(content);
+    const fromRefs = refs.filter((r) => r.source === "from");
+    expect(fromRefs).toHaveLength(2);
+    expect(fromRefs[0].instrLineIndex).toBe(0); // first FROM
+    expect(fromRefs[1].instrLineIndex).toBe(2); // second FROM
+  });
+
+  it("FROM <img> AS <stage>: buildStage is the alias name", () => {
+    const content = "FROM golang:1.24-bookworm AS build-nerdctl\nWORKDIR /src\n";
+    const refs = parseDockerfileImagesWithPositions(content);
+    expect(refs).toHaveLength(1);
+    expect(refs[0].buildStage).toBe("build-nerdctl");
+  });
+
+  it("FROM <img> without AS: buildStage is null", () => {
+    const content = "FROM alpine:3.23\nRUN echo hi\n";
+    const refs = parseDockerfileImagesWithPositions(content);
+    expect(refs).toHaveLength(1);
+    expect(refs[0].buildStage).toBeNull();
+  });
+
+  it("COPY --from: buildStage is null", () => {
+    const content = "FROM alpine:3.23\nCOPY --from=docker:20.10.5-dind /usr/bin/docker /usr/bin/docker\n";
+    const refs = parseDockerfileImagesWithPositions(content);
+    const copyRef = refs.find((r) => r.source === "copy-from");
+    expect(copyRef).toBeDefined();
+    expect(copyRef!.buildStage).toBeNull();
+  });
+
+  it("FROM single-line: instrEndLine and instrEndChar point to end of that line", () => {
+    // "FROM alpine:3.23\n" — the instruction ends on line 0 after "alpine:3.23"
+    const content = "FROM alpine:3.23\nRUN echo hi\n";
+    const refs = parseDockerfileImagesWithPositions(content);
+    expect(refs).toHaveLength(1);
+    expect(refs[0].instrEndLine).toBe(0);
+    // The instruction ends at the end of "FROM alpine:3.23" (character 16)
+    expect(refs[0].instrEndChar).toBe("FROM alpine:3.23".length);
+  });
+});
+
+// ─── H4: annotation accumulation regression ──────────────────────────────────
+// Verifies that parseDockerfileImagesWithPositions correctly parses a FROM line
+// that already carries a "# was <old-ref>" comment from a previous updater run
+// (possibly with a trailing author comment after it). The key invariant: the raw
+// image ref must be parsed from the portion before any comment, and the
+// instrEndChar must not extend into the comment text.
+
+describe("docker annotation accumulation (H4 regression)", () => {
+  it("FROM with existing '# was <old>' comment: raw is the image ref only", () => {
+    // Simulates a Dockerfile that was already updated once; the updater previously
+    // appended "# was nginx:1.24". The FROM line is valid and the ref must parse
+    // as the current pinned ref, not include the comment.
+    const content = "FROM nginx@sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab\n";
+    const refs = parseDockerfileImagesWithPositions(content);
+    expect(refs).toHaveLength(1);
+    expect(refs[0].raw).toBe(
+      "nginx@sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+    );
+  });
+
+  it("lineOffset/lineLength cover only the image ref, not the trailing comment", () => {
+    // The key H4 invariant: lineOffset/lineLength slice exactly the image ref.
+    // instrEndChar spans the FULL instruction (including the comment) so the
+    // stale-offset "expected" guard has the widest safe region — it must be
+    // GREATER THAN hashPos, not less.
+    const digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab";
+    const ref = `nginx@${digest}`;
+    const content = `FROM ${ref}  # was nginx:1.24\n`;
+    const refs = parseDockerfileImagesWithPositions(content);
+    expect(refs).toHaveLength(1);
+    // raw must be only the image ref, not including any comment
+    expect(refs[0].raw).toBe(ref);
+    // lineOffset/lineLength must slice exactly the ref on its line
+    const { lineIndex, lineOffset, lineLength } = refs[0];
+    const lines = content.split("\n");
+    expect(lines[lineIndex].slice(lineOffset, lineOffset + lineLength)).toBe(ref);
+    // instrEndChar extends past the "#" (wide guard for stale-offset detection)
+    const hashPos = content.indexOf("#");
+    expect(refs[0].instrEndChar).toBeGreaterThan(hashPos);
+  });
+
+  it("deduplication still works when existing '# was' annotation is present", () => {
+    // Two FROM instructions referencing the same digest (one with a comment) must
+    // still deduplicate to a single candidate.
+    const digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab";
+    const content = [
+      `FROM nginx@${digest}  # was nginx:1.24`,
+      `FROM nginx@${digest}`,
+    ].join("\n") + "\n";
+    const candidates = parseDockerfileImages(content);
+    expect(candidates).toHaveLength(1);
+  });
+});
+
+// ─── T1: discover() offset round-trip ───────────────────────────────────────
+// Validates the core invariant that discover() relies on:
+//   content.slice(lineStarts[lineIndex] + lineOffset, ... + lineLength) === raw
+// This exercises the (lineIndex, lineOffset) → absoluteOffset conversion used in
+// src/update/ecosystems/docker.ts before any FileEdit is built.
+
+describe("discover() offset round-trip (T1)", () => {
+  function checkOffsets(content: string): void {
+    const refs = parseDockerfileImagesWithPositions(content);
+    const lineStarts = lineStartOffsets(content);
+    expect(refs.length).toBeGreaterThan(0);
+    for (const ref of refs) {
+      const absoluteOffset = lineStarts[ref.lineIndex] + ref.lineOffset;
+      expect(content.slice(absoluteOffset, absoluteOffset + ref.lineLength)).toBe(ref.raw);
+    }
+  }
+
+  it("FROM and COPY --from: absoluteOffset slices to raw", () => {
+    checkOffsets(
+      "# comment\n" +
+      "FROM golang:1.24-bookworm AS builder\n" +
+      "COPY --from=docker:20.10.5-dind /usr/bin/docker /usr/local/bin/docker\n",
+    );
+  });
+
+  it("multi-stage Dockerfile: each FROM ref's offset slices to its own raw", () => {
+    checkOffsets(
+      "FROM node:20 AS build\n" +
+      "RUN make\n" +
+      "FROM nginx:1.25\n" +
+      "COPY --from=build /app /app\n",
+    );
+  });
+
+  it("multibyte character earlier on the same line does not shift lineOffset", () => {
+    // dockerfile-ast Range.character is UTF-16, matching JS String.slice.
+    // A 2-byte UTF-8 char (ñ = U+00F1) is still 1 UTF-16 code unit — offset must be correct.
+    const content = "FROM alpine:3.18\nRUN echo ñ\nFROM nginx:1.25\n";
+    const refs = parseDockerfileImagesWithPositions(content);
+    const lineStarts = lineStartOffsets(content);
+    const nginxRef = refs.find((r) => r.raw === "nginx:1.25");
+    expect(nginxRef).toBeDefined();
+    const abs = lineStarts[nginxRef!.lineIndex] + nginxRef!.lineOffset;
+    expect(content.slice(abs, abs + nginxRef!.lineLength)).toBe("nginx:1.25");
+  });
+
+  it("FROM with digest pin: absoluteOffset covers the full ref including digest", () => {
+    const digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab";
+    checkOffsets(`FROM alpine:3.18@${digest}\n`);
+  });
+});
+
+// ─── CRLF line-ending round-trip ─────────────────────────────────────────────
+describe("parseDockerfileImagesWithPositions — CRLF line endings", () => {
+  const LF_CONTENT = "FROM nginx:1.25\nRUN echo hello\nFROM alpine:3.18\n";
+  const CRLF_CONTENT = LF_CONTENT.replace(/\n/g, "\r\n");
+
+  it("finds the same image refs under CRLF as under LF", () => {
+    const lf = parseDockerfileImagesWithPositions(LF_CONTENT);
+    const crlf = parseDockerfileImagesWithPositions(CRLF_CONTENT);
+    expect(crlf.map((r) => r.raw).sort()).toEqual(lf.map((r) => r.raw).sort());
+    expect(crlf.every((r) => r.ref !== null)).toBe(true);
+  });
+
+  it("absoluteOffset points to the correct bytes in the CRLF content", () => {
+    const refs = parseDockerfileImagesWithPositions(CRLF_CONTENT);
+    const lineStarts = lineStartOffsets(CRLF_CONTENT);
+    for (const ref of refs) {
+      const abs = lineStarts[ref.lineIndex] + ref.lineOffset;
+      expect(CRLF_CONTENT.slice(abs, abs + ref.lineLength)).toBe(ref.raw);
+    }
   });
 });

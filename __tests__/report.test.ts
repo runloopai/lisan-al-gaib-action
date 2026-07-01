@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { determineStatus, sortedByStatus, reportTotals, versionAtLeast, parseExcludeNewerDays, dedupeResults } from "../src/report.js";
+import { meetsMinAge } from "../src/age.js";
+import { applyAgeGate } from "../src/update/latest.js";
 import type { CheckResult, DepStatus } from "../src/ecosystems/types.js";
 
 function makeResult(status: DepStatus, name = "pkg"): CheckResult {
@@ -199,4 +201,40 @@ describe("dedupeResults", () => {
     };
     expect(dedupeResults([npm, python])).toHaveLength(2);
   });
+});
+
+/**
+ * Cross-path age-gate equivalence: the updater's promise is
+ * "never suggest a version the verify action would fail."
+ * Both sides now use meetsMinAge() from age.ts — this test asserts
+ * that determineStatus (verify) and applyAgeGate (update) agree on
+ * the same boundary conditions for the same inputs.
+ */
+describe("verify ↔ update age-gate shared predicate contract", () => {
+  const MIN = 14;
+
+  const cases: Array<{ ageDays: number | null; passes: boolean; label: string }> = [
+    { ageDays: null,   passes: false, label: "null age → fails" },
+    { ageDays: 0,      passes: false, label: "0 days → fails" },
+    { ageDays: MIN - 1, passes: false, label: "one day under threshold → fails" },
+    { ageDays: MIN,    passes: true,  label: "exactly at threshold → passes" },
+    { ageDays: MIN + 1, passes: true, label: "one day over threshold → passes" },
+    { ageDays: 365,    passes: true,  label: "well above threshold → passes" },
+  ];
+
+  for (const { ageDays, passes, label } of cases) {
+    it(`meetsMinAge / determineStatus / applyAgeGate all agree: ${label}`, () => {
+      // Shared predicate
+      expect(meetsMinAge(ageDays, MIN)).toBe(passes);
+
+      // Verify side: determineStatus must produce "fail"/"unknown" iff !passes
+      const verifyStatus = determineStatus(ageDays, MIN, /* warnAgeDays */ MIN + 7);
+      expect(verifyStatus === "fail" || verifyStatus === "unknown").toBe(!passes);
+
+      // Update side: applyAgeGate filters to an empty list iff !passes
+      const versionList = [{ version: "1.2.3", publishDate: null, ageDays }];
+      const gated = applyAgeGate(versionList, MIN);
+      expect(gated.length > 0).toBe(passes);
+    });
+  }
 });

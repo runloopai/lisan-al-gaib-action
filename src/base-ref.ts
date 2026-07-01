@@ -30,7 +30,8 @@ async function refExists(ref: string): Promise<boolean> {
 }
 
 function isZeroSha(sha: string): boolean {
-  return /^0{40}$/.test(sha);
+  // Match the SHA-1 all-zeros sentinel (40 zeros) and the SHA-256 all-zeros sentinel (64 zeros).
+  return /^0{40}$/.test(sha) || /^0{64}$/.test(sha);
 }
 
 export function resolveBaseRef(inputBaseRef: string): string {
@@ -68,12 +69,35 @@ export function resolveBaseRef(inputBaseRef: string): string {
     }
   }
 
-  // release — use the target commitish (branch/tag the release targets)
+  // release — use the target commitish (branch/tag the release targets).
+  // target_commitish may be a branch name (e.g. "main") or a commit SHA.
+  // Branch names are resolved by validateBaseRef via git rev-parse; if the
+  // branch doesn't exist locally the normal fallback chain takes over.
+  //
+  // Validated against a safe-ref charset: an attacker-controlled target_commitish
+  // that resolves to an unrelated commit could produce a misleading diff —
+  // we fail through to HEAD~1 rather than diff the wrong base.
   if (eventName === "release") {
     const targetRef = payload.release?.target_commitish;
-    if (targetRef) {
-      core.info(`Auto-detected base ref from release target: ${targetRef}`);
-      return targetRef;
+    if (targetRef && typeof targetRef === "string") {
+      const trimmed = targetRef.trim();
+      // Accept: 7-64 hex chars (commit SHA), or a branch/tag name composed of
+      // alphanumeric, dot, underscore, hyphen, and slash. Reject a leading `-`
+      // (option injection) and any other characters outside this charset.
+      // `..` is excluded from a plain charset check — the charset above allows `.`
+      // for legitimate refs like "release/1.0", but a `..` segment (e.g. "main/../../other")
+      // is a path-traversal-style ref that could resolve outside the intended branch/tag.
+      const SAFE_REF_RE = /^(?:[0-9a-f]{7,64}|[a-zA-Z0-9][a-zA-Z0-9_./-]*)$/;
+      if (trimmed && !trimmed.startsWith("-") && !trimmed.includes("..") && SAFE_REF_RE.test(trimmed)) {
+        core.info(`Auto-detected base ref from release target: ${trimmed}`);
+        return trimmed;
+      }
+      if (trimmed) {
+        core.warning(
+          `release.target_commitish ${JSON.stringify(trimmed)} contains unsafe characters — ` +
+          `falling back to HEAD~1 to avoid diffing an attacker-controlled base ref`,
+        );
+      }
     }
   }
 
@@ -195,12 +219,17 @@ export async function makeBaseRefDiffable(
 ): Promise<DiffPlan> {
   if (rawRef === EMPTY_TREE) return { mode: "git", baseRef: EMPTY_TREE };
 
-  // For push events, distrust the before-SHA if the push was forced
-  let ref = rawRef;
+  // For push events, distrust the before-SHA if the push was forced.
+  // A force-push rewrites history, so `before` is no longer an ancestor of HEAD —
+  // diffing against it would produce a misleading (possibly enormous) changed-file set.
+  // Degrade to check-all (EMPTY_TREE) so we fail-closed rather than under-checking.
   const { eventName, payload } = github.context;
   if (eventName === "push" && payload.forced === true) {
-    core.info("Forced push detected — resolving parent commit instead of before-SHA");
-    ref = "HEAD~1";
+    core.warning(
+      "Forced push detected — before-SHA is no longer an ancestor of HEAD. " +
+      "Falling back to check-all (empty tree) to avoid missing changed packages.",
+    );
+    return { mode: "git", baseRef: EMPTY_TREE };
   }
 
   // Pre-compute head SHA for API mode. If absent (non-Actions CLI context), any API
@@ -212,11 +241,11 @@ export async function makeBaseRefDiffable(
       : { mode: "git", baseRef: EMPTY_TREE };
 
   // HEAD-prefixed refs (HEAD~1, HEAD^, etc.): deepen first, then resolve to a concrete SHA
-  if (ref.startsWith("HEAD")) {
+  if (rawRef.startsWith("HEAD")) {
     if (await isShallowRepo()) {
       await deepenLoop(opts.fetchRetries);
     }
-    const sha = await revParse(ref);
+    const sha = await revParse(rawRef);
     if (!sha) {
       core.info("No parent commit found — using empty tree (initial commit)");
       return { mode: "git", baseRef: EMPTY_TREE };
@@ -228,26 +257,26 @@ export async function makeBaseRefDiffable(
   }
 
   // origin/ refs are always locally accessible
-  if (ref.startsWith("origin/")) {
-    if (await canDiffCommits(ref)) return { mode: "git", baseRef: ref };
-    return toApiPlan(ref);
+  if (rawRef.startsWith("origin/")) {
+    if (await canDiffCommits(rawRef)) return { mode: "git", baseRef: rawRef };
+    return toApiPlan(rawRef);
   }
 
   // Concrete SHA or branch ref: check if already locally available
-  if ((await refExists(ref)) && (await canDiffCommits(ref))) {
-    return { mode: "git", baseRef: ref };
+  if ((await refExists(rawRef)) && (await canDiffCommits(rawRef))) {
+    return { mode: "git", baseRef: rawRef };
   }
 
   // Not available locally; try to fetch it if repo is shallow
   if (await isShallowRepo()) {
-    await fetchBySha(ref);
+    await fetchBySha(rawRef);
     await deepenLoop(opts.fetchRetries);
   }
 
-  if (await canDiffCommits(ref)) {
-    return { mode: "git", baseRef: ref };
+  if (await canDiffCommits(rawRef)) {
+    return { mode: "git", baseRef: rawRef };
   }
 
   // Cannot recover locally — use GitHub API to diff
-  return toApiPlan(ref);
+  return toApiPlan(rawRef);
 }

@@ -18,6 +18,7 @@ vi.mock("@actions/exec", () => ({
 }));
 
 import * as github from "@actions/github";
+import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 import { resolveBaseRef, validateBaseRef, makeBaseRefDiffable, EMPTY_TREE } from "../src/base-ref.js";
 
@@ -76,6 +77,70 @@ describe("resolveBaseRef", () => {
       payload: { release: { target_commitish: "main" } },
     });
     expect(resolveBaseRef("")).toBe("main");
+  });
+
+  it("returns release target_commitish when it is a full commit SHA", () => {
+    Object.assign(github.context, {
+      eventName: "release",
+      payload: { release: { target_commitish: "a".repeat(40) } },
+    });
+    expect(resolveBaseRef("")).toBe("a".repeat(40));
+  });
+
+  // P2.4: target_commitish is attacker-controlled (release authors don't need repo write
+  // access). A leading "-" could be interpreted as a git option by a downstream command.
+  it("rejects a release target_commitish starting with '-' (option injection) and warns", () => {
+    Object.assign(github.context, {
+      eventName: "release",
+      payload: { release: { target_commitish: "--upload-pack=evil" } },
+    });
+    expect(resolveBaseRef("")).toBe("HEAD~1");
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining("unsafe characters"));
+  });
+
+  // P2.4: characters outside the safe-ref charset (e.g. shell metacharacters) must be
+  // rejected even though they aren't a leading-dash, since the ref may flow into exec args.
+  it("rejects a release target_commitish containing unsafe characters and warns", () => {
+    Object.assign(github.context, {
+      eventName: "release",
+      payload: { release: { target_commitish: "foo;rm -rf" } },
+    });
+    expect(resolveBaseRef("")).toBe("HEAD~1");
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining("unsafe characters"));
+  });
+
+  // P2 review: `.` is allowed in the charset for legitimate refs like "release/1.0", but a
+  // `..` segment is a path-traversal-style ref that could resolve outside the intended
+  // branch/tag and must be explicitly rejected even though every individual character is
+  // otherwise within the safe charset.
+  it("rejects a release target_commitish containing '..' and warns", () => {
+    Object.assign(github.context, {
+      eventName: "release",
+      payload: { release: { target_commitish: "main/../../other" } },
+    });
+    expect(resolveBaseRef("")).toBe("HEAD~1");
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining("unsafe characters"));
+  });
+
+  // P2.4: a non-string target_commitish (malformed/hostile webhook payload) must not reach
+  // the regex test (which assumes a string) or be returned as-is.
+  it("falls back to HEAD~1 when release target_commitish is not a string", () => {
+    Object.assign(github.context, {
+      eventName: "release",
+      payload: { release: { target_commitish: 123 } },
+    });
+    expect(resolveBaseRef("")).toBe("HEAD~1");
+    expect(core.warning).not.toHaveBeenCalled();
+  });
+
+  // P2.4: the SHA-256 all-zeros sentinel (64 chars) must be rejected on push, same as the
+  // SHA-1 sentinel (40 chars) — isZeroSha() supports both repo hash algorithms.
+  it("skips the SHA-256 zero SHA sentinel on push", () => {
+    Object.assign(github.context, {
+      eventName: "push",
+      payload: { before: "0".repeat(64) },
+    });
+    expect(resolveBaseRef("")).toBe("HEAD~1");
   });
 
   it("falls back to HEAD~1 for schedule event", () => {
@@ -212,26 +277,18 @@ describe("makeBaseRefDiffable", () => {
     expect(result).toEqual({ mode: "git", baseRef: EMPTY_TREE });
   });
 
-  it("treats a forced-push before-SHA as HEAD~1 and resolves the parent commit instead", async () => {
+  it("treats a forced-push as check-all (EMPTY_TREE) to avoid missing changed packages", async () => {
+    // M6/fail-open: force-push rewrites history so before-SHA is not an ancestor.
+    // The fix returns EMPTY_TREE immediately (check-all), not HEAD~1.
     Object.assign(github.context, {
       eventName: "push",
       payload: { forced: true, before: "forcedsha" },
     });
-    // isShallowRepo → false (non-shallow, skip deepenLoop)
-    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
-      opts?.listeners?.stdout?.(Buffer.from("false\n"));
-      return 0;
-    });
-    // revParse("HEAD~1^{commit}") → parentsha
-    vi.mocked(exec.exec).mockImplementationOnce(async (_cmd, _args, opts) => {
-      opts?.listeners?.stdout?.(Buffer.from("parentsha\n"));
-      return 0;
-    });
-    // canDiffCommits("parentsha") → success
-    vi.mocked(exec.exec).mockResolvedValueOnce(0);
+    // No exec mocks needed — the function must return early before any git call.
 
     const result = await makeBaseRefDiffable("forcedsha", { fetchRetries: 3 });
-    expect(result).toEqual({ mode: "git", baseRef: "parentsha" });
+    expect(result).toEqual({ mode: "git", baseRef: EMPTY_TREE });
+    expect(exec.exec).not.toHaveBeenCalled();
   });
 
   it("fetches a missing SHA on a shallow clone and returns git mode when diff succeeds", async () => {

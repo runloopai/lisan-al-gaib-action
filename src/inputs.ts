@@ -1,6 +1,8 @@
 import * as core from "@actions/core";
 import yaml from "js-yaml";
 
+export const DEFAULT_MIN_AGE_DAYS = 14;
+
 export type LicenseOverrides = Map<string, Map<string, string>>;
 export type AgeOverrides = Map<string, Set<string>>;
 
@@ -36,9 +38,18 @@ export interface ActionInputs {
   fetchMissingHistoryRetries: number;
 }
 
-function trimSlash(url: string): string {
+export function trimSlash(url: string): string {
   return url.replace(/\/$/, "");
 }
+
+export const DEFAULT_REGISTRIES = {
+  npm: "https://registry.npmjs.org",
+  pypi: "https://pypi.org",
+  crates: "https://crates.io",
+  maven: "https://repo1.maven.org/maven2",
+  /** Default Bazel Central Registry URL — shared by CLI and latest.ts. */
+  bcrUrl: "https://bcr.bazel.build",
+} as const;
 
 export function getInputs(): ActionInputs {
   const ecosystems = core
@@ -47,10 +58,27 @@ export function getInputs(): ActionInputs {
     .map((e) => e.trim())
     .filter(Boolean);
 
-  const parsedMin = parseInt(core.getInput("min-age-days") || "14", 10);
-  const minAgeDays = isNaN(parsedMin) ? 14 : parsedMin;
+  const parsedMin = parseInt(core.getInput("min-age-days") || String(DEFAULT_MIN_AGE_DAYS), 10);
+  const minAgeDaysRaw = isNaN(parsedMin) ? DEFAULT_MIN_AGE_DAYS : parsedMin;
+  // Fail closed rather than silently clamp: min-age-days is the core security control this
+  // action exists to enforce, so a negative value (typo, or an attacker-controlled workflow
+  // input) must not be quietly downgraded to "gate disabled" — the run should stop and force
+  // the value to be fixed explicitly (use 0 to disable the age gate on purpose).
+  if (minAgeDaysRaw < 0) {
+    throw new Error(
+      `min-age-days (${minAgeDaysRaw}) is negative. Set it to 0 explicitly to disable the age gate.`,
+    );
+  }
+  const minAgeDays = minAgeDaysRaw;
+
   const parsedWarn = parseInt(core.getInput("warn-age-days") || "21", 10);
-  const warnAgeDays = isNaN(parsedWarn) ? 21 : parsedWarn;
+  const warnAgeDaysRaw = isNaN(parsedWarn) ? 21 : parsedWarn;
+  if (warnAgeDaysRaw < 0) {
+    core.warning(
+      `warn-age-days (${warnAgeDaysRaw}) is negative — clamping to 0.`,
+    );
+  }
+  const warnAgeDays = Math.max(0, warnAgeDaysRaw);
 
   const parsedRetries = parseInt(core.getInput("fetch-missing-history-retries") || "10", 10);
   const fetchMissingHistoryRetries = isNaN(parsedRetries) || parsedRetries < 0 ? 10 : parsedRetries;
@@ -103,10 +131,10 @@ export function getInputs(): ActionInputs {
     licenseHeuristics: core.getBooleanInput("license-heuristics"),
     fetchMissingHistoryRetries,
     registries: {
-      npm: trimSlash(core.getInput("npm-registry-url") || "https://registry.npmjs.org"),
-      pypi: trimSlash(core.getInput("pypi-registry-url") || "https://pypi.org"),
-      crates: trimSlash(core.getInput("crates-registry-url") || "https://crates.io"),
-      maven: trimSlash(core.getInput("maven-registry-url") || "https://repo1.maven.org/maven2"),
+      npm: trimSlash(core.getInput("npm-registry-url") || DEFAULT_REGISTRIES.npm),
+      pypi: trimSlash(core.getInput("pypi-registry-url") || DEFAULT_REGISTRIES.pypi),
+      crates: trimSlash(core.getInput("crates-registry-url") || DEFAULT_REGISTRIES.crates),
+      maven: trimSlash(core.getInput("maven-registry-url") || DEFAULT_REGISTRIES.maven),
     },
   };
 }
